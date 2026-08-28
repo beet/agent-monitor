@@ -1,0 +1,17 @@
+[package]
+name = "agentmon-report"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "agentmon-report"
+path = "src/main.rs"
+
+[lib]
+name = "agentmon_report"
+path = "src/lib.rs"
+
+[dependencies]
+agentmon-proto = { path = "../agentmon-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

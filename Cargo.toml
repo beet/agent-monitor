@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentmon-proto",
+    "crates/agentd",
+    "crates/agentmon-report",
+    "crates/agentmon",
+]
+
+[workspace.package]
+edition = "2021"
