@@ -53,9 +53,9 @@
 
 ## 9. Homebrew distribution
 
-- [ ] 9.1 Push the repo to a GitHub remote and create an initial tagged release (e.g. `v0.1.0`), and verify the release's source tarball URL is reachable (`curl -sI` returns 200)
-- [ ] 9.2 Create a Homebrew tap repo (e.g. `beet/homebrew-agentmon`) or a `Formula/` directory in an existing tap, and verify `brew tap` can add it locally
-- [ ] 9.3 Write `Formula/agentmon.rb` that builds all three binaries (`agentd`, `agentmon`, `agentmon-report`) from the tagged source tarball via `cargo install` per crate, with `depends_on "rust" => :build`, and verify `brew install --build-from-source` succeeds locally from the tap
-- [ ] 9.4 Add a `caveats` block to the formula documenting the required post-install steps (`agentmon-report install-hooks`, `agentd install`), and verify the message is shown after `brew install`
-- [ ] 9.5 Verify end-to-end on a clean machine (or a clean `brew` state): `brew tap <tap> && brew install agentmon` installs all three binaries onto `PATH`, and each runs (`agentd --foreground`, `agentmon`, `agentmon-report install-hooks`)
-- [ ] 9.6 Document the release process for future version bumps (tag a new version, update the formula's `url`/`sha256`/`version`, push to the tap) so updates don't require re-deriving these steps
+- [x] 9.1 Push the repo to a GitHub remote and create an initial tagged release (e.g. `v0.1.0`), and verify the release's source tarball URL is reachable (`curl -sI` returns 200)
+- [x] 9.2 Create a Homebrew tap repo (e.g. `beet/homebrew-agentmon`) or a `Formula/` directory in an existing tap, and verify `brew tap` can add it locally
+- [x] 9.3 Write `Formula/agentmon.rb` that builds all three binaries (`agentd`, `agentmon`, `agentmon-report`) from the tagged source tarball via `cargo install` per crate, with `depends_on "rust" => :build`, and verify `brew install --build-from-source` succeeds locally from the tap
+- [x] 9.4 Add a `caveats` block to the formula documenting the required post-install steps (`agentmon-report install-hooks`, `agentd install`), and verify the message is shown after `brew install`
+- [x] 9.5 Verify end-to-end on a clean machine (or a clean `brew` state): `brew tap beet/agent-monitor && brew install agent-monitor` installs all three binaries onto `PATH`, and each runs (`agentd --foreground`, `agentmon`, `agentmon-report install-hooks`). Confirmed on a second, genuinely separate machine (required `brew trust beet/agent-monitor` first - now documented in the tap README).
+- [x] 9.6 Document the release process for future version bumps (tag a new version, update the formula's `url`/`sha256`/`version`, push to the tap) so updates don't require re-deriving these steps
