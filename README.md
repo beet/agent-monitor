@@ -26,6 +26,20 @@ agentd install                  # installs and starts the daemon as a launchd se
 
 Then run `agentmon` in a terminal to see tracked sessions.
 
+## Upgrade
+
+```
+brew upgrade agent-monitor
+pkill agentd   # the launchd service restarts it automatically
+```
+
+If you installed the service before `agentd install` started pinning a stable path (anything installed via `brew install`/`brew upgrade` before this README section existed), run this once to pick it up; after that, upgrades only need the two commands above:
+
+```
+agentd uninstall
+agentd install
+```
+
 ## Supported hosts
 
 Works for Claude Code sessions in a terminal or nvim's embedded terminal. The desktop app isn't supported — it runs sessions in a sandboxed environment that can't execute local hooks (it has its own built-in notifications instead).
