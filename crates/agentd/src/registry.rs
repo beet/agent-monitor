@@ -170,6 +170,19 @@ mod tests {
     }
 
     #[test]
+    fn running_event_clears_a_needs_input_session() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::NeedsInput));
+
+        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+
+        assert_eq!(outcome.agent.status, AgentStatus::Running);
+        assert_eq!(outcome.previous_status, Some(AgentStatus::NeedsInput));
+        assert_eq!(registry.snapshot()[0].status, AgentStatus::Running);
+    }
+
+    #[test]
     fn mark_stale_transitions_a_known_agent() {
         let registry = Registry::new();
         registry.upsert(sample_event(AgentStatus::Running));

@@ -13,6 +13,7 @@ pub const NEEDS_INPUT_MATCHER: &str =
 
 const HOOK_EVENTS: &[(&str, &str)] = &[
     ("UserPromptSubmit", ""),
+    ("PreToolUse", ""),
     ("Stop", ""),
     ("Notification", NEEDS_INPUT_MATCHER),
 ];
@@ -135,8 +136,8 @@ mod tests {
             r#"{
                 "some_other_setting": true,
                 "hooks": {
-                    "PreToolUse": [
-                        { "matcher": "Bash", "hooks": [{ "type": "command", "command": "my-other-tool" }] }
+                    "PreCompact": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": "my-other-tool" }] }
                     ],
                     "Stop": [
                         { "matcher": "", "hooks": [{ "type": "command", "command": "existing-stop-hook" }] }
@@ -150,7 +151,13 @@ mod tests {
 
         let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["some_other_setting"], true);
-        assert_eq!(written["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "my-other-tool");
+        let pre_compact_groups = written["hooks"]["PreCompact"].as_array().unwrap();
+        assert_eq!(
+            pre_compact_groups.len(),
+            1,
+            "hook event this tool doesn't manage must be left completely untouched"
+        );
+        assert_eq!(pre_compact_groups[0]["hooks"][0]["command"], "my-other-tool");
 
         let stop_groups = written["hooks"]["Stop"].as_array().unwrap();
         assert!(stop_groups

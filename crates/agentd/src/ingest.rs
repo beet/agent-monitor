@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_running_status_does_not_renotify_or_change_status() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        // Models repeated PreToolUse events for a session that is already
+        // "running" - each tool call reports "running" again, and this must
+        // stay a silent no-op rather than notifying on every tool use.
+        ingestor.ingest_event(event(AgentStatus::Running));
+        let agent = ingestor.ingest_event(event(AgentStatus::Running));
+
+        assert_eq!(agent.status, AgentStatus::Running);
+        assert_eq!(
+            notifier.calls.lock().unwrap().len(),
+            0,
+            "repeated running events must not trigger a notification"
+        );
+    }
+
+    #[test]
     fn transitions_that_are_not_done_or_needs_input_never_notify() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());

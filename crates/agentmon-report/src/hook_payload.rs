@@ -38,6 +38,7 @@ const NEEDS_INPUT_NOTIFICATION_TYPES: &[&str] = &[
 pub fn status_for_payload(payload: &HookPayload) -> Option<AgentStatus> {
     match payload.hook_event_name.as_str() {
         "UserPromptSubmit" => Some(AgentStatus::Running),
+        "PreToolUse" => Some(AgentStatus::Running),
         "Stop" => Some(AgentStatus::Done),
         "Notification" => {
             let notification_type = payload.notification_type.as_deref()?;
@@ -65,6 +66,20 @@ mod tests {
 
         assert_eq!(payload.session_id, "abc-123");
         assert_eq!(payload.cwd, "/tmp/project");
+        assert_eq!(status_for_payload(&payload), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn parses_a_pre_tool_use_payload_as_running() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash"
+        }"#;
+
+        let payload = parse_hook_payload(raw).unwrap();
+
         assert_eq!(status_for_payload(&payload), Some(AgentStatus::Running));
     }
 
