@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 agentmon-proto = { path = "../agentmon-proto" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }

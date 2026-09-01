@@ -64,7 +64,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             Ok(AppEvent::Client(ClientEvent::Snapshot(agents))) => app.apply_snapshot(agents),
             Ok(AppEvent::Client(ClientEvent::Update(agent))) => app.apply_update(agent),
             Ok(AppEvent::Key(key)) => {
-                if handle_key(&mut app, key) == InputAction::Quit {
+                if handle_key(key) == InputAction::Quit {
                     return Ok(());
                 }
             }
