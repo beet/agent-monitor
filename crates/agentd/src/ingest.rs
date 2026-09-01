@@ -34,11 +34,18 @@ impl Ingestor {
     }
 }
 
-/// A transition warrants a notification only when it lands on "done" or
-/// "needs input" and actually changes the status - repeated events
-/// reporting the same status must not re-notify.
+/// Every "needs input" event notifies, since each one represents a distinct
+/// blocking prompt and Claude Code reports no event when a prompt is
+/// resolved (so two prompts in the same turn look identical to the
+/// registry). A "done" event only notifies when it actually changes the
+/// status - repeated "done" events for an already-done session must not
+/// re-notify.
 fn should_notify(previous: Option<AgentStatus>, current: AgentStatus) -> bool {
-    matches!(current, AgentStatus::Done | AgentStatus::NeedsInput) && previous != Some(current)
+    match current {
+        AgentStatus::NeedsInput => true,
+        AgentStatus::Done => previous != Some(current),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -103,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_identical_status_does_not_renotify() {
+    fn repeated_done_status_does_not_renotify() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
 
@@ -114,19 +121,55 @@ mod tests {
         assert_eq!(
             notifier.calls.lock().unwrap().len(),
             1,
-            "repeated same-status events must not trigger duplicate notifications"
+            "repeated same-status done events must not trigger duplicate notifications"
         );
     }
 
     #[test]
-    fn switching_between_attention_states_notifies_again() {
+    fn repeated_needs_input_status_notifies_each_time() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        ingestor.ingest_event(event(AgentStatus::NeedsInput));
+        ingestor.ingest_event(event(AgentStatus::NeedsInput));
+        ingestor.ingest_event(event(AgentStatus::NeedsInput));
+
+        assert_eq!(
+            notifier.calls.lock().unwrap().len(),
+            3,
+            "each needs-input event is a distinct blocking prompt and must notify"
+        );
+    }
+
+    #[test]
+    fn switching_from_needs_input_to_done_notifies_again() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        ingestor.ingest_event(event(AgentStatus::NeedsInput));
+        ingestor.ingest_event(event(AgentStatus::Done));
+
+        assert_eq!(notifier.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn needs_input_after_done_is_guarded_and_does_not_notify() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
 
         ingestor.ingest_event(event(AgentStatus::Done));
-        ingestor.ingest_event(event(AgentStatus::NeedsInput));
+        let agent = ingestor.ingest_event(event(AgentStatus::NeedsInput));
 
-        assert_eq!(notifier.calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            agent.status,
+            AgentStatus::Done,
+            "a needs-input event for an already-done session must be dropped by the registry"
+        );
+        assert_eq!(
+            notifier.calls.lock().unwrap().len(),
+            1,
+            "the dropped needs-input event must not trigger a second notification"
+        );
     }
 
     #[test]

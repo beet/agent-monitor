@@ -291,4 +291,68 @@ mod tests {
         }
         assert_eq!(notified, 1);
     }
+
+    #[test]
+    fn late_needs_input_event_after_done_is_ignored_across_connections() {
+        let (path, notifier) = spawn_test_server("late-needs-input");
+        let session_id = SessionId("session-1".to_string());
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Running),
+                },
+            )
+            .expect("send running event");
+        }
+        wait_for_status(&path, &session_id, AgentStatus::Running);
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Done),
+                },
+            )
+            .expect("send done event");
+        }
+        wait_for_status(&path, &session_id, AgentStatus::Done);
+
+        // Simulates a delayed idle-prompt Notification hook landing on its
+        // own connection/thread after the session already reported Stop.
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::NeedsInput),
+                },
+            )
+            .expect("send late needs-input event");
+        }
+
+        // Give the server ample time to process (and, if the guard were
+        // broken, wrongly apply) the late event before asserting it never
+        // took effect.
+        let mut agents = Vec::new();
+        for _ in 0..20 {
+            agents = read_snapshot_until_nonempty(&path);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(
+            agents[0].status,
+            AgentStatus::Done,
+            "a needs-input event arriving after done must not change the session's status"
+        );
+        assert_eq!(
+            notifier.calls.lock().unwrap().len(),
+            1,
+            "the ignored needs-input event must not trigger a second notification"
+        );
+    }
 }
