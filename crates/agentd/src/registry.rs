@@ -36,6 +36,13 @@ impl Registry {
     /// "running" event starts its next turn, so this guards against a
     /// needs-input hook event (e.g. Claude Code's idle-prompt notification)
     /// arriving after that session's Stop event and flipping it back.
+    ///
+    /// A pid never has more than one live entry: when this event's session
+    /// id is new but its pid matches an existing entry under a different
+    /// session id, that existing entry is dropped first. This happens when
+    /// the same Claude Code process starts a new session id (e.g. `/clear`)
+    /// - the old session is gone, not merely quiet, so it must not linger
+    /// as an untouched duplicate row sharing the live pid.
     pub fn upsert(&self, event: AgentEvent) -> UpsertOutcome {
         let mut state = self.state.lock().unwrap();
         let previous_status = state.agents.get(&event.session_id).map(|a| a.status);
@@ -47,6 +54,14 @@ impl Registry {
                 is_new: false,
                 previous_status,
             };
+        }
+
+        if previous_status.is_none() {
+            state
+                .agents
+                .retain(|session_id, agent| {
+                    !(agent.pid == event.pid && *session_id != event.session_id)
+                });
         }
 
         let agent = AgentInfo {
@@ -201,5 +216,51 @@ mod tests {
         let result = registry.mark_stale(&SessionId("unknown".to_string()));
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn a_new_session_id_for_a_tracked_pid_replaces_the_old_entry() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "the old session-1 entry must be replaced, not left as a duplicate"
+        );
+        assert_eq!(snapshot[0].session_id, SessionId("session-2".to_string()));
+    }
+
+    #[test]
+    fn unrelated_pids_are_unaffected_by_dedup() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 456,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        let mut snapshot = registry.snapshot();
+        snapshot.sort_by(|a, b| a.session_id.0.cmp(&b.session_id.0));
+        assert_eq!(snapshot.len(), 2, "different pids must both be tracked");
+        assert_eq!(snapshot[0].session_id, SessionId("session-1".to_string()));
+        assert_eq!(snapshot[1].session_id, SessionId("session-2".to_string()));
     }
 }
