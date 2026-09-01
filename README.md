@@ -42,7 +42,7 @@ agentd install
 
 ## How it works
 
-`agentmon-report` runs as a Claude Code hook and reports each hook event to `agentd`, which maps it onto a status for the session. `agentd`'s own liveness sweep (not a hook) detects when a tracked process has exited and marks it stale.
+`agentmon-report` runs as a Claude Code hook and reports each hook event to `agentd`, which maps it onto a status for the session. `agentd`'s own liveness sweep (not a hook) detects when a tracked process has exited and marks it stale. (A fifth status, `idle`, is defined in the protocol but not currently produced by any hook, so it doesn't appear below.)
 
 ```mermaid
 stateDiagram-v2
@@ -57,12 +57,6 @@ stateDiagram-v2
     Running --> Stale: liveness sweep - pid no longer running
     NeedsInput --> Stale: liveness sweep - pid no longer running
     Done --> Stale: liveness sweep - pid no longer running
-
-    state Idle
-    note right of Idle
-        Defined in the protocol but not
-        currently produced by any hook
-    end note
 ```
 
 ## Supported hosts
