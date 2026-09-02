@@ -20,8 +20,8 @@ If Homebrew refuses the tap as untrusted, run `brew trust beet/agent-monitor` fi
 ## Setup
 
 ```
-agentmon-report install-hooks   # registers hooks in ~/.claude/settings.json
-agentd install                  # installs and starts the daemon as a launchd service
+agentmon-report install-hooks        # registers hooks in ~/.claude/settings.json
+brew services start agent-monitor    # installs and starts the daemon as a launchd service
 ```
 
 Then run `agentmon` in a terminal to see tracked sessions.
@@ -30,14 +30,7 @@ Then run `agentmon` in a terminal to see tracked sessions.
 
 ```
 brew upgrade agent-monitor
-pkill agentd   # the launchd service restarts it automatically
-```
-
-If you installed the service before `agentd install` started pinning a stable path (anything installed via `brew install`/`brew upgrade` before this README section existed), run this once to pick it up; after that, upgrades only need the two commands above:
-
-```
-agentd uninstall
-agentd install
+brew services restart agent-monitor
 ```
 
 ## How it works
