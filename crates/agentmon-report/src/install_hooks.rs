@@ -14,6 +14,7 @@ pub const NEEDS_INPUT_MATCHER: &str =
 const HOOK_EVENTS: &[(&str, &str)] = &[
     ("UserPromptSubmit", ""),
     ("PreToolUse", ""),
+    ("PostToolUse", ""),
     ("Stop", ""),
     ("Notification", NEEDS_INPUT_MATCHER),
 ];

@@ -177,9 +177,10 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
 
-        // Models repeated PreToolUse events for a session that is already
-        // "running" - each tool call reports "running" again, and this must
-        // stay a silent no-op rather than notifying on every tool use.
+        // Models repeated PreToolUse/PostToolUse events for a session that is
+        // already "running" - each tool call reports "running" again (once
+        // before it runs, once after), and this must stay a silent no-op
+        // rather than notifying on every tool use.
         ingestor.ingest_event(event(AgentStatus::Running));
         let agent = ingestor.ingest_event(event(AgentStatus::Running));
 

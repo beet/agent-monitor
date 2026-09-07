@@ -39,13 +39,13 @@ brew services restart agent-monitor
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Running: UserPromptSubmit / PreToolUse
-    Running --> Running: PreToolUse (already running)
+    [*] --> Running: UserPromptSubmit / PreToolUse / PostToolUse
+    Running --> Running: PreToolUse / PostToolUse (already running)
     Running --> NeedsInput: Notification (permission_prompt / idle_prompt / elicitation_dialog / elicitation_url_dialog / agent_needs_input)
     NeedsInput --> NeedsInput: Notification (another blocking prompt - always notifies again)
-    NeedsInput --> Running: PreToolUse / UserPromptSubmit
+    NeedsInput --> Running: PreToolUse / PostToolUse / UserPromptSubmit
     Running --> Done: Stop
-    Done --> Running: UserPromptSubmit / PreToolUse (next turn starts)
+    Done --> Running: UserPromptSubmit / PreToolUse / PostToolUse (next turn starts)
     Done --> Done: Notification (needs-input event dropped - a finished session can't need input again until it's running)
     Running --> Stale: liveness sweep - pid no longer running
     NeedsInput --> Stale: liveness sweep - pid no longer running
