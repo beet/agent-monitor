@@ -45,6 +45,30 @@ pub enum AgentStatus {
     Declined,
 }
 
+/// Lifecycle status of a tracked test run, per the rspec-test-reporting and
+/// agent-daemon specs. Distinct from `AgentStatus`: a test run has no
+/// "declined" or "stale" concept - its last reported status simply stands
+/// until superseded by the next run at the same working directory and pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRunStatus {
+    Started,
+    Passed,
+    Failed,
+}
+
+/// The daemon's view of a tracked test run, as sent to clients. Identified by
+/// `(cwd, pid)`, not by any Claude Code session id - a test run may be
+/// launched outside any agent's process tree (see rspec-test-reporting spec).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestRunInfo {
+    pub cwd: PathBuf,
+    pub pid: u32,
+    pub status: TestRunStatus,
+    /// Unix epoch milliseconds of the last update to this test run.
+    pub last_updated_ms: u64,
+}
+
 /// A status event reported by a Claude Code hook to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEvent {
@@ -77,6 +101,14 @@ pub struct AgentInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     ReportEvent { event: AgentEvent },
+    /// Reported by a test formatter (e.g. RSpec), not a Claude Code hook -
+    /// carries no session id, since a test run has no reliable way to learn
+    /// one (see rspec-test-reporting spec).
+    ReportTestRun {
+        cwd: PathBuf,
+        pid: u32,
+        status: TestRunStatus,
+    },
     Subscribe,
 }
 
@@ -85,14 +117,28 @@ pub enum ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// Full current state, sent once when a client connects.
-    Snapshot { agents: Vec<AgentInfo> },
+    Snapshot {
+        agents: Vec<AgentInfo>,
+        test_runs: Vec<TestRunInfo>,
+    },
     /// An incremental update to a single agent's state.
     AgentUpdate { agent: AgentInfo },
+    /// An incremental update to a single test run's state.
+    TestRunUpdate { test_run: TestRunInfo },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_test_run() -> TestRunInfo {
+        TestRunInfo {
+            cwd: PathBuf::from("/Users/beet/Documents/Projects/enclaudinate"),
+            pid: 5150,
+            status: TestRunStatus::Started,
+            last_updated_ms: 1_700_000_000_000,
+        }
+    }
 
     fn sample_agent() -> AgentInfo {
         AgentInfo {
@@ -140,12 +186,55 @@ mod tests {
     fn server_message_snapshot_round_trips_through_json() {
         let message = ServerMessage::Snapshot {
             agents: vec![sample_agent()],
+            test_runs: vec![sample_test_run()],
         };
 
         let json = serde_json::to_string(&message).unwrap();
         let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
 
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn client_message_report_test_run_round_trips_through_json() {
+        let message = ClientMessage::ReportTestRun {
+            cwd: PathBuf::from("/tmp/project"),
+            pid: 321,
+            status: TestRunStatus::Failed,
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn server_message_test_run_update_round_trips_through_json() {
+        let mut test_run = sample_test_run();
+        test_run.status = TestRunStatus::Passed;
+        let message = ServerMessage::TestRunUpdate { test_run };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn test_run_status_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TestRunStatus::Started).unwrap(),
+            "\"started\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TestRunStatus::Passed).unwrap(),
+            "\"passed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TestRunStatus::Failed).unwrap(),
+            "\"failed\""
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use agentmon_proto::{AgentInfo, AgentStatus, HostContext};
+use std::path::Path;
+
+use agentmon_proto::{AgentInfo, AgentStatus, HostContext, TestRunStatus};
 
 use crate::app::{App, ConnectionStatus};
 
@@ -33,16 +35,31 @@ fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
     let header = Row::new(["PROJECT", "HOST", "PID", "STATUS", "UPDATED"]).style(Style::new().bold());
 
     let now = now_ms();
-    let agents = sorted_by_recency(&app.agents);
-    let rows = agents.iter().map(|agent| {
-        let (status_cell, style) = status_cell_text_and_style(agent, now);
-        Row::new([
-            Cell::from(project_name(agent)),
-            Cell::from(host_label(agent.host_context)),
-            Cell::from(agent.pid.to_string()),
-            Cell::from(status_cell).style(style),
-            Cell::from(format_last_updated(agent.last_updated_ms)),
-        ])
+    let groups = app.directory_groups();
+    let rows = groups.iter().flat_map(|group| {
+        let project = project_name(&group.cwd);
+        let test_run_project = project.clone();
+        let agent_rows = group.agents.iter().map(move |agent| {
+            let (status_cell, style) = status_cell_text_and_style(agent, now);
+            Row::new([
+                Cell::from(project.clone()),
+                Cell::from(host_label(agent.host_context)),
+                Cell::from(agent.pid.to_string()),
+                Cell::from(status_cell).style(style),
+                Cell::from(format_last_updated(agent.last_updated_ms)),
+            ])
+        });
+        let test_run_rows = group.test_runs.iter().map(move |test_run| {
+            let (status_cell, style) = test_run_status_cell_text_and_style(test_run.status);
+            Row::new([
+                Cell::from(test_run_project.clone()),
+                Cell::from("test run"),
+                Cell::from(test_run.pid.to_string()),
+                Cell::from(status_cell).style(style),
+                Cell::from(format_last_updated(test_run.last_updated_ms)),
+            ])
+        });
+        agent_rows.chain(test_run_rows).collect::<Vec<_>>()
     });
 
     let widths = [
@@ -55,7 +72,9 @@ fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
 
     let title = match banner {
         Some(banner) => format!("agentmon - {banner}"),
-        None if app.agents.is_empty() => "agentmon - no agents tracked yet".to_string(),
+        None if app.agents.is_empty() && app.test_runs.is_empty() => {
+            "agentmon - no agents tracked yet".to_string()
+        }
         None => "agentmon".to_string(),
     };
     let table = Table::new(rows, widths)
@@ -63,14 +82,6 @@ fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
         .block(Block::default().title(title).borders(Borders::ALL));
 
     frame.render_widget(table, frame.area());
-}
-
-/// Returns agents ordered most-recently-updated first, without touching
-/// `App.agents`'s own (insertion) order.
-fn sorted_by_recency<'a>(agents: &'a [AgentInfo]) -> Vec<&'a AgentInfo> {
-    let mut sorted: Vec<&AgentInfo> = agents.iter().collect();
-    sorted.sort_by(|a, b| b.last_updated_ms.cmp(&a.last_updated_ms));
-    sorted
 }
 
 /// Formats a unix-epoch-milliseconds timestamp in the system's local
@@ -109,12 +120,10 @@ fn format_running_duration(status_since_ms: u64, now_ms: u64) -> String {
     }
 }
 
-fn project_name(agent: &AgentInfo) -> String {
-    agent
-        .cwd
-        .file_name()
+fn project_name(cwd: &Path) -> String {
+    cwd.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| agent.cwd.display().to_string())
+        .unwrap_or_else(|| cwd.display().to_string())
 }
 
 fn host_label(host: HostContext) -> &'static str {
@@ -159,6 +168,22 @@ fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
         ),
         AgentStatus::Declined => ("🚫 declined", Style::new().fg(Color::Red)),
     }
+}
+
+/// The STATUS cell's text and style for a test run. Labels are worded
+/// distinctly from agent statuses (e.g. "tests passed" vs "done") so a
+/// passed test run and a done agent aren't visually confused even though
+/// both use a ✅ marker.
+fn test_run_status_cell_text_and_style(status: TestRunStatus) -> (String, Style) {
+    let (label, style) = match status {
+        TestRunStatus::Started => ("⏳ test started", Style::new().fg(Color::Blue)),
+        TestRunStatus::Passed => ("✅ tests passed", Style::new().fg(Color::Green)),
+        TestRunStatus::Failed => (
+            "❌ tests failed",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    };
+    (label.to_string(), style)
 }
 
 #[cfg(test)]
@@ -228,7 +253,7 @@ mod tests {
     fn seeded_agents_are_rendered_in_the_table() {
         let mut term = terminal();
         let mut app = App::new();
-        app.apply_snapshot(vec![agent("s", AgentStatus::Running, HostContext::Nvim, 4242, 0)]);
+        app.apply_snapshot(vec![agent("s", AgentStatus::Running, HostContext::Nvim, 4242, 0)], Vec::new());
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
@@ -243,10 +268,13 @@ mod tests {
     fn needs_input_is_visually_distinguished_from_other_statuses() {
         let mut term = terminal();
         let mut app = App::new();
-        app.apply_snapshot(vec![
-            agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
-            agent("b", AgentStatus::NeedsInput, HostContext::Terminal, 4243, 0),
-        ]);
+        app.apply_snapshot(
+            vec![
+                agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
+                agent("b", AgentStatus::NeedsInput, HostContext::Terminal, 4243, 0),
+            ],
+            Vec::new(),
+        );
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
@@ -277,10 +305,13 @@ mod tests {
     fn agents_are_rendered_most_recently_updated_first() {
         let mut term = terminal();
         let mut app = App::new();
-        app.apply_snapshot(vec![
-            agent("older", AgentStatus::Running, HostContext::Terminal, 1111, 1_000),
-            agent("newer", AgentStatus::Running, HostContext::Terminal, 2222, 2_000),
-        ]);
+        app.apply_snapshot(
+            vec![
+                agent("older", AgentStatus::Running, HostContext::Terminal, 1111, 1_000),
+                agent("newer", AgentStatus::Running, HostContext::Terminal, 2222, 2_000),
+            ],
+            Vec::new(),
+        );
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
@@ -297,10 +328,13 @@ mod tests {
     fn an_update_moves_the_updated_agent_to_the_top() {
         let mut term = terminal();
         let mut app = App::new();
-        app.apply_snapshot(vec![
-            agent("a", AgentStatus::Running, HostContext::Terminal, 1111, 1_000),
-            agent("b", AgentStatus::Running, HostContext::Terminal, 2222, 2_000),
-        ]);
+        app.apply_snapshot(
+            vec![
+                agent("a", AgentStatus::Running, HostContext::Terminal, 1111, 1_000),
+                agent("b", AgentStatus::Running, HostContext::Terminal, 2222, 2_000),
+            ],
+            Vec::new(),
+        );
         // "a" starts below "b"; a fresh update should move it back to the top.
         app.apply_update(agent("a", AgentStatus::Running, HostContext::Terminal, 1111, 3_000));
 
@@ -320,13 +354,16 @@ mod tests {
         let mut term = terminal();
         let mut app = App::new();
         let last_updated_ms: u64 = 1_700_000_000_000;
-        app.apply_snapshot(vec![agent(
-            "s",
-            AgentStatus::Running,
-            HostContext::Terminal,
-            4242,
-            last_updated_ms,
-        )]);
+        app.apply_snapshot(
+            vec![agent(
+                "s",
+                AgentStatus::Running,
+                HostContext::Terminal,
+                4242,
+                last_updated_ms,
+            )],
+            Vec::new(),
+        );
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
@@ -399,10 +436,13 @@ mod tests {
     fn declined_is_visually_distinguished_from_other_statuses() {
         let mut term = terminal();
         let mut app = App::new();
-        app.apply_snapshot(vec![
-            agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
-            agent("b", AgentStatus::Declined, HostContext::Terminal, 4243, 0),
-        ]);
+        app.apply_snapshot(
+            vec![
+                agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
+                agent("b", AgentStatus::Declined, HostContext::Terminal, 4243, 0),
+            ],
+            Vec::new(),
+        );
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
@@ -431,14 +471,17 @@ mod tests {
         let mut term = terminal();
         let mut app = App::new();
         let now = now_ms();
-        app.apply_snapshot(vec![agent_with_status_since(
-            "s",
-            AgentStatus::Running,
-            HostContext::Terminal,
-            4242,
-            now,
-            now - 134_000,
-        )]);
+        app.apply_snapshot(
+            vec![agent_with_status_since(
+                "s",
+                AgentStatus::Running,
+                HostContext::Terminal,
+                4242,
+                now,
+                now - 134_000,
+            )],
+            Vec::new(),
+        );
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
@@ -446,6 +489,79 @@ mod tests {
         assert!(
             text.contains("2m1"),
             "expected a running duration around 2m14s, got:\n{text}"
+        );
+    }
+
+    fn test_run(pid: u32, status: TestRunStatus, last_updated_ms: u64) -> agentmon_proto::TestRunInfo {
+        agentmon_proto::TestRunInfo {
+            cwd: PathBuf::from("/Users/beet/project"),
+            pid,
+            status,
+            last_updated_ms,
+        }
+    }
+
+    #[test]
+    fn a_directory_with_no_tracked_agent_still_shows_its_test_run() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_test_run_update(test_run(999, TestRunStatus::Started, 0));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("project"), "expected project name, got:\n{text}");
+        assert!(text.contains("test started"), "expected test-run status, got:\n{text}");
+    }
+
+    #[test]
+    fn a_test_run_appears_alongside_its_directorys_agent() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            vec![test_run(999, TestRunStatus::Failed, 0)],
+        );
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("running"), "expected the agent row, got:\n{text}");
+        assert!(text.contains("tests failed"), "expected the test-run row, got:\n{text}");
+    }
+
+    #[test]
+    fn each_test_run_status_has_a_distinct_emoji_marker() {
+        assert_eq!(
+            test_run_status_cell_text_and_style(TestRunStatus::Started).0,
+            "⏳ test started"
+        );
+        assert_eq!(
+            test_run_status_cell_text_and_style(TestRunStatus::Passed).0,
+            "✅ tests passed"
+        );
+        assert_eq!(
+            test_run_status_cell_text_and_style(TestRunStatus::Failed).0,
+            "❌ tests failed"
+        );
+    }
+
+    #[test]
+    fn a_failing_test_run_is_visually_distinguished() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            vec![test_run(999, TestRunStatus::Failed, 0)],
+        );
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed);
+        let (_, running_style) = status_label_and_style(AgentStatus::Running);
+        assert_ne!(
+            failed_style.fg, running_style.fg,
+            "a failed test run's styling must differ from a running agent's"
         );
     }
 }

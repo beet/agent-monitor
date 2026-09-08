@@ -5,7 +5,9 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use agentmon_proto::{read_message, write_message, AgentInfo, ClientMessage, ServerMessage};
+use agentmon_proto::{
+    read_message, write_message, AgentInfo, ClientMessage, ServerMessage, TestRunInfo,
+};
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -18,8 +20,9 @@ pub enum ClientEvent {
     /// A previously-established connection dropped and a reconnect attempt
     /// is under way.
     Reconnecting,
-    Snapshot(Vec<AgentInfo>),
+    Snapshot(Vec<AgentInfo>, Vec<TestRunInfo>),
     Update(AgentInfo),
+    TestRunUpdate(TestRunInfo),
 }
 
 /// Connects to the daemon at `socket_path`, subscribes, and forwards every
@@ -89,13 +92,18 @@ fn connect_and_stream(socket_path: &Path, events: &Sender<ClientEvent>) -> Strea
     let mut reader = BufReader::new(stream);
     loop {
         match read_message::<_, ServerMessage>(&mut reader) {
-            Ok(Some(ServerMessage::Snapshot { agents })) => {
-                if events.send(ClientEvent::Snapshot(agents)).is_err() {
+            Ok(Some(ServerMessage::Snapshot { agents, test_runs })) => {
+                if events.send(ClientEvent::Snapshot(agents, test_runs)).is_err() {
                     return StreamOutcome::ReceiverGone;
                 }
             }
             Ok(Some(ServerMessage::AgentUpdate { agent })) => {
                 if events.send(ClientEvent::Update(agent)).is_err() {
+                    return StreamOutcome::ReceiverGone;
+                }
+            }
+            Ok(Some(ServerMessage::TestRunUpdate { test_run })) => {
+                if events.send(ClientEvent::TestRunUpdate(test_run)).is_err() {
                     return StreamOutcome::ReceiverGone;
                 }
             }
@@ -168,6 +176,7 @@ mod tests {
                 &mut writer,
                 &ServerMessage::Snapshot {
                     agents: vec![sample_agent(AgentStatus::Running)],
+                    test_runs: Vec::new(),
                 },
             )
             .unwrap();
@@ -193,7 +202,7 @@ mod tests {
         let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
         assert_eq!(
             snapshot,
-            ClientEvent::Snapshot(vec![sample_agent(AgentStatus::Running)])
+            ClientEvent::Snapshot(vec![sample_agent(AgentStatus::Running)], Vec::new())
         );
 
         let update = rx.recv_timeout(Duration::from_secs(2)).expect("update event");
@@ -228,6 +237,7 @@ mod tests {
                     &mut writer,
                     &ServerMessage::Snapshot {
                         agents: vec![sample_agent(AgentStatus::Running)],
+                        test_runs: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -255,6 +265,7 @@ mod tests {
                 &mut writer2,
                 &ServerMessage::Snapshot {
                     agents: vec![sample_agent(AgentStatus::Done)],
+                    test_runs: Vec::new(),
                 },
             )
             .unwrap();
@@ -264,7 +275,7 @@ mod tests {
         spawn_client(path, tx);
 
         match rx.recv_timeout(Duration::from_secs(2)).expect("initial snapshot") {
-            ClientEvent::Snapshot(agents) => {
+            ClientEvent::Snapshot(agents, _) => {
                 assert_eq!(agents, vec![sample_agent(AgentStatus::Running)])
             }
             other => panic!("expected initial Snapshot, got {other:?}"),
@@ -276,7 +287,7 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(3)) {
                 Ok(ClientEvent::Reconnecting) => saw_reconnecting = true,
                 Ok(ClientEvent::Unreachable(_)) => {}
-                Ok(ClientEvent::Snapshot(agents)) => {
+                Ok(ClientEvent::Snapshot(agents, _)) => {
                     final_snapshot = Some(agents);
                     break;
                 }
@@ -296,5 +307,67 @@ mod tests {
         );
 
         daemon.join().expect("mock daemon thread should not panic");
+    }
+
+    fn sample_test_run(status: agentmon_proto::TestRunStatus) -> TestRunInfo {
+        TestRunInfo {
+            cwd: PathBuf::from("/tmp/project"),
+            pid: 999,
+            status,
+            last_updated_ms: 0,
+        }
+    }
+
+    #[test]
+    fn forwards_a_snapshot_with_test_runs_then_a_test_run_update() {
+        let path = unique_socket_path("test-runs");
+        let listener = UnixListener::bind(&path).expect("bind mock daemon listener");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client connection");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            let subscribe: ClientMessage = read_message(&mut reader)
+                .expect("read subscribe")
+                .expect("connection should not close before subscribing");
+            assert_eq!(subscribe, ClientMessage::Subscribe);
+
+            write_message(
+                &mut writer,
+                &ServerMessage::Snapshot {
+                    agents: Vec::new(),
+                    test_runs: vec![sample_test_run(agentmon_proto::TestRunStatus::Started)],
+                },
+            )
+            .unwrap();
+            write_message(
+                &mut writer,
+                &ServerMessage::TestRunUpdate {
+                    test_run: sample_test_run(agentmon_proto::TestRunStatus::Failed),
+                },
+            )
+            .unwrap();
+        });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_client(path, tx);
+
+        let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
+        assert_eq!(
+            snapshot,
+            ClientEvent::Snapshot(
+                Vec::new(),
+                vec![sample_test_run(agentmon_proto::TestRunStatus::Started)]
+            )
+        );
+
+        let update = rx.recv_timeout(Duration::from_secs(2)).expect("test-run update event");
+        assert_eq!(
+            update,
+            ClientEvent::TestRunUpdate(sample_test_run(agentmon_proto::TestRunStatus::Failed))
+        );
+
+        server.join().expect("mock daemon thread should not panic");
     }
 }

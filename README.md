@@ -26,6 +26,16 @@ brew services start agent-monitor    # installs and starts the daemon as a launc
 
 Then run `agentmon` in a terminal to see tracked sessions.
 
+### RSpec test-run notifications (optional)
+
+In a Ruby project, run:
+
+```
+agentmon init-rspec
+```
+
+This writes a `.rspec-local` file (RSpec's own mechanism for personal, untracked local options) pointing at the bundled formatter, without touching the project's tracked `.rspec`. Once in place, `bundle exec rspec` reports each run's start/pass/fail to `agentd`, correlated by working directory to whatever agent(s) are tracked there - regardless of whether the run was started by an agent's own tool call, from nvim, or from another terminal. A failing run in a directory with no tracked agent still gets a plain macOS notification so results are never silently dropped.
+
 ## Upgrade
 
 ```
@@ -51,6 +61,8 @@ stateDiagram-v2
     NeedsInput --> Stale: liveness sweep - pid no longer running
     Done --> Stale: liveness sweep - pid no longer running
 ```
+
+Tracked agents and test runs are grouped by exact working directory. A test run has no session id of its own - it can't, since Claude Code never propagates one into a Bash tool's subprocess tree, and a run may not even be agent-initiated - so `agentd` correlates it purely by directory instead. `agentmon`'s TUI shows each directory's tracked agent(s) together with any test run(s) there, rather than as unrelated rows.
 
 ## Supported hosts
 

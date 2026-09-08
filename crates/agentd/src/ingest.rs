@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus};
+use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus, TestRunInfo, TestRunStatus};
 
 use crate::notify::Notifier;
 use crate::registry::Registry;
@@ -32,6 +33,17 @@ impl Ingestor {
         }
         outcome.agent
     }
+
+    /// Updates the registry from a reported test-run event, notifying the
+    /// user directly only when the run failed and its working directory has
+    /// no tracked agent to otherwise surface the failure through.
+    pub fn ingest_test_run(&self, cwd: PathBuf, pid: u32, status: TestRunStatus) -> TestRunInfo {
+        let outcome = self.registry.upsert_test_run(cwd, pid, status);
+        if status == TestRunStatus::Failed && !outcome.has_tracked_agent {
+            self.notifier.notify_test_run_failure(&outcome.test_run.cwd);
+        }
+        outcome.test_run
+    }
 }
 
 /// Every "needs input" event notifies, since each one represents a distinct
@@ -58,11 +70,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingNotifier {
         calls: Mutex<Vec<AgentInfo>>,
+        test_run_failure_calls: Mutex<Vec<PathBuf>>,
     }
 
     impl Notifier for RecordingNotifier {
         fn notify(&self, agent: &AgentInfo) {
             self.calls.lock().unwrap().push(agent.clone());
+        }
+
+        fn notify_test_run_failure(&self, cwd: &std::path::Path) {
+            self.test_run_failure_calls
+                .lock()
+                .unwrap()
+                .push(cwd.to_path_buf());
         }
     }
 
@@ -202,5 +222,53 @@ mod tests {
         ingestor.ingest_event(event(AgentStatus::Running));
 
         assert_eq!(notifier.calls.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ingest_test_run_updates_the_registry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        let test_run =
+            ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+
+        assert_eq!(test_run.status, TestRunStatus::Started);
+        assert_eq!(ingestor.registry().snapshot_test_runs().len(), 1);
+    }
+
+    #[test]
+    fn a_failing_run_with_no_tracked_agent_notifies() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
+
+        assert_eq!(notifier.test_run_failure_calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failing_run_with_a_tracked_agent_does_not_notify_via_the_fallback() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+        ingestor.ingest_event(event(AgentStatus::Running));
+
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
+
+        assert_eq!(
+            notifier.test_run_failure_calls.lock().unwrap().len(),
+            0,
+            "a directory with a tracked agent must not use the no-agent fallback"
+        );
+    }
+
+    #[test]
+    fn a_started_or_passed_run_never_triggers_the_fallback() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Passed);
+
+        assert_eq!(notifier.test_run_failure_calls.lock().unwrap().len(), 0);
     }
 }

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use agentmon_proto::{AgentInfo, AgentStatus, HostContext};
@@ -5,6 +6,14 @@ use agentmon_proto::{AgentInfo, AgentStatus, HostContext};
 /// Delivers a user-facing notification for an agent that needs attention.
 pub trait Notifier: Send + Sync {
     fn notify(&self, agent: &AgentInfo);
+
+    /// Notifies about a failing test run whose working directory has no
+    /// tracked agent - the only case where the daemon itself, rather than a
+    /// tracked agent's row in a connected client, is what surfaces the
+    /// failure to the user. Defaults to a no-op so existing implementors
+    /// (e.g. test doubles that don't care about test runs) don't need to
+    /// change.
+    fn notify_test_run_failure(&self, _cwd: &Path) {}
 }
 
 /// Sends a macOS notification banner via `osascript`.
@@ -20,6 +29,30 @@ impl Notifier for OsaScriptNotifier {
             eprintln!("agentd: failed to send notification: {err}");
         }
     }
+
+    fn notify_test_run_failure(&self, cwd: &Path) {
+        let script = test_run_failure_script(cwd);
+        if let Err(err) = Command::new("osascript").arg("-e").arg(script).status() {
+            eprintln!("agentd: failed to send test-run notification: {err}");
+        }
+    }
+}
+
+/// Builds the `osascript` AppleScript for a test-run failure with no tracked
+/// agent, played with the `Basso` sound - distinct from the `Glass`/`Ping`
+/// sounds used for agent completion notifications, so it's not confused with
+/// either by ear.
+fn test_run_failure_script(cwd: &Path) -> String {
+    let project = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.display().to_string());
+    format!(
+        "display notification {} with title {} sound name {}",
+        applescript_literal(&format!("{project} tests failed")),
+        applescript_literal("agentmon"),
+        applescript_literal("Basso")
+    )
 }
 
 /// Builds the `osascript` AppleScript for a notification, or `None` if
@@ -111,6 +144,24 @@ mod tests {
         assert!(notification_script(&sample_agent(AgentStatus::Idle)).is_none());
         assert!(notification_script(&sample_agent(AgentStatus::Stale)).is_none());
         assert!(notification_script(&sample_agent(AgentStatus::Declined)).is_none());
+    }
+
+    #[test]
+    fn test_run_failure_script_uses_basso_sound() {
+        let script = test_run_failure_script(&PathBuf::from("/tmp/project"));
+        assert!(
+            script.ends_with("sound name \"Basso\""),
+            "script did not end with the Basso sound clause: {script}"
+        );
+    }
+
+    #[test]
+    fn test_run_failure_script_identifies_the_directory() {
+        let script = test_run_failure_script(&PathBuf::from("/tmp/project"));
+        assert!(
+            script.contains("project"),
+            "script did not mention the project directory: {script}"
+        );
     }
 
     #[test]

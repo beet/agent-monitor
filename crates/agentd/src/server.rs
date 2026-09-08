@@ -5,28 +5,37 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use agentmon_proto::{AgentInfo, ClientMessage, ServerMessage};
+use agentmon_proto::{AgentInfo, ClientMessage, ServerMessage, TestRunInfo};
 
 use crate::ingest::Ingestor;
 use crate::liveness::spawn_liveness_sweep;
 use crate::protocol::{read_message, write_message};
 
+/// An incremental update fanned out to subscribers - either kind of tracked
+/// entity, merged onto one channel per connection so a single subscriber
+/// loop can forward both without racing two separate channels.
+#[derive(Clone)]
+enum Update {
+    Agent(AgentInfo),
+    TestRun(TestRunInfo),
+}
+
 /// Fans out registry updates to every currently-subscribed client.
 #[derive(Clone, Default)]
 struct Broadcaster {
-    subscribers: Arc<Mutex<Vec<mpsc::Sender<AgentInfo>>>>,
+    subscribers: Arc<Mutex<Vec<mpsc::Sender<Update>>>>,
 }
 
 impl Broadcaster {
-    fn subscribe(&self) -> mpsc::Receiver<AgentInfo> {
+    fn subscribe(&self) -> mpsc::Receiver<Update> {
         let (tx, rx) = mpsc::channel();
         self.subscribers.lock().unwrap().push(tx);
         rx
     }
 
-    fn publish(&self, agent: AgentInfo) {
+    fn publish(&self, update: Update) {
         let mut subscribers = self.subscribers.lock().unwrap();
-        subscribers.retain(|tx| tx.send(agent.clone()).is_ok());
+        subscribers.retain(|tx| tx.send(update.clone()).is_ok());
     }
 }
 
@@ -39,7 +48,7 @@ pub fn serve(listener: UnixListener, ingestor: Ingestor, liveness_interval: Dura
     let sweep_registry = ingestor.registry().clone();
     let sweep_broadcaster = broadcaster.clone();
     spawn_liveness_sweep(sweep_registry, liveness_interval, move |agent| {
-        sweep_broadcaster.publish(agent);
+        sweep_broadcaster.publish(Update::Agent(agent));
     });
 
     for stream in listener.incoming() {
@@ -66,17 +75,26 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
     match message {
         Some(ClientMessage::ReportEvent { event }) => {
             let agent = ingestor.ingest_event(event);
-            broadcaster.publish(agent);
+            broadcaster.publish(Update::Agent(agent));
+        }
+        Some(ClientMessage::ReportTestRun { cwd, pid, status }) => {
+            let test_run = ingestor.ingest_test_run(cwd, pid, status);
+            broadcaster.publish(Update::TestRun(test_run));
         }
         Some(ClientMessage::Subscribe) => {
-            let snapshot = ingestor.registry().snapshot();
-            let sent = write_message(&mut writer, &ServerMessage::Snapshot { agents: snapshot });
+            let agents = ingestor.registry().snapshot();
+            let test_runs = ingestor.registry().snapshot_test_runs();
+            let sent = write_message(&mut writer, &ServerMessage::Snapshot { agents, test_runs });
             if sent.is_err() {
                 return;
             }
 
-            for agent in broadcaster.subscribe() {
-                if write_message(&mut writer, &ServerMessage::AgentUpdate { agent }).is_err() {
+            for update in broadcaster.subscribe() {
+                let message = match update {
+                    Update::Agent(agent) => ServerMessage::AgentUpdate { agent },
+                    Update::TestRun(test_run) => ServerMessage::TestRunUpdate { test_run },
+                };
+                if write_message(&mut writer, &message).is_err() {
                     break;
                 }
             }
@@ -144,6 +162,27 @@ mod tests {
         }
     }
 
+    fn read_test_run_snapshot_until_nonempty(path: &PathBuf) -> Vec<agentmon_proto::TestRunInfo> {
+        for _ in 0..20 {
+            let client = UnixStream::connect(path).expect("connect as subscriber");
+            let mut writer = client.try_clone().expect("clone stream");
+            write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+            let mut reader = BufReader::new(client);
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read snapshot")
+                .expect("connection should not close before snapshot");
+
+            let ServerMessage::Snapshot { test_runs, .. } = message else {
+                panic!("expected a Snapshot message, got {message:?}");
+            };
+            if !test_runs.is_empty() {
+                return test_runs;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Vec::new()
+    }
+
     fn read_snapshot_until_nonempty(path: &PathBuf) -> Vec<AgentInfo> {
         for _ in 0..20 {
             let client = UnixStream::connect(path).expect("connect as subscriber");
@@ -154,7 +193,7 @@ mod tests {
                 .expect("read snapshot")
                 .expect("connection should not close before snapshot");
 
-            let ServerMessage::Snapshot { agents } = message else {
+            let ServerMessage::Snapshot { agents, .. } = message else {
                 panic!("expected a Snapshot message, got {message:?}");
             };
             if !agents.is_empty() {
@@ -183,7 +222,7 @@ mod tests {
                 .expect("read snapshot")
                 .expect("connection should not close before snapshot");
 
-            let ServerMessage::Snapshot { agents } = message else {
+            let ServerMessage::Snapshot { agents, .. } = message else {
                 panic!("expected a Snapshot message, got {message:?}");
             };
             if agents
@@ -354,5 +393,63 @@ mod tests {
             1,
             "the ignored needs-input event must not trigger a second notification"
         );
+    }
+
+    #[test]
+    fn subscriber_receives_a_snapshot_containing_a_reported_test_run() {
+        let (path, _notifier) = spawn_test_server("test-run-snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportTestRun {
+                    cwd: PathBuf::from("/tmp/project"),
+                    pid: 999,
+                    status: agentmon_proto::TestRunStatus::Started,
+                },
+            )
+            .expect("send test-run event");
+        }
+
+        let test_runs = read_test_run_snapshot_until_nonempty(&path);
+
+        assert_eq!(test_runs.len(), 1);
+        assert_eq!(test_runs[0].cwd, PathBuf::from("/tmp/project"));
+        assert_eq!(test_runs[0].status, agentmon_proto::TestRunStatus::Started);
+    }
+
+    #[test]
+    fn connected_subscriber_receives_a_test_run_update() {
+        let (path, _notifier) = spawn_test_server("test-run-update");
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportTestRun {
+                    cwd: PathBuf::from("/tmp/project"),
+                    pid: 999,
+                    status: agentmon_proto::TestRunStatus::Failed,
+                },
+            )
+            .expect("send test-run event");
+        }
+
+        let update: ServerMessage = read_message(&mut reader)
+            .expect("read update")
+            .expect("connection should not close before update");
+        let ServerMessage::TestRunUpdate { test_run } = update else {
+            panic!("expected a TestRunUpdate message, got {update:?}");
+        };
+        assert_eq!(test_run.status, agentmon_proto::TestRunStatus::Failed);
     }
 }
