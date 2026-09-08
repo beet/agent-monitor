@@ -80,7 +80,7 @@ fn quitting_a_tui_client_does_not_affect_the_daemon_or_its_tracked_agents() {
         write_message(&mut quitting_client, &ClientMessage::Subscribe).expect("subscribe");
         let mut quitting_reader = BufReader::new(quitting_client.try_clone().unwrap());
         match read_message::<_, ServerMessage>(&mut quitting_reader).unwrap() {
-            Some(ServerMessage::Snapshot { agents: snapshot }) if !snapshot.is_empty() => {
+            Some(ServerMessage::Snapshot { agents: snapshot, .. }) if !snapshot.is_empty() => {
                 agents = snapshot;
                 // "Quit": close the connection, exactly as process exit
                 // would close the real TUI's socket fd.
@@ -104,7 +104,7 @@ fn quitting_a_tui_client_does_not_affect_the_daemon_or_its_tracked_agents() {
     let (tx2, rx2) = mpsc::channel();
     spawn_client(path, tx2);
     match rx2.recv_timeout(Duration::from_secs(2)) {
-        Ok(ClientEvent::Snapshot(agents)) => {
+        Ok(ClientEvent::Snapshot(agents, _)) => {
             assert_eq!(agents.len(), 1, "daemon should still be tracking the agent");
             assert_eq!(agents[0].session_id, SessionId("session-1".to_string()));
         }

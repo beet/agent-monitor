@@ -6,6 +6,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 
 use agentmon::app::App;
 use agentmon::client::{spawn_client, ClientEvent};
+use agentmon::init_rspec::{formatter_path, write_rspec_local};
 use agentmon::input::{handle_key, InputAction};
 use agentmon::ui::render;
 use agentmon_proto::default_socket_path;
@@ -23,10 +24,31 @@ enum AppEvent {
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> std::io::Result<()> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("init-rspec") {
+        return run_init_rspec();
+    }
+
     let mut terminal = ratatui::init();
     let result = run(&mut terminal);
     ratatui::restore();
     result
+}
+
+fn run_init_rspec() -> std::io::Result<()> {
+    let Some(formatter) = formatter_path() else {
+        eprintln!("agentmon: could not determine this binary's install location");
+        std::process::exit(1);
+    };
+
+    let cwd = std::env::current_dir()?;
+    write_rspec_local(&cwd, &formatter)?;
+    println!(
+        "agentmon: wrote {} (pointing at {})",
+        cwd.join(".rspec-local").display(),
+        formatter.display()
+    );
+    Ok(())
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
@@ -74,8 +96,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         match rx.recv() {
             Ok(AppEvent::Client(ClientEvent::Unreachable(reason))) => app.set_unreachable(reason),
             Ok(AppEvent::Client(ClientEvent::Reconnecting)) => app.set_reconnecting(),
-            Ok(AppEvent::Client(ClientEvent::Snapshot(agents))) => app.apply_snapshot(agents),
+            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs))) => {
+                app.apply_snapshot(agents, test_runs)
+            }
             Ok(AppEvent::Client(ClientEvent::Update(agent))) => app.apply_update(agent),
+            Ok(AppEvent::Client(ClientEvent::TestRunUpdate(test_run))) => {
+                app.apply_test_run_update(test_run)
+            }
             Ok(AppEvent::Key(key)) => {
                 if handle_key(key) == InputAction::Quit {
                     return Ok(());
