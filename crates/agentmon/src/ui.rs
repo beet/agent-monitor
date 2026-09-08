@@ -102,18 +102,15 @@ fn host_label(host: HostContext) -> &'static str {
 /// tests) and not only through color.
 fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
     match status {
-        AgentStatus::Running => ("running", Style::new().fg(Color::Blue)),
-        AgentStatus::Idle => ("idle", Style::new().fg(Color::Gray)),
+        AgentStatus::Running => ("🔧 running", Style::new().fg(Color::Blue)),
+        AgentStatus::Idle => ("💤 idle", Style::new().fg(Color::Gray)),
         AgentStatus::NeedsInput => (
-            "NEEDS INPUT",
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            "🔔 NEEDS INPUT",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        AgentStatus::Done => ("done", Style::new().fg(Color::Green)),
+        AgentStatus::Done => ("✅ done", Style::new().fg(Color::Green)),
         AgentStatus::Stale => (
-            "stale",
+            "🕸️ stale",
             Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -201,7 +198,7 @@ mod tests {
         assert!(text.contains("running"));
 
         // ...and by style: locate the "NEEDS INPUT" cell and confirm its
-        // background differs from a "running" cell's.
+        // foreground color differs from a "running" cell's.
         let buffer = term.backend().buffer();
         let needs_input_cell = (0..buffer.area.width)
             .find(|&x| buffer[(x, 3)].symbol() == "N")
@@ -213,7 +210,7 @@ mod tests {
         let needs_input_cell = needs_input_cell.expect("NEEDS INPUT cell should be found");
         let running_cell = running_cell.expect("running cell should be found");
         assert_ne!(
-            needs_input_cell.bg, running_cell.bg,
+            needs_input_cell.fg, running_cell.fg,
             "needs-input styling must differ from running styling"
         );
     }

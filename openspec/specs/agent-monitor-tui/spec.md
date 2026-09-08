@@ -45,11 +45,15 @@ The TUI SHALL display each tracked agent's working directory/project, host conte
 - **THEN** the row includes that agent's last-updated time converted to the system's local timezone and formatted as `%Y-%m-%d %H:%M:%S` (e.g. `2026-09-01 16:32:07`), without a UTC offset or timezone code
 
 ### Requirement: Status is visually distinguishable
-The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale) from one another so the user can scan the list and immediately identify agents needing attention.
+The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale) from one another so the user can scan the list and immediately identify agents needing attention. Each status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, and stale with 🕸️.
 
 #### Scenario: An agent needs input
 - **WHEN** an agent's status is "needs input"
-- **THEN** that row is visually distinguished (e.g. color or marker) from rows in other states
+- **THEN** that row displays the 🔔 marker and is visually distinguished (e.g. color) from rows in other states, using bold colored text rather than a solid background fill
+
+#### Scenario: Each status has a distinct emoji marker
+- **WHEN** the TUI renders a row for an agent
+- **THEN** the status cell is prefixed with the emoji for that status (🔧 running, 💤 idle, 🔔 needs input, ✅ done, 🕸️ stale)
 
 ### Requirement: Navigation and quit do not affect tracked agents
 The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
