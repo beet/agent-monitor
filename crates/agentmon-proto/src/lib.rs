@@ -42,6 +42,7 @@ pub enum AgentStatus {
     NeedsInput,
     Done,
     Stale,
+    Declined,
 }
 
 /// A status event reported by a Claude Code hook to the daemon.
@@ -196,6 +197,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentStatus::NeedsInput).unwrap(),
             "\"needs_input\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentStatus::Declined).unwrap(),
+            "\"declined\""
         );
     }
 }

@@ -61,7 +61,7 @@ The TUI SHALL display each tracked agent's working directory/project, host conte
 - **THEN** the TUI displays a duration counted from the new status-since timestamp, not accumulated from the earlier running period
 
 ### Requirement: Status is visually distinguishable
-The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale) from one another so the user can scan the list and immediately identify agents needing attention. Each status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, and stale with 🕸️.
+The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) from one another so the user can scan the list and immediately identify agents needing attention. Each status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 🕸️, and declined with 🚫.
 
 #### Scenario: An agent needs input
 - **WHEN** an agent's status is "needs input"
@@ -69,7 +69,11 @@ The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs inp
 
 #### Scenario: Each status has a distinct emoji marker
 - **WHEN** the TUI renders a row for an agent
-- **THEN** the status cell is prefixed with the emoji for that status (🔧 running, 💤 idle, 🔔 needs input, ✅ done, 🕸️ stale)
+- **THEN** the status cell is prefixed with the emoji for that status (🔧 running, 💤 idle, 🔔 needs input, ✅ done, 🕸️ stale, 🚫 declined)
+
+#### Scenario: A declined permission is visually distinguished
+- **WHEN** an agent's status is "declined"
+- **THEN** that row displays the 🚫 marker and is visually distinguished (e.g. color) from rows in other states
 
 ### Requirement: Navigation and quit do not affect tracked agents
 The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.

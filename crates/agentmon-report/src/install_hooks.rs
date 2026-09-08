@@ -17,6 +17,7 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostToolUse", ""),
     ("Stop", ""),
     ("Notification", NEEDS_INPUT_MATCHER),
+    ("PermissionDenied", ""),
 ];
 
 /// The default per-user Claude Code settings file.

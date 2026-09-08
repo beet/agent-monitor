@@ -41,6 +41,7 @@ pub fn status_for_payload(payload: &HookPayload) -> Option<AgentStatus> {
         "PreToolUse" => Some(AgentStatus::Running),
         "PostToolUse" => Some(AgentStatus::Running),
         "Stop" => Some(AgentStatus::Done),
+        "PermissionDenied" => Some(AgentStatus::Declined),
         "Notification" => {
             let notification_type = payload.notification_type.as_deref()?;
             NEEDS_INPUT_NOTIFICATION_TYPES
@@ -96,6 +97,21 @@ mod tests {
         let payload = parse_hook_payload(raw).unwrap();
 
         assert_eq!(status_for_payload(&payload), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn parses_a_permission_denied_payload_as_declined() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PermissionDenied",
+            "tool_name": "Bash",
+            "denied_by": "user"
+        }"#;
+
+        let payload = parse_hook_payload(raw).unwrap();
+
+        assert_eq!(status_for_payload(&payload), Some(AgentStatus::Declined));
     }
 
     #[test]

@@ -157,6 +157,7 @@ fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
         ),
+        AgentStatus::Declined => ("🚫 declined", Style::new().fg(Color::Red)),
     }
 }
 
@@ -383,6 +384,46 @@ mod tests {
         let (text, _) = status_cell_text_and_style(&idle, 1_000_000);
 
         assert_eq!(text, "💤 idle");
+    }
+
+    #[test]
+    fn a_declined_agent_shows_no_duration() {
+        let declined = agent("s", AgentStatus::Declined, HostContext::Terminal, 4242, 0);
+
+        let (text, _) = status_cell_text_and_style(&declined, 1_000_000);
+
+        assert_eq!(text, "🚫 declined");
+    }
+
+    #[test]
+    fn declined_is_visually_distinguished_from_other_statuses() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![
+            agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
+            agent("b", AgentStatus::Declined, HostContext::Terminal, 4243, 0),
+        ]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("declined"), "expected declined status, got:\n{text}");
+        assert!(text.contains("running"), "expected running status, got:\n{text}");
+
+        let buffer = term.backend().buffer();
+        let declined_cell = (0..buffer.area.width)
+            .find(|&x| buffer[(x, 3)].symbol() == "d")
+            .map(|x| &buffer[(x, 3)]);
+        let running_cell = (0..buffer.area.width)
+            .find(|&x| buffer[(x, 2)].symbol() == "r")
+            .map(|x| &buffer[(x, 2)]);
+
+        let declined_cell = declined_cell.expect("declined cell should be found");
+        let running_cell = running_cell.expect("running cell should be found");
+        assert_ne!(
+            declined_cell.fg, running_cell.fg,
+            "declined styling must differ from running styling"
+        );
     }
 
     #[test]

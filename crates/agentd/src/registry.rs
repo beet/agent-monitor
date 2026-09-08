@@ -254,6 +254,32 @@ mod tests {
     }
 
     #[test]
+    fn running_event_clears_a_declined_session() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Declined));
+
+        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+
+        assert_eq!(outcome.agent.status, AgentStatus::Running);
+        assert_eq!(outcome.previous_status, Some(AgentStatus::Declined));
+        assert_eq!(registry.snapshot()[0].status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn done_event_clears_a_declined_session() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Declined));
+
+        let outcome = registry.upsert(sample_event(AgentStatus::Done));
+
+        assert_eq!(outcome.agent.status, AgentStatus::Done);
+        assert_eq!(outcome.previous_status, Some(AgentStatus::Declined));
+        assert_eq!(registry.snapshot()[0].status, AgentStatus::Done);
+    }
+
+    #[test]
     fn running_event_clears_a_needs_input_session_via_post_tool_use() {
         let registry = Registry::new();
         registry.upsert(sample_event(AgentStatus::Running));

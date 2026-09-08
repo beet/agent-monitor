@@ -110,6 +110,7 @@ mod tests {
         assert!(notification_script(&sample_agent(AgentStatus::Running)).is_none());
         assert!(notification_script(&sample_agent(AgentStatus::Idle)).is_none());
         assert!(notification_script(&sample_agent(AgentStatus::Stale)).is_none());
+        assert!(notification_script(&sample_agent(AgentStatus::Declined)).is_none());
     }
 
     #[test]
@@ -133,5 +134,6 @@ mod tests {
         assert_eq!(status_notification(AgentStatus::Running), None);
         assert_eq!(status_notification(AgentStatus::Idle), None);
         assert_eq!(status_notification(AgentStatus::Stale), None);
+        assert_eq!(status_notification(AgentStatus::Declined), None);
     }
 }
