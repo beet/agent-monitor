@@ -45,10 +45,11 @@ impl Registry {
     /// as an untouched duplicate row sharing the live pid.
     pub fn upsert(&self, event: AgentEvent) -> UpsertOutcome {
         let mut state = self.state.lock().unwrap();
-        let previous_status = state.agents.get(&event.session_id).map(|a| a.status);
+        let previous = state.agents.get(&event.session_id).cloned();
+        let previous_status = previous.as_ref().map(|a| a.status);
 
         if previous_status == Some(AgentStatus::Done) && event.status == AgentStatus::NeedsInput {
-            let agent = state.agents.get(&event.session_id).unwrap().clone();
+            let agent = previous.unwrap();
             return UpsertOutcome {
                 agent,
                 is_new: false,
@@ -64,13 +65,20 @@ impl Registry {
                 });
         }
 
+        let now = now_ms();
+        let status_since_ms = match &previous {
+            Some(agent) if agent.status == event.status => agent.status_since_ms,
+            _ => now,
+        };
+
         let agent = AgentInfo {
             session_id: event.session_id.clone(),
             cwd: event.cwd,
             host_context: event.host_context,
             pid: event.pid,
             status: event.status,
-            last_updated_ms: now_ms(),
+            last_updated_ms: now,
+            status_since_ms,
         };
         state.agents.insert(agent.session_id.clone(), agent.clone());
 
@@ -89,8 +97,10 @@ impl Registry {
         if agent.status == AgentStatus::Stale {
             return None;
         }
+        let now = now_ms();
         agent.status = AgentStatus::Stale;
-        agent.last_updated_ms = now_ms();
+        agent.last_updated_ms = now;
+        agent.status_since_ms = now;
         Some(agent.clone())
     }
 
@@ -112,6 +122,8 @@ mod tests {
     use super::*;
     use agentmon_proto::HostContext;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
 
     fn sample_event(status: AgentStatus) -> AgentEvent {
         AgentEvent {
@@ -151,12 +163,52 @@ mod tests {
     }
 
     #[test]
+    fn same_status_event_leaves_status_since_ms_unchanged() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        let status_since_ms = registry.snapshot()[0].status_since_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        // A `PostToolUse` event during the same running turn reports the
+        // same status - it must not look like a fresh transition.
+        registry.upsert(sample_event(AgentStatus::Running));
+
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot[0].status_since_ms, status_since_ms,
+            "a same-status event must not reset status_since_ms"
+        );
+        assert!(
+            snapshot[0].last_updated_ms > status_since_ms,
+            "last_updated_ms must still advance even when status is unchanged"
+        );
+    }
+
+    #[test]
+    fn status_transition_resets_status_since_ms() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        let running_status_since_ms = registry.snapshot()[0].status_since_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        registry.upsert(sample_event(AgentStatus::Done));
+
+        let snapshot = registry.snapshot();
+        assert!(
+            snapshot[0].status_since_ms > running_status_since_ms,
+            "a status transition must reset status_since_ms to the current time"
+        );
+    }
+
+    #[test]
     fn needs_input_event_is_dropped_when_session_already_done() {
         let registry = Registry::new();
         registry.upsert(sample_event(AgentStatus::Running));
         registry.upsert(sample_event(AgentStatus::Done));
         let done_snapshot = registry.snapshot();
         let done_last_updated_ms = done_snapshot[0].last_updated_ms;
+        let done_status_since_ms = done_snapshot[0].status_since_ms;
+        thread::sleep(Duration::from_millis(10));
 
         let outcome = registry.upsert(sample_event(AgentStatus::NeedsInput));
 
@@ -168,6 +220,10 @@ mod tests {
         assert_eq!(
             snapshot[0].last_updated_ms, done_last_updated_ms,
             "a dropped needs-input event must not update last_updated_ms"
+        );
+        assert_eq!(
+            snapshot[0].status_since_ms, done_status_since_ms,
+            "a dropped needs-input event must not update status_since_ms"
         );
     }
 
@@ -217,12 +273,18 @@ mod tests {
     fn mark_stale_transitions_a_known_agent() {
         let registry = Registry::new();
         registry.upsert(sample_event(AgentStatus::Running));
+        let running_status_since_ms = registry.snapshot()[0].status_since_ms;
         let session_id = SessionId("session-1".to_string());
+        thread::sleep(Duration::from_millis(10));
 
         let updated = registry.mark_stale(&session_id);
 
         assert_eq!(updated.map(|a| a.status), Some(AgentStatus::Stale));
         assert_eq!(registry.snapshot()[0].status, AgentStatus::Stale);
+        assert!(
+            registry.snapshot()[0].status_since_ms > running_status_since_ms,
+            "marking an agent stale must reset its status_since_ms"
+        );
     }
 
     #[test]

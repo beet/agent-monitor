@@ -15,7 +15,12 @@ use agentmon_proto::default_socket_path;
 enum AppEvent {
     Client(ClientEvent),
     Key(crossterm::event::KeyEvent),
+    Tick,
 }
+
+/// How often the tick thread wakes the main loop to redraw, so a running
+/// agent's elapsed duration counts up even without a new daemon event.
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> std::io::Result<()> {
     let mut terminal = ratatui::init();
@@ -38,11 +43,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         }
     });
 
+    let key_tx = tx.clone();
     thread::spawn(move || loop {
         match event::poll(Duration::from_millis(150)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if tx.send(AppEvent::Key(key)).is_err() {
+                    if key_tx.send(AppEvent::Key(key)).is_err() {
                         return;
                     }
                 }
@@ -51,6 +57,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             },
             Ok(false) => {}
             Err(_) => return,
+        }
+    });
+
+    thread::spawn(move || loop {
+        thread::sleep(TICK_INTERVAL);
+        if tx.send(AppEvent::Tick).is_err() {
+            return;
         }
     });
 
@@ -68,6 +81,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                     return Ok(());
                 }
             }
+            Ok(AppEvent::Tick) => {}
             Err(_) => return Ok(()),
         }
     }

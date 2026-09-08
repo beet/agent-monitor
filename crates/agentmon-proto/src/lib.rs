@@ -64,6 +64,10 @@ pub struct AgentInfo {
     pub status: AgentStatus,
     /// Unix epoch milliseconds of the last update to this agent.
     pub last_updated_ms: u64,
+    /// Unix epoch milliseconds of when this agent most recently entered
+    /// its current status, unlike `last_updated_ms` which also bumps on
+    /// same-status events (e.g. each tool call while running).
+    pub status_since_ms: u64,
 }
 
 /// The first message a connection sends, telling the daemon whether it is a
@@ -97,6 +101,7 @@ mod tests {
             pid: 4242,
             status: AgentStatus::Running,
             last_updated_ms: 1_700_000_000_000,
+            status_since_ms: 1_700_000_000_000,
         }
     }
 
@@ -124,6 +129,10 @@ mod tests {
         let decoded: AgentInfo = serde_json::from_str(&json).unwrap();
 
         assert_eq!(info, decoded);
+        assert!(
+            json.contains("\"status_since_ms\":1700000000000"),
+            "expected status_since_ms field in JSON, got: {json}"
+        );
     }
 
     #[test]

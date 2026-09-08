@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ratatui::layout::Constraint;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
@@ -30,14 +32,15 @@ fn render_message(frame: &mut Frame, message: &str) {
 fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
     let header = Row::new(["PROJECT", "HOST", "PID", "STATUS", "UPDATED"]).style(Style::new().bold());
 
+    let now = now_ms();
     let agents = sorted_by_recency(&app.agents);
     let rows = agents.iter().map(|agent| {
-        let (label, style) = status_label_and_style(agent.status);
+        let (status_cell, style) = status_cell_text_and_style(agent, now);
         Row::new([
             Cell::from(project_name(agent)),
             Cell::from(host_label(agent.host_context)),
             Cell::from(agent.pid.to_string()),
-            Cell::from(label).style(style),
+            Cell::from(status_cell).style(style),
             Cell::from(format_last_updated(agent.last_updated_ms)),
         ])
     });
@@ -81,6 +84,31 @@ fn format_last_updated(last_updated_ms: u64) -> String {
         .to_string()
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Formats the elapsed time since `status_since_ms` as a compact counter:
+/// `9s` under a minute, `2m14s` under an hour, `1h03m` at an hour or more
+/// (seconds are dropped once hours are shown, since they stop being useful).
+fn format_running_duration(status_since_ms: u64, now_ms: u64) -> String {
+    let elapsed_secs = now_ms.saturating_sub(status_since_ms) / 1000;
+    let hours = elapsed_secs / 3600;
+    let minutes = (elapsed_secs % 3600) / 60;
+    let seconds = elapsed_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn project_name(agent: &AgentInfo) -> String {
     agent
         .cwd
@@ -95,6 +123,20 @@ fn host_label(host: HostContext) -> &'static str {
         HostContext::Terminal => "terminal",
         HostContext::Desktop => "desktop",
     }
+}
+
+/// The STATUS cell's text and style for one agent: the running status gets
+/// an appended elapsed-duration counter (see `format_running_duration`);
+/// every other status renders as just its label.
+fn status_cell_text_and_style(agent: &AgentInfo, now_ms: u64) -> (String, Style) {
+    let (label, style) = status_label_and_style(agent.status);
+    let text = match agent.status {
+        AgentStatus::Running => {
+            format!("{label} {}", format_running_duration(agent.status_since_ms, now_ms))
+        }
+        _ => label.to_string(),
+    };
+    (text, style)
 }
 
 /// Every status gets both a distinct label and a distinct style, so the
@@ -138,6 +180,21 @@ mod tests {
             pid,
             status,
             last_updated_ms,
+            status_since_ms: last_updated_ms,
+        }
+    }
+
+    fn agent_with_status_since(
+        id: &str,
+        status: AgentStatus,
+        host: HostContext,
+        pid: u32,
+        last_updated_ms: u64,
+        status_since_ms: u64,
+    ) -> AgentInfo {
+        AgentInfo {
+            status_since_ms,
+            ..agent(id, status, host, pid, last_updated_ms)
         }
     }
 
@@ -285,6 +342,69 @@ mod tests {
         assert!(
             text.contains(&expected),
             "expected local timestamp {expected:?}, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn format_running_duration_under_a_minute() {
+        assert_eq!(format_running_duration(0, 9_000), "9s");
+    }
+
+    #[test]
+    fn format_running_duration_under_an_hour() {
+        assert_eq!(format_running_duration(0, 134_000), "2m14s");
+    }
+
+    #[test]
+    fn format_running_duration_an_hour_or_more() {
+        assert_eq!(format_running_duration(0, 3_780_000), "1h03m");
+    }
+
+    #[test]
+    fn a_running_agent_shows_its_elapsed_duration() {
+        let running = agent_with_status_since(
+            "s",
+            AgentStatus::Running,
+            HostContext::Terminal,
+            4242,
+            1_000_000,
+            866_000,
+        );
+
+        let (text, _) = status_cell_text_and_style(&running, 1_000_000);
+
+        assert_eq!(text, "🔧 running 2m14s");
+    }
+
+    #[test]
+    fn a_non_running_agent_shows_no_duration() {
+        let idle = agent("s", AgentStatus::Idle, HostContext::Terminal, 4242, 0);
+
+        let (text, _) = status_cell_text_and_style(&idle, 1_000_000);
+
+        assert_eq!(text, "💤 idle");
+    }
+
+    #[test]
+    fn a_running_agent_row_includes_a_duration_in_the_rendered_table() {
+        let mut term = terminal();
+        let mut app = App::new();
+        let now = now_ms();
+        app.apply_snapshot(vec![agent_with_status_since(
+            "s",
+            AgentStatus::Running,
+            HostContext::Terminal,
+            4242,
+            now,
+            now - 134_000,
+        )]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("2m1"),
+            "expected a running duration around 2m14s, got:\n{text}"
         );
     }
 }

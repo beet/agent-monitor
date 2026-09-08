@@ -1,21 +1,4 @@
-# agent-monitor-tui Specification
-
-## Purpose
-
-Gives the user a single, live-updating terminal view of every Claude Code agent session tracked by the daemon, across nvim, standalone terminals, and the desktop app.
-
-## Requirements
-
-### Requirement: Connect to the daemon
-The TUI SHALL connect to the daemon's local socket on startup and clearly inform the user when the daemon is unreachable.
-
-#### Scenario: Daemon is running
-- **WHEN** the TUI starts and the daemon's socket is reachable
-- **THEN** the TUI connects and begins displaying tracked agents
-
-#### Scenario: Daemon is not running
-- **WHEN** the TUI starts and cannot reach the daemon's socket
-- **THEN** the TUI displays a clear message that the daemon is not running instead of showing a blank or misleading agent list
+## MODIFIED Requirements
 
 ### Requirement: Live agent list
 The TUI SHALL display each tracked agent's working directory/project, host context (nvim, standalone terminal, or desktop app), process id, current status, and last-updated time in the system's local timezone formatted `%Y-%m-%d %H:%M:%S`, updating the display as the daemon reports changes. Agents SHALL be displayed sorted by last-updated time, most recent first. An agent whose status is "running" SHALL additionally display the elapsed duration since it entered "running" (per the daemon's status-since timestamp), formatted as a compact counter (e.g. `2m14s`) and kept current by the TUI's own periodic redraw rather than only refreshing when the daemon pushes an update. An agent not in "running" status SHALL NOT display a duration.
@@ -59,28 +42,3 @@ The TUI SHALL display each tracked agent's working directory/project, host conte
 #### Scenario: A status transition resets the displayed duration
 - **WHEN** an agent transitions out of and back into "running" status (for example, "running" to "needs input" and back to "running")
 - **THEN** the TUI displays a duration counted from the new status-since timestamp, not accumulated from the earlier running period
-
-### Requirement: Status is visually distinguishable
-The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale) from one another so the user can scan the list and immediately identify agents needing attention. Each status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, and stale with 🕸️.
-
-#### Scenario: An agent needs input
-- **WHEN** an agent's status is "needs input"
-- **THEN** that row displays the 🔔 marker and is visually distinguished (e.g. color) from rows in other states, using bold colored text rather than a solid background fill
-
-#### Scenario: Each status has a distinct emoji marker
-- **WHEN** the TUI renders a row for an agent
-- **THEN** the status cell is prefixed with the emoji for that status (🔧 running, 💤 idle, 🔔 needs input, ✅ done, 🕸️ stale)
-
-### Requirement: Navigation and quit do not affect tracked agents
-The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
-
-#### Scenario: User quits the TUI
-- **WHEN** the user presses the quit key
-- **THEN** the TUI process exits while the daemon keeps running and continues tracking agents
-
-### Requirement: Reconnect after daemon restart
-The TUI SHALL detect when its connection to the daemon drops and attempt to reconnect, resuming display of current agent state once reconnected.
-
-#### Scenario: Daemon restarts while the TUI is open
-- **WHEN** the daemon process restarts (e.g. after an update) while the TUI is running
-- **THEN** the TUI detects the dropped connection, retries connecting, and repopulates the agent list once the daemon is back

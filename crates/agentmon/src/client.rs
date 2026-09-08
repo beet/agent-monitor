@@ -132,6 +132,7 @@ mod tests {
             pid: 42,
             status,
             last_updated_ms: 0,
+            status_since_ms: 0,
         }
     }
 

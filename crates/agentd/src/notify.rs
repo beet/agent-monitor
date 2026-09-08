@@ -83,6 +83,7 @@ mod tests {
             pid: 4242,
             status,
             last_updated_ms: 1_700_000_000_000,
+            status_since_ms: 1_700_000_000_000,
         }
     }
 
