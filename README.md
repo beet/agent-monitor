@@ -28,27 +28,17 @@ Then run `agentmon` in a terminal to see tracked sessions.
 
 ### RSpec test-run notifications (optional)
 
-In a Ruby project, run:
-
-```
-agentmon init-rspec
-```
-
-This writes a `.rspec-local` file (RSpec's own mechanism for personal, untracked local options) pointing at the bundled formatter, without touching the project's tracked `.rspec`. Once in place, `bundle exec rspec` reports each run's start/pass/fail to `agentd`, correlated by working directory to whatever agent(s) are tracked there - regardless of whether the run was started by an agent's own tool call, from nvim, or from another terminal. A failing run in a directory with no tracked agent still gets a plain macOS notification so results are never silently dropped.
+Run `agentmon init-rspec` in a Ruby project. It writes a `.rspec-local` file (untracked, leaves `.rspec` alone) that reports each `bundle exec rspec` run's start/pass/fail to `agentd`, matched to whatever agent(s) are tracked in that directory - whether the run came from an agent, nvim, or a plain terminal. A failing run with no tracked agent still triggers a plain macOS notification.
 
 #### Editor test runners (e.g. neotest-rspec)
 
-`.rspec-local` alone isn't enough for editor/test-runner integrations that invoke `rspec` with their own explicit `-f`/`--format` flags - which is most of them, since they need their own formatter to parse results back into the editor. RSpec merges CLI, file (`.rspec`/`.rspec-local`), and `SPEC_OPTS` options from separate sources, but for the formatter list specifically, whichever source runs *last* completely replaces the others rather than combining with them - it does not append. Since these tools pass `-f`/`--format` directly on the command line, that always wins over `.rspec-local`'s `--format` entry, silently dropping this formatter even though it's still `--require`d (only `:libs`/`:requires` are merged additively across sources; `:formatters` is not).
-
-The fix is to get this formatter's `--require`/`--format` onto the *same* command line the tool builds, rather than a separate file - multiple `-f` flags within one source do coexist normally. For [neotest-rspec](https://github.com/olimorris/neotest-rspec), whose adapter builds its command by flattening its own `-f`/`-o` flags onto whatever `rspec_cmd` returns, that means overriding `rspec_cmd` in its setup:
+Test runners that pass their own `-f`/`--format` flag (most editor integrations do) override `.rspec-local`'s formatter instead of combining with it, so it won't load by default. Point the runner's own command-building option at it instead. For [neotest-rspec](https://github.com/olimorris/neotest-rspec):
 
 ```lua
 require("neotest-rspec")({
   rspec_cmd = function()
     local cmd = { "bundle", "exec", "rspec" }
-    -- Resolve via `brew --prefix`, not a hardcoded path, so this survives
-    -- being shared across machines with different Homebrew prefixes
-    -- (Apple Silicon vs Intel) and across `brew upgrade`.
+    -- brew --prefix, not a hardcoded path, so this works across machines/Homebrew prefixes
     if vim.fn.executable("brew") == 1 then
       local prefix = vim.fn.system("brew --prefix agent-monitor"):gsub("%s+$", "")
       if vim.v.shell_error == 0 then
@@ -63,7 +53,7 @@ require("neotest-rspec")({
 })
 ```
 
-Other editor/CI integrations that pass their own `--format` will need the equivalent: whatever mechanism they expose for customizing their base command, rather than relying on `.rspec-local`.
+Other tools that pass their own `--format` need the same treatment: whatever option they expose for customizing the base command.
 
 ## Upgrade
 
