@@ -101,7 +101,7 @@ The daemon SHALL accept test-run events (distinct from Claude Code hook events) 
 - **THEN** the daemon accepts the event and updates its tracked test runs accordingly
 
 ### Requirement: Agents and test runs are grouped by working directory
-The daemon SHALL group tracked agents and test runs by exact working directory match: each distinct working directory forms a group containing zero or more tracked agents (keyed by session id, as today) and zero or more tracked test runs. This grouping is additive to agent tracking - it SHALL NOT change how individual agent events are processed, keyed, or deduplicated. A test run SHALL be identified independently of any agent (for example, by working directory and process id together), so that multiple test runs and multiple agents can coexist in the same directory's group without colliding.
+The daemon SHALL group tracked agents and test runs by exact working directory match: each distinct working directory forms a group containing zero or more tracked agents (keyed by session id, as today) and at most one tracked test run. This grouping is additive to agent tracking - it SHALL NOT change how individual agent events are processed, keyed, or deduplicated. A test run SHALL be identified by its working directory alone, independent of any agent: reporting a new test-run event for a directory SHALL replace any previously tracked test run for that directory, regardless of process id, so a directory's test-run row always reflects only the most recently reported run rather than accumulating one entry per invocation.
 
 #### Scenario: A test run in a directory with a tracked agent
 - **WHEN** a test-run event's working directory exactly matches a directory with at least one tracked agent
@@ -118,6 +118,10 @@ The daemon SHALL group tracked agents and test runs by exact working directory m
 #### Scenario: Grouping does not affect agent identity
 - **WHEN** the daemon processes an agent hook event
 - **THEN** it applies the existing session-id-keyed registry behavior unchanged, independent of how many test runs share that agent's directory group
+
+#### Scenario: A later test run replaces the previous one in the same directory
+- **WHEN** the daemon receives a test-run event for a working directory that already has a tracked test run, reported by a different process id than the one currently tracked
+- **THEN** the daemon replaces the tracked test run with the new one instead of tracking both, so repeated invocations in the same directory (for example, an edit/test loop) never accumulate more than one test-run row per directory
 
 ### Requirement: Notification fallback for a test run with no tracked agent
 When a test-run event reports "failed" status and its directory group contains no tracked agent, the daemon SHALL send a plain macOS user notification identifying the working directory, played with the built-in `Basso` system sound, since there is no agent row that would otherwise surface the failure to the user. `Basso` SHALL be distinct from the `Glass` and `Ping` sounds used for agent completion notifications, so a test failure is not confused with either by ear.

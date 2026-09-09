@@ -8,10 +8,14 @@ use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus, SessionId, TestRunInfo,
 #[derive(Default)]
 struct RegistryState {
     agents: HashMap<SessionId, AgentInfo>,
-    /// Keyed by (working directory, pid) rather than any agent identity - a
-    /// test run may be launched outside any tracked agent's process tree,
-    /// per the rspec-test-reporting spec.
-    test_runs: HashMap<(PathBuf, u32), TestRunInfo>,
+    /// Keyed by working directory alone, not by pid or any agent identity: a
+    /// test run may be launched outside any tracked agent's process tree
+    /// (per the rspec-test-reporting spec), and a directory holds at most
+    /// one tracked test run at a time - a later report for the same
+    /// directory always replaces the previous one, regardless of pid, so
+    /// repeated invocations (e.g. an edit/test loop) don't accumulate one
+    /// entry per invocation.
+    test_runs: HashMap<PathBuf, TestRunInfo>,
 }
 
 /// A tracked test run's update, paired with whether its working directory
@@ -132,10 +136,11 @@ impl Registry {
         state.agents.values().cloned().collect()
     }
 
-    /// Records a test-run event, keyed by `(cwd, pid)`. A later event for the
-    /// same key overwrites the earlier one (last write wins) rather than
-    /// accumulating history, mirroring how an agent's row persists until its
-    /// next status transition.
+    /// Records a test-run event, keyed by `cwd` alone. A later event for the
+    /// same directory always replaces the previous one - even if it was
+    /// reported by a different pid - rather than accumulating one entry per
+    /// invocation, mirroring how an agent's row persists until its next
+    /// status transition.
     pub fn upsert_test_run(&self, cwd: PathBuf, pid: u32, status: TestRunStatus) -> TestRunUpsertOutcome {
         let mut state = self.state.lock().unwrap();
         let test_run = TestRunInfo {
@@ -144,7 +149,7 @@ impl Registry {
             status,
             last_updated_ms: now_ms(),
         };
-        state.test_runs.insert((cwd.clone(), pid), test_run.clone());
+        state.test_runs.insert(cwd.clone(), test_run.clone());
         let has_tracked_agent = state.agents.values().any(|agent| agent.cwd == cwd);
 
         TestRunUpsertOutcome {
@@ -479,13 +484,52 @@ mod tests {
     }
 
     #[test]
-    fn different_pids_in_the_same_directory_do_not_collide() {
+    fn different_pids_in_the_same_directory_collapse_to_one_entry() {
         let registry = Registry::new();
         registry.upsert_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Started);
 
         registry.upsert_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Started);
 
-        assert_eq!(registry.snapshot_test_runs().len(), 2);
+        assert_eq!(
+            registry.snapshot_test_runs().len(),
+            1,
+            "a directory holds at most one test run, regardless of how many distinct pids report to it"
+        );
+    }
+
+    #[test]
+    fn a_later_test_run_from_a_different_pid_replaces_the_previous_one() {
+        let registry = Registry::new();
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Started);
+
+        let outcome = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Failed);
+
+        assert_eq!(
+            outcome.test_run.pid, 222,
+            "the surviving entry must reflect the newest report, not the first one"
+        );
+        let snapshot = registry.snapshot_test_runs();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "sequential invocations in the same directory (e.g. an edit/test loop) must never accumulate"
+        );
+        assert_eq!(snapshot[0].pid, 222);
+        assert_eq!(snapshot[0].status, TestRunStatus::Failed);
+    }
+
+    #[test]
+    fn different_directories_each_keep_their_own_test_run() {
+        let registry = Registry::new();
+        registry.upsert_test_run(PathBuf::from("/tmp/project-a"), 1, TestRunStatus::Passed);
+
+        registry.upsert_test_run(PathBuf::from("/tmp/project-b"), 2, TestRunStatus::Failed);
+
+        let mut snapshot = registry.snapshot_test_runs();
+        snapshot.sort_by(|a, b| a.cwd.cmp(&b.cwd));
+        assert_eq!(snapshot.len(), 2, "unrelated directories must not affect each other");
+        assert_eq!(snapshot[0].cwd, PathBuf::from("/tmp/project-a"));
+        assert_eq!(snapshot[1].cwd, PathBuf::from("/tmp/project-b"));
     }
 
     #[test]
