@@ -79,11 +79,11 @@ The daemon SHALL treat a `PermissionDenied` hook event as a distinct "declined" 
 - **THEN** the daemon updates that session's status to "running" or "done" as normal, the same as it would from any other status
 
 ### Requirement: Agent list query and live updates
-The daemon SHALL let connected clients retrieve the current list of tracked agents and test runs, grouped by working directory, and receive updates as agent status or test-run status changes, without polling being the only option. Every agent sent to a client, in the initial snapshot or an incremental update, SHALL include its status-since timestamp alongside its last-updated timestamp. Every test run sent to a client SHALL include its working directory, status, and last-updated timestamp.
+The daemon SHALL let connected clients retrieve the current list of tracked agents and test runs, grouped by working directory, and receive updates as agent status or test-run status changes, without polling being the only option. Every agent sent to a client, in the initial snapshot or an incremental update, SHALL include its status-since timestamp alongside its last-updated timestamp. Every test run sent to a client SHALL include its working directory, status, last-updated timestamp, and run-start timestamp.
 
 #### Scenario: Client requests current agents on connect
 - **WHEN** a client (e.g. the TUI) connects to the daemon
-- **THEN** the daemon sends the full current list of tracked agents and test runs, grouped by working directory, each agent including its status and status-since timestamp
+- **THEN** the daemon sends the full current list of tracked agents and test runs, grouped by working directory, each agent including its status and status-since timestamp, and each test run including its run-start timestamp
 
 #### Scenario: Client receives incremental updates
 - **WHEN** an agent's status changes while a client is connected
@@ -91,14 +91,22 @@ The daemon SHALL let connected clients retrieve the current list of tracked agen
 
 #### Scenario: Client receives a test-run update
 - **WHEN** a test-run event is reported while a client is connected
-- **THEN** the daemon pushes an update for that test run, including its working directory and status, to the connected client without requiring the client to reconnect
+- **THEN** the daemon pushes an update for that test run, including its working directory, status, and run-start timestamp, to the connected client without requiring the client to reconnect
 
 ### Requirement: Test-run event ingestion
-The daemon SHALL accept test-run events (distinct from Claude Code hook events) over the same local socket, each carrying a working directory and a status of "started", "passed", or "failed".
+The daemon SHALL accept test-run events (distinct from Claude Code hook events) over the same local socket, each carrying a working directory and a status of "started", "passed", or "failed". The daemon SHALL track a run-start timestamp for each directory's tracked test run: a test-run event whose process id matches the directory's currently tracked test run SHALL leave that run-start timestamp unchanged, since it is the same test process continuing through its lifecycle (started, then passed or failed); a test-run event whose process id does not match (a new process, or no test run currently tracked for that directory) SHALL set the run-start timestamp to the time of that event, since it represents the start of a new run.
 
 #### Scenario: Formatter reports a test-run event
 - **WHEN** an RSpec formatter sends a test-run event to the daemon's socket
 - **THEN** the daemon accepts the event and updates its tracked test runs accordingly
+
+#### Scenario: A started event begins a new run's timer
+- **WHEN** the daemon receives a test-run event for a directory with no currently tracked test run, or whose currently tracked test run has a different process id
+- **THEN** the daemon sets that test run's run-start timestamp to the time of this event
+
+#### Scenario: A same-process completion event preserves the run-start timestamp
+- **WHEN** the daemon receives a "passed" or "failed" test-run event whose process id matches the directory's currently tracked test run
+- **THEN** the daemon keeps that test run's existing run-start timestamp unchanged, updating only its status and last-updated timestamp
 
 ### Requirement: Agents and test runs are grouped by working directory
 The daemon SHALL group tracked agents and test runs by exact working directory match: each distinct working directory forms a group containing zero or more tracked agents (keyed by session id, as today) and at most one tracked test run. This grouping is additive to agent tracking - it SHALL NOT change how individual agent events are processed, keyed, or deduplicated. A test run SHALL be identified by its working directory alone, independent of any agent: reporting a new test-run event for a directory SHALL replace any previously tracked test run for that directory, regardless of process id, so a directory's test-run row always reflects only the most recently reported run rather than accumulating one entry per invocation.
@@ -123,20 +131,28 @@ The daemon SHALL group tracked agents and test runs by exact working directory m
 - **WHEN** the daemon receives a test-run event for a working directory that already has a tracked test run, reported by a different process id than the one currently tracked
 - **THEN** the daemon replaces the tracked test run with the new one instead of tracking both, so repeated invocations in the same directory (for example, an edit/test loop) never accumulate more than one test-run row per directory
 
-### Requirement: Notification fallback for a test run with no tracked agent
-When a test-run event reports "failed" status and its directory group contains no tracked agent, the daemon SHALL send a plain macOS user notification identifying the working directory, played with the built-in `Basso` system sound, since there is no agent row that would otherwise surface the failure to the user. `Basso` SHALL be distinct from the `Glass` and `Ping` sounds used for agent completion notifications, so a test failure is not confused with either by ear.
+### Requirement: Test-run lifecycle notifications
+The daemon SHALL send a macOS user notification identifying the working directory whenever a tracked test run's status is reported as "started", "passed", or "failed", independent of whether that directory has a tracked agent - so a test run can be started, stopped, and re-run multiple times over the course of one long agent session, and each event is heard on its own rather than only when nothing else would surface it. A "started" test run SHALL play the built-in `Pop` system sound; a "passed" test run SHALL play the built-in `Tink` system sound; a "failed" test run SHALL play the built-in `Basso` system sound. `Pop`, `Tink`, and `Basso` SHALL each be distinct from one another and from the `Glass`/`Ping` sounds used for agent completion notifications, so a test-run event is never confused with a different event or with an agent notification by ear.
 
-#### Scenario: A failing test run with no tracked agent
+#### Scenario: A test run starts
+- **WHEN** the daemon receives a "started" test-run event
+- **THEN** the daemon sends a macOS notification identifying the working directory, played with the built-in `Pop` system sound, regardless of whether that directory has a tracked agent
+
+#### Scenario: A test run fails with no tracked agent
 - **WHEN** the daemon receives a "failed" test-run event whose directory group contains no tracked agent
 - **THEN** the daemon sends a macOS notification identifying the working directory, played with the built-in `Basso` system sound
 
-#### Scenario: A failing test run with a tracked agent does not duplicate via this fallback
-- **WHEN** the daemon receives a "failed" test-run event whose directory group contains at least one tracked agent
-- **THEN** the daemon does not send this fallback notification, since the failure is visible through the tracked agent's group in a connected client
+#### Scenario: A test run fails with a tracked agent present
+- **WHEN** the daemon receives a "failed" test-run event whose directory group contains a tracked agent
+- **THEN** the daemon sends a macOS notification identifying the working directory, played with `Basso`, the same as it would if no agent were tracked
 
-#### Scenario: A passing or started test run never triggers the fallback
-- **WHEN** the daemon receives a "started" or "passed" test-run event whose directory group contains no tracked agent
-- **THEN** the daemon does not send a macOS notification for it
+#### Scenario: A test run passes
+- **WHEN** the daemon receives a "passed" test-run event
+- **THEN** the daemon sends a macOS notification identifying the working directory, played with the built-in `Tink` system sound, regardless of whether that directory has a tracked agent
+
+#### Scenario: Repeated lifecycle events each notify independently
+- **WHEN** a tracked test run in the same directory starts, fails, and later starts and fails again
+- **THEN** the daemon sends a separate notification for each event, since each represents a distinct occurrence rather than a repeat of an earlier one
 
 ### Requirement: Completion notifications
 The daemon SHALL send a macOS user notification when a tracked agent's status transitions to "done" or "needs input", using a status-specific system sound so the two cases are distinguishable by ear. Every hook-reported "needs input" event SHALL produce a notification, even if the agent's status was already "needs input", because each such event represents a distinct blocking prompt; a "done" event SHALL NOT produce an additional notification when the agent's status is already "done". A transition to "declined" SHALL NOT produce a notification, since the user just took that action themselves.

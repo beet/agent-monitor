@@ -315,6 +315,7 @@ mod tests {
             pid: 999,
             status,
             last_updated_ms: 0,
+            run_started_ms: 0,
         }
     }
 

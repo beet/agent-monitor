@@ -1,19 +1,19 @@
 use std::path::Path;
 use std::process::Command;
 
-use agentmon_proto::{AgentInfo, AgentStatus, HostContext};
+use agentmon_proto::{AgentInfo, AgentStatus, HostContext, TestRunStatus};
 
 /// Delivers a user-facing notification for an agent that needs attention.
 pub trait Notifier: Send + Sync {
     fn notify(&self, agent: &AgentInfo);
 
-    /// Notifies about a failing test run whose working directory has no
-    /// tracked agent - the only case where the daemon itself, rather than a
-    /// tracked agent's row in a connected client, is what surfaces the
-    /// failure to the user. Defaults to a no-op so existing implementors
-    /// (e.g. test doubles that don't care about test runs) don't need to
-    /// change.
-    fn notify_test_run_failure(&self, _cwd: &Path) {}
+    /// Notifies about a test-run event ("started", "passed", or "failed"),
+    /// independent of whether its working directory has a tracked agent - a
+    /// long agent session can start/stop tests many times before it
+    /// finishes, and each event is heard on its own. Defaults to a no-op so
+    /// existing implementors (e.g. test doubles that don't care about test
+    /// runs) don't need to change.
+    fn notify_test_run(&self, _cwd: &Path, _status: TestRunStatus) {}
 }
 
 /// Sends a macOS notification banner via `osascript`.
@@ -30,28 +30,34 @@ impl Notifier for OsaScriptNotifier {
         }
     }
 
-    fn notify_test_run_failure(&self, cwd: &Path) {
-        let script = test_run_failure_script(cwd);
+    fn notify_test_run(&self, cwd: &Path, status: TestRunStatus) {
+        let script = test_run_notification_script(cwd, status);
         if let Err(err) = Command::new("osascript").arg("-e").arg(script).status() {
             eprintln!("agentd: failed to send test-run notification: {err}");
         }
     }
 }
 
-/// Builds the `osascript` AppleScript for a test-run failure with no tracked
-/// agent, played with the `Basso` sound - distinct from the `Glass`/`Ping`
-/// sounds used for agent completion notifications, so it's not confused with
-/// either by ear.
-fn test_run_failure_script(cwd: &Path) -> String {
+/// Builds the `osascript` AppleScript for a test-run event. `Pop` (started),
+/// `Tink` (passed), and `Basso` (failed) are each distinct from one another
+/// and from the `Glass`/`Ping` sounds used for agent completion
+/// notifications, so a test-run event is never confused with a different
+/// event or with an agent notification by ear.
+fn test_run_notification_script(cwd: &Path, status: TestRunStatus) -> String {
+    let (status_label, sound_name) = match status {
+        TestRunStatus::Started => ("tests started", "Pop"),
+        TestRunStatus::Passed => ("tests passed", "Tink"),
+        TestRunStatus::Failed => ("tests failed", "Basso"),
+    };
     let project = cwd
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| cwd.display().to_string());
     format!(
         "display notification {} with title {} sound name {}",
-        applescript_literal(&format!("{project} tests failed")),
+        applescript_literal(&format!("{project} {status_label}")),
         applescript_literal("agentmon"),
-        applescript_literal("Basso")
+        applescript_literal(sound_name)
     )
 }
 
@@ -147,8 +153,8 @@ mod tests {
     }
 
     #[test]
-    fn test_run_failure_script_uses_basso_sound() {
-        let script = test_run_failure_script(&PathBuf::from("/tmp/project"));
+    fn test_run_notification_script_uses_basso_sound_when_failed() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Failed);
         assert!(
             script.ends_with("sound name \"Basso\""),
             "script did not end with the Basso sound clause: {script}"
@@ -156,8 +162,26 @@ mod tests {
     }
 
     #[test]
-    fn test_run_failure_script_identifies_the_directory() {
-        let script = test_run_failure_script(&PathBuf::from("/tmp/project"));
+    fn test_run_notification_script_uses_tink_sound_when_passed() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Passed);
+        assert!(
+            script.ends_with("sound name \"Tink\""),
+            "script did not end with the Tink sound clause: {script}"
+        );
+    }
+
+    #[test]
+    fn test_run_notification_script_uses_pop_sound_when_started() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Started);
+        assert!(
+            script.ends_with("sound name \"Pop\""),
+            "script did not end with the Pop sound clause: {script}"
+        );
+    }
+
+    #[test]
+    fn test_run_notification_script_identifies_the_directory() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Failed);
         assert!(
             script.contains("project"),
             "script did not mention the project directory: {script}"

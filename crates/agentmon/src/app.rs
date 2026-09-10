@@ -25,8 +25,9 @@ pub struct DirectoryGroup {
 
 impl DirectoryGroup {
     /// The most recent `last_updated_ms` among this group's members, used to
-    /// order groups relative to one another.
-    fn most_recent_update_ms(&self) -> u64 {
+    /// order groups relative to one another and, in the TUI, as the
+    /// project's rendered UPDATED time.
+    pub fn most_recent_update_ms(&self) -> u64 {
         let agents_max = self.agents.iter().map(|a| a.last_updated_ms).max();
         let test_runs_max = self.test_runs.iter().map(|t| t.last_updated_ms).max();
         agents_max.into_iter().chain(test_runs_max).max().unwrap_or(0)
@@ -166,6 +167,7 @@ mod tests {
             pid,
             status,
             last_updated_ms,
+            run_started_ms: last_updated_ms,
         }
     }
 

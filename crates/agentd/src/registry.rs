@@ -18,15 +18,6 @@ struct RegistryState {
     test_runs: HashMap<PathBuf, TestRunInfo>,
 }
 
-/// A tracked test run's update, paired with whether its working directory
-/// currently has any tracked agent - callers (e.g. the notification
-/// fallback) need this to decide whether the daemon is the only thing that
-/// will ever surface this run's result to the user.
-pub struct TestRunUpsertOutcome {
-    pub test_run: TestRunInfo,
-    pub has_tracked_agent: bool,
-}
-
 /// Every tracked agent and test run sharing one exact working directory, per
 /// the "agents and test runs are grouped by working directory" requirement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,21 +132,28 @@ impl Registry {
     /// reported by a different pid - rather than accumulating one entry per
     /// invocation, mirroring how an agent's row persists until its next
     /// status transition.
-    pub fn upsert_test_run(&self, cwd: PathBuf, pid: u32, status: TestRunStatus) -> TestRunUpsertOutcome {
+    ///
+    /// `run_started_ms` marks when the currently tracked process (`pid`)
+    /// began: it carries over from the previous entry when this event's pid
+    /// matches (the same process moving from "started" to "passed"/"failed"),
+    /// and resets to now when the pid differs (a new run), mirroring how
+    /// `status_since_ms` tracks an agent's current status.
+    pub fn upsert_test_run(&self, cwd: PathBuf, pid: u32, status: TestRunStatus) -> TestRunInfo {
         let mut state = self.state.lock().unwrap();
+        let now = now_ms();
+        let run_started_ms = match state.test_runs.get(&cwd) {
+            Some(existing) if existing.pid == pid => existing.run_started_ms,
+            _ => now,
+        };
         let test_run = TestRunInfo {
             cwd: cwd.clone(),
             pid,
             status,
-            last_updated_ms: now_ms(),
+            last_updated_ms: now,
+            run_started_ms,
         };
         state.test_runs.insert(cwd.clone(), test_run.clone());
-        let has_tracked_agent = state.agents.values().any(|agent| agent.cwd == cwd);
-
-        TestRunUpsertOutcome {
-            test_run,
-            has_tracked_agent,
-        }
+        test_run
     }
 
     pub fn snapshot_test_runs(&self) -> Vec<TestRunInfo> {
@@ -461,12 +459,11 @@ mod tests {
     fn first_started_event_creates_a_test_run_entry() {
         let registry = Registry::new();
 
-        let outcome = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
 
-        assert_eq!(outcome.test_run.cwd, PathBuf::from("/tmp/project"));
-        assert_eq!(outcome.test_run.pid, 999);
-        assert_eq!(outcome.test_run.status, TestRunStatus::Started);
-        assert!(!outcome.has_tracked_agent);
+        assert_eq!(test_run.cwd, PathBuf::from("/tmp/project"));
+        assert_eq!(test_run.pid, 999);
+        assert_eq!(test_run.status, TestRunStatus::Started);
         assert_eq!(registry.snapshot_test_runs().len(), 1);
     }
 
@@ -475,12 +472,46 @@ mod tests {
         let registry = Registry::new();
         registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
 
-        let outcome = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
 
-        assert_eq!(outcome.test_run.status, TestRunStatus::Failed);
+        assert_eq!(test_run.status, TestRunStatus::Failed);
         let snapshot = registry.snapshot_test_runs();
         assert_eq!(snapshot.len(), 1, "must update in place, not duplicate");
         assert_eq!(snapshot[0].status, TestRunStatus::Failed);
+    }
+
+    #[test]
+    fn a_same_pid_completion_event_preserves_run_started_ms() {
+        let registry = Registry::new();
+        let started = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        let run_started_ms = started.run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Passed);
+
+        assert_eq!(
+            test_run.run_started_ms, run_started_ms,
+            "a same-pid completion event must not reset run_started_ms"
+        );
+        assert!(
+            test_run.last_updated_ms > run_started_ms,
+            "last_updated_ms must still advance even though run_started_ms is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_different_pid_event_resets_run_started_ms() {
+        let registry = Registry::new();
+        let first = registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Started);
+        let first_run_started_ms = first.run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Started);
+
+        assert!(
+            test_run.run_started_ms > first_run_started_ms,
+            "a different pid must start a fresh run_started_ms rather than inheriting the previous run's"
+        );
     }
 
     #[test]
@@ -502,10 +533,10 @@ mod tests {
         let registry = Registry::new();
         registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Started);
 
-        let outcome = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Failed);
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Failed);
 
         assert_eq!(
-            outcome.test_run.pid, 222,
+            test_run.pid, 222,
             "the surviving entry must reflect the newest report, not the first one"
         );
         let snapshot = registry.snapshot_test_runs();
@@ -530,16 +561,6 @@ mod tests {
         assert_eq!(snapshot.len(), 2, "unrelated directories must not affect each other");
         assert_eq!(snapshot[0].cwd, PathBuf::from("/tmp/project-a"));
         assert_eq!(snapshot[1].cwd, PathBuf::from("/tmp/project-b"));
-    }
-
-    #[test]
-    fn upsert_test_run_reports_a_tracked_agent_in_the_same_directory() {
-        let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-
-        let outcome = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
-
-        assert!(outcome.has_tracked_agent);
     }
 
     #[test]

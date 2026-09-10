@@ -67,6 +67,11 @@ pub struct TestRunInfo {
     pub status: TestRunStatus,
     /// Unix epoch milliseconds of the last update to this test run.
     pub last_updated_ms: u64,
+    /// Unix epoch milliseconds of when this run (the tracked process id)
+    /// started - unlike `last_updated_ms`, this stays fixed across the
+    /// started -> passed/failed lifecycle of the same process, and only
+    /// resets when a different pid reports for the same directory.
+    pub run_started_ms: u64,
 }
 
 /// A status event reported by a Claude Code hook to the daemon.
@@ -137,6 +142,7 @@ mod tests {
             pid: 5150,
             status: TestRunStatus::Started,
             last_updated_ms: 1_700_000_000_000,
+            run_started_ms: 1_700_000_000_000,
         }
     }
 
@@ -179,6 +185,20 @@ mod tests {
         assert!(
             json.contains("\"status_since_ms\":1700000000000"),
             "expected status_since_ms field in JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_run_info_round_trips_through_json() {
+        let info = sample_test_run();
+
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: TestRunInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(info, decoded);
+        assert!(
+            json.contains("\"run_started_ms\":1700000000000"),
+            "expected run_started_ms field in JSON, got: {json}"
         );
     }
 

@@ -1,21 +1,4 @@
-# agent-monitor-tui Specification
-
-## Purpose
-
-Gives the user a single, live-updating terminal view of every Claude Code agent session tracked by the daemon, across nvim, standalone terminals, and the desktop app.
-
-## Requirements
-
-### Requirement: Connect to the daemon
-The TUI SHALL connect to the daemon's local socket on startup and clearly inform the user when the daemon is unreachable.
-
-#### Scenario: Daemon is running
-- **WHEN** the TUI starts and the daemon's socket is reachable
-- **THEN** the TUI connects and begins displaying tracked agents
-
-#### Scenario: Daemon is not running
-- **WHEN** the TUI starts and cannot reach the daemon's socket
-- **THEN** the TUI displays a clear message that the daemon is not running instead of showing a blank or misleading agent list
+## MODIFIED Requirements
 
 ### Requirement: Live agent list
 The TUI SHALL display tracked agents and test runs grouped by working directory as one row per project: each distinct working directory forms exactly one row showing that project's name (derived from the working directory), a combined status for its tracked agent(s) and any test run in that directory, and the most recent last-updated time among those members (in the system's local timezone, formatted `%Y-%m-%d %H:%M:%S`), updating as the daemon reports changes. A project row SHALL NOT display per-agent host context or process id as separate columns; the daemon continues tracking that data, it is simply not rendered in the collapsed row. Project rows SHALL be ordered by the most recent last-updated time of any member (agent or test run) within them, most recent first. An agent whose status is "running" SHALL contribute a duration to the row, computed from the current time minus that agent's status-since timestamp, formatted as a compact counter (e.g. `2m14s`) and kept current by the TUI's own periodic redraw rather than only refreshing when the daemon pushes an update. An agent not in "running" status SHALL NOT contribute a duration. A test run whose status is "started" SHALL likewise contribute a live, counting-up duration computed from its run-start timestamp. Once a test run reaches "passed" or "failed", its row SHALL continue to show a duration - the total elapsed time from its run-start timestamp to its last-updated timestamp - rather than showing no duration.
@@ -114,17 +97,3 @@ The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs inp
 #### Scenario: An agent status and a test-run status are shown together
 - **WHEN** a project has both a tracked agent and a test run whose statuses differ
 - **THEN** the row's status cell shows both the agent's status and the test run's status together, rather than picking one over the other
-
-### Requirement: Navigation and quit do not affect tracked agents
-The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
-
-#### Scenario: User quits the TUI
-- **WHEN** the user presses the quit key
-- **THEN** the TUI process exits while the daemon keeps running and continues tracking agents
-
-### Requirement: Reconnect after daemon restart
-The TUI SHALL detect when its connection to the daemon drops and attempt to reconnect, resuming display of current agent state once reconnected.
-
-#### Scenario: Daemon restarts while the TUI is open
-- **WHEN** the daemon process restarts (e.g. after an update) while the TUI is running
-- **THEN** the TUI detects the dropped connection, retries connecting, and repopulates the agent list once the daemon is back

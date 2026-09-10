@@ -35,14 +35,13 @@ impl Ingestor {
     }
 
     /// Updates the registry from a reported test-run event, notifying the
-    /// user directly only when the run failed and its working directory has
-    /// no tracked agent to otherwise surface the failure through.
+    /// user for every status - "started", "passed", or "failed" - independent
+    /// of whether its working directory has a tracked agent, so each event
+    /// over the life of a long agent session is heard on its own.
     pub fn ingest_test_run(&self, cwd: PathBuf, pid: u32, status: TestRunStatus) -> TestRunInfo {
-        let outcome = self.registry.upsert_test_run(cwd, pid, status);
-        if status == TestRunStatus::Failed && !outcome.has_tracked_agent {
-            self.notifier.notify_test_run_failure(&outcome.test_run.cwd);
-        }
-        outcome.test_run
+        let test_run = self.registry.upsert_test_run(cwd, pid, status);
+        self.notifier.notify_test_run(&test_run.cwd, status);
+        test_run
     }
 }
 
@@ -70,7 +69,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingNotifier {
         calls: Mutex<Vec<AgentInfo>>,
-        test_run_failure_calls: Mutex<Vec<PathBuf>>,
+        test_run_calls: Mutex<Vec<(PathBuf, TestRunStatus)>>,
     }
 
     impl Notifier for RecordingNotifier {
@@ -78,11 +77,11 @@ mod tests {
             self.calls.lock().unwrap().push(agent.clone());
         }
 
-        fn notify_test_run_failure(&self, cwd: &std::path::Path) {
-            self.test_run_failure_calls
+        fn notify_test_run(&self, cwd: &std::path::Path, status: TestRunStatus) {
+            self.test_run_calls
                 .lock()
                 .unwrap()
-                .push(cwd.to_path_buf());
+                .push((cwd.to_path_buf(), status));
         }
     }
 
@@ -243,11 +242,11 @@ mod tests {
 
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
 
-        assert_eq!(notifier.test_run_failure_calls.lock().unwrap().len(), 1);
+        assert_eq!(notifier.test_run_calls.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn a_failing_run_with_a_tracked_agent_does_not_notify_via_the_fallback() {
+    fn a_failing_run_with_a_tracked_agent_still_notifies() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
         ingestor.ingest_event(event(AgentStatus::Running));
@@ -255,20 +254,62 @@ mod tests {
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
 
         assert_eq!(
-            notifier.test_run_failure_calls.lock().unwrap().len(),
-            0,
-            "a directory with a tracked agent must not use the no-agent fallback"
+            notifier.test_run_calls.lock().unwrap().as_slice(),
+            [(PathBuf::from("/tmp/project"), TestRunStatus::Failed)],
+            "a tracked agent in the directory must not suppress the test-run notification"
         );
     }
 
     #[test]
-    fn a_started_or_passed_run_never_triggers_the_fallback() {
+    fn a_passing_run_notifies_regardless_of_a_tracked_agent() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+        ingestor.ingest_event(event(AgentStatus::Running));
+
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Passed);
+
+        assert_eq!(
+            notifier.test_run_calls.lock().unwrap().as_slice(),
+            [(PathBuf::from("/tmp/project"), TestRunStatus::Passed)]
+        );
+    }
+
+    #[test]
+    fn a_started_run_notifies() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
 
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
-        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Passed);
 
-        assert_eq!(notifier.test_run_failure_calls.lock().unwrap().len(), 0);
+        assert_eq!(
+            notifier.test_run_calls.lock().unwrap().as_slice(),
+            [(PathBuf::from("/tmp/project"), TestRunStatus::Started)]
+        );
+    }
+
+    #[test]
+    fn repeated_lifecycle_events_in_the_same_directory_each_notify() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        // Two distinct runs (each its own pid) starting and failing in the
+        // same directory over the life of one long agent session - each
+        // event must notify on its own, not just the first.
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Failed);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Failed);
+
+        let calls = notifier.test_run_calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            [
+                (PathBuf::from("/tmp/project"), TestRunStatus::Started),
+                (PathBuf::from("/tmp/project"), TestRunStatus::Failed),
+                (PathBuf::from("/tmp/project"), TestRunStatus::Started),
+                (PathBuf::from("/tmp/project"), TestRunStatus::Failed),
+            ],
+            "each lifecycle event must notify independently, got: {calls:?}"
+        );
     }
 }
