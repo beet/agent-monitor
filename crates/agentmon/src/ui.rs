@@ -59,8 +59,8 @@ fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
     });
 
     let widths = [
-        Constraint::Length(20),
-        Constraint::Fill(1),
+        Constraint::Fill(2),
+        Constraint::Fill(3),
         Constraint::Length(19),
     ];
 
@@ -321,6 +321,58 @@ mod tests {
         assert!(!text.contains("PID"), "PID column should be removed, got:\n{text}");
         assert!(!text.contains("nvim"), "host label should not be rendered, got:\n{text}");
         assert!(!text.contains("4242"), "pid should not be rendered, got:\n{text}");
+    }
+
+    #[test]
+    fn a_long_project_name_uses_more_than_20_characters_on_a_wide_terminal() {
+        let mut term = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut app = App::new();
+        let long_name = "this-is-a-very-long-project-directory-name";
+        app.apply_snapshot(
+            vec![agent_in(
+                &format!("/tmp/{long_name}"),
+                "s",
+                AgentStatus::Running,
+                HostContext::Terminal,
+                1,
+                0,
+            )],
+            Vec::new(),
+        );
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains(long_name),
+            "expected the full project name to render on a wide terminal, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_long_project_name_is_clipped_on_a_narrow_terminal() {
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new();
+        let long_name = "this-is-a-very-long-project-directory-name";
+        app.apply_snapshot(
+            vec![agent_in(
+                &format!("/tmp/{long_name}"),
+                "s",
+                AgentStatus::Running,
+                HostContext::Terminal,
+                1,
+                0,
+            )],
+            Vec::new(),
+        );
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains(long_name),
+            "expected the name not to fit in full on a narrow terminal, got:\n{text}"
+        );
     }
 
     #[test]
