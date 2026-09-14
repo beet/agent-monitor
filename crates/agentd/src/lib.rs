@@ -1,3 +1,4 @@
+pub mod activity_log;
 pub mod ingest;
 pub mod liveness;
 pub mod notify;

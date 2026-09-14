@@ -5,19 +5,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use agentmon_proto::{AgentInfo, ClientMessage, ServerMessage, TestRunInfo};
+use agentmon_proto::{AgentInfo, ClientMessage, LogEntry, ServerMessage, TestRunInfo};
 
 use crate::ingest::Ingestor;
 use crate::liveness::spawn_liveness_sweep;
 use crate::protocol::{read_message, write_message};
 
-/// An incremental update fanned out to subscribers - either kind of tracked
+/// An incremental update fanned out to subscribers - any kind of tracked
 /// entity, merged onto one channel per connection so a single subscriber
-/// loop can forward both without racing two separate channels.
+/// loop can forward all three without racing separate channels.
 #[derive(Clone)]
 enum Update {
     Agent(AgentInfo),
     TestRun(TestRunInfo),
+    Log(LogEntry),
 }
 
 /// Fans out registry updates to every currently-subscribed client.
@@ -49,6 +50,11 @@ pub fn serve(listener: UnixListener, ingestor: Ingestor, liveness_interval: Dura
     let sweep_broadcaster = broadcaster.clone();
     spawn_liveness_sweep(sweep_registry, liveness_interval, move |agent| {
         sweep_broadcaster.publish(Update::Agent(agent));
+    });
+
+    let log_broadcaster = broadcaster.clone();
+    ingestor.set_log_listener(move |entry| {
+        log_broadcaster.publish(Update::Log(entry));
     });
 
     for stream in listener.incoming() {
@@ -84,7 +90,11 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
         Some(ClientMessage::Subscribe) => {
             let agents = ingestor.registry().snapshot();
             let test_runs = ingestor.registry().snapshot_test_runs();
-            let sent = write_message(&mut writer, &ServerMessage::Snapshot { agents, test_runs });
+            let logs = ingestor.activity_log().snapshot();
+            let sent = write_message(
+                &mut writer,
+                &ServerMessage::Snapshot { agents, test_runs, logs },
+            );
             if sent.is_err() {
                 return;
             }
@@ -93,6 +103,7 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
                 let message = match update {
                     Update::Agent(agent) => ServerMessage::AgentUpdate { agent },
                     Update::TestRun(test_run) => ServerMessage::TestRunUpdate { test_run },
+                    Update::Log(entry) => ServerMessage::LogAppended { entry },
                 };
                 if write_message(&mut writer, &message).is_err() {
                     break;
@@ -181,6 +192,42 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         Vec::new()
+    }
+
+    fn read_log_snapshot_until_nonempty(path: &PathBuf) -> Vec<agentmon_proto::LogEntry> {
+        for _ in 0..20 {
+            let client = UnixStream::connect(path).expect("connect as subscriber");
+            let mut writer = client.try_clone().expect("clone stream");
+            write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+            let mut reader = BufReader::new(client);
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read snapshot")
+                .expect("connection should not close before snapshot");
+
+            let ServerMessage::Snapshot { logs, .. } = message else {
+                panic!("expected a Snapshot message, got {message:?}");
+            };
+            if !logs.is_empty() {
+                return logs;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Vec::new()
+    }
+
+    /// Reads messages from `reader` until one that isn't `LogAppended`,
+    /// discarding any activity-log pushes along the way. Used by tests that
+    /// care about a specific agent/test-run update but not the log entry a
+    /// notification-worthy event also produces.
+    fn read_message_skipping_log_appended(reader: &mut BufReader<UnixStream>) -> ServerMessage {
+        loop {
+            let message: ServerMessage = read_message(reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if !matches!(message, ServerMessage::LogAppended { .. }) {
+                return message;
+            }
+        }
     }
 
     fn read_snapshot_until_nonempty(path: &PathBuf) -> Vec<AgentInfo> {
@@ -444,12 +491,75 @@ mod tests {
             .expect("send test-run event");
         }
 
-        let update: ServerMessage = read_message(&mut reader)
-            .expect("read update")
-            .expect("connection should not close before update");
+        // The test-run event also appends an activity-log entry, broadcast
+        // as its own message - skip past it to the TestRunUpdate.
+        let update = read_message_skipping_log_appended(&mut reader);
         let ServerMessage::TestRunUpdate { test_run } = update else {
             panic!("expected a TestRunUpdate message, got {update:?}");
         };
         assert_eq!(test_run.status, agentmon_proto::TestRunStatus::Failed);
+    }
+
+    #[test]
+    fn subscriber_receives_a_snapshot_containing_previously_logged_activity() {
+        let (path, _notifier) = spawn_test_server("log-snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportTestRun {
+                    cwd: PathBuf::from("/tmp/project"),
+                    pid: 999,
+                    status: agentmon_proto::TestRunStatus::Started,
+                },
+            )
+            .expect("send test-run event");
+        }
+
+        let logs = read_log_snapshot_until_nonempty(&path);
+
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].working_dir, PathBuf::from("/tmp/project"));
+        assert_eq!(logs[0].status, "started");
+    }
+
+    #[test]
+    fn connected_subscriber_receives_a_log_appended_push() {
+        let (path, _notifier) = spawn_test_server("log-push");
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Done),
+                },
+            )
+            .expect("send done event");
+        }
+
+        // Both an AgentUpdate and a LogAppended are broadcast for this event;
+        // find the LogAppended among them.
+        let mut found = None;
+        for _ in 0..2 {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::LogAppended { entry } = message {
+                found = Some(entry);
+                break;
+            }
+        }
+        let entry = found.expect("expected a LogAppended message");
+        assert_eq!(entry.status, "done");
     }
 }
