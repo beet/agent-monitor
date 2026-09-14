@@ -443,6 +443,86 @@ mod tests {
     }
 
     #[test]
+    fn late_event_for_a_session_superseded_by_a_pid_reuse_is_ignored_across_connections() {
+        let (path, _notifier) = spawn_test_server("late-superseded-session");
+        let session_1 = SessionId("session-1".to_string());
+        let session_2 = SessionId("session-2".to_string());
+        let pid = 123;
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: AgentEvent {
+                        session_id: session_1.clone(),
+                        pid,
+                        ..sample_event(AgentStatus::Running)
+                    },
+                },
+            )
+            .expect("send session-1 running event");
+        }
+        wait_for_status(&path, &session_1, AgentStatus::Running);
+
+        // session-2 reuses the same pid (e.g. `/clear`), superseding
+        // session-1 per the same-pid dedup rule.
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: AgentEvent {
+                        session_id: session_2.clone(),
+                        pid,
+                        ..sample_event(AgentStatus::Running)
+                    },
+                },
+            )
+            .expect("send session-2 running event");
+        }
+        wait_for_status(&path, &session_2, AgentStatus::Running);
+
+        // A late hook event for session-1, on its own one-shot connection,
+        // finally arrives after session-2 has already taken over the pid.
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: AgentEvent {
+                        session_id: session_1.clone(),
+                        pid,
+                        ..sample_event(AgentStatus::Done)
+                    },
+                },
+            )
+            .expect("send late session-1 event");
+        }
+
+        // Give the server ample time to process (and, if the guard were
+        // broken, wrongly apply) the late event before asserting it never
+        // took effect.
+        let mut agents = Vec::new();
+        for _ in 0..20 {
+            agents = read_snapshot_until_nonempty(&path);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            agents.len(),
+            1,
+            "the late session-1 event must not resurrect it as a second entry"
+        );
+        assert_eq!(agents[0].session_id, session_2);
+        assert_eq!(
+            agents[0].status,
+            AgentStatus::Running,
+            "session-2 must be completely unaffected by the late session-1 event"
+        );
+    }
+
+    #[test]
     fn subscriber_receives_a_snapshot_containing_a_reported_test_run() {
         let (path, _notifier) = spawn_test_server("test-run-snapshot");
 

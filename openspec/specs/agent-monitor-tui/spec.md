@@ -96,7 +96,7 @@ The TUI's PROJECT column SHALL NOT be capped at a fixed 20-character width. Its 
 - **THEN** the PROJECT column clips the name to the space available, consistent with existing table-rendering behavior
 
 ### Requirement: Status is visually distinguishable
-The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) and test-run statuses (started, passed, failed) from one another so the user can scan the list and immediately identify agents or test runs needing attention. Each agent status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 🕸️, and declined with 🚫. Each test-run status SHALL be prefixed with a distinct emoji marker: started with ⏳, passed with ✅, and failed with ❌. When a project's row combines more than one status - two or more tracked agents in different statuses, and/or an agent alongside a test run - the row SHALL show each distinct status present rather than collapsing them into a single "winning" status, so no status needing attention is hidden behind another.
+The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) and test-run statuses (started, passed, failed) from one another so the user can scan the list and immediately identify agents or test runs needing attention. Each agent status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 🕸️, and declined with 🚫. Each test-run status SHALL be prefixed with a distinct emoji marker: started with ⏳, passed with ✅, and failed with ❌. When a project's row combines more than one status - two or more tracked agents in different statuses, and/or an agent alongside a test run - the row SHALL show each distinct status present rather than collapsing them into a single "winning" status, so no status needing attention is hidden behind another. No status's text color SHALL match the Agents tab's row-highlight background color, since a status rendered in that color would become invisible - emoji included - on whichever row is currently selected (including the initially-selected row shown as soon as any project is tracked, before the user has moved the selection).
 
 #### Scenario: An agent needs input
 - **WHEN** an agent's status is "needs input"
@@ -125,6 +125,10 @@ The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs inp
 #### Scenario: An agent status and a test-run status are shown together
 - **WHEN** a project has both a tracked agent and a test run whose statuses differ
 - **THEN** the row's status cell shows both the agent's status and the test run's status together, rather than picking one over the other
+
+#### Scenario: A running status stays legible on the selected row
+- **WHEN** a project row showing the "running" status is the currently-selected (highlighted) row in the Agents tab
+- **THEN** the status's label and emoji remain visible, styled in a color distinct from the row-highlight background
 
 ### Requirement: Navigation and quit do not affect tracked agents
 The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
@@ -252,3 +256,14 @@ The TUI SHALL open a help modal listing all available keyboard shortcuts when th
 #### Scenario: Closing help
 - **WHEN** the user presses `Esc` while the help modal is open
 - **THEN** the TUI closes the help modal and returns to the previously active tab
+
+### Requirement: Empty-state placeholders appear in the table body, not the pane title
+When the Agents tab has no tracked agents or test runs, and when the Logs tab's full (unfiltered) activity log is empty, the TUI SHALL show that empty state as gray placeholder text in the table body beneath the header, matching the existing convention used when a Logs tab filter matches nothing. The pane title SHALL NOT carry this placeholder text; the Logs tab's title SHALL continue to show its sort/filter control hints regardless of whether the log is empty.
+
+#### Scenario: No agents tracked yet
+- **WHEN** the daemon reports no tracked agents and no test runs
+- **THEN** the Agents tab's title reads "Agents" and its table body shows gray placeholder text indicating no agents are tracked yet
+
+#### Scenario: No activity logged yet
+- **WHEN** the daemon's activity log is empty
+- **THEN** the Logs tab's title shows only its sort/filter control hints (no empty-state text) and its table body shows gray placeholder text indicating no activity has been logged yet

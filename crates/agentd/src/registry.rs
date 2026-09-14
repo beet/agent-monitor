@@ -1,9 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus, SessionId, TestRunInfo, TestRunStatus};
+
+/// Cap on how many retired session ids `RegistryState::superseded_sessions`
+/// remembers, evicting the oldest once exceeded - the same bounded-eviction
+/// shape as `ActivityLog`'s cap, so memory stays flat over a long-running
+/// daemon instead of growing with total historical `/clear` churn. Session
+/// ids are Claude Code-generated and effectively unique, so this is a global
+/// set rather than one bounded per pid: a pid can be superseded more than
+/// once (session A -> B -> C), and a late event for the original session A
+/// must still be recognized as stale even after B - the entry that directly
+/// retired it - has itself since been retired by C.
+const MAX_SUPERSEDED_SESSIONS: usize = 256;
 
 #[derive(Default)]
 struct RegistryState {
@@ -16,6 +27,28 @@ struct RegistryState {
     /// repeated invocations (e.g. an edit/test loop) don't accumulate one
     /// entry per invocation.
     test_runs: HashMap<PathBuf, TestRunInfo>,
+    /// Every session id retired by `upsert`'s same-pid dedup, most recent
+    /// last, so a late/out-of-order event naming one of them can be
+    /// recognized and dropped instead of being resurrected as a "new" entry
+    /// that evicts whichever session currently holds that pid. See
+    /// `MAX_SUPERSEDED_SESSIONS`.
+    superseded_sessions: VecDeque<SessionId>,
+    /// Mirrors `superseded_sessions` for O(1) membership checks; kept in
+    /// sync with it on every insert and eviction.
+    superseded_session_set: HashSet<SessionId>,
+}
+
+impl RegistryState {
+    fn record_superseded(&mut self, session_id: SessionId) {
+        if self.superseded_session_set.insert(session_id.clone()) {
+            self.superseded_sessions.push_back(session_id);
+            if self.superseded_sessions.len() > MAX_SUPERSEDED_SESSIONS {
+                if let Some(oldest) = self.superseded_sessions.pop_front() {
+                    self.superseded_session_set.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 /// Every tracked agent and test run sharing one exact working directory, per
@@ -40,6 +73,16 @@ pub struct UpsertOutcome {
     pub agent: AgentInfo,
     pub is_new: bool,
     pub previous_status: Option<AgentStatus>,
+    /// Set when the incoming event was recognized as stale and had no effect
+    /// on the registry - currently only a late event naming an
+    /// already-superseded session id (see `upsert`'s doc comment). Callers
+    /// (`Ingestor::ingest_event`) must treat this as a pure no-op: `agent`
+    /// and `previous_status` both describe the pid's unaffected live entry,
+    /// not the dropped event, so they must not be fed to notification/log
+    /// logic that inspects a status transition - doing so could spuriously
+    /// re-notify (e.g. if the live entry's status happens to be "needs
+    /// input", which always notifies regardless of whether it changed).
+    pub stale_event_ignored: bool,
 }
 
 impl Registry {
@@ -61,6 +104,18 @@ impl Registry {
     /// the same Claude Code process starts a new session id (e.g. `/clear`)
     /// - the old session is gone, not merely quiet, so it must not linger
     /// as an untouched duplicate row sharing the live pid.
+    ///
+    /// Retiring an entry this way permanently supersedes its session id:
+    /// hook events arrive over independent, one-shot connections with no
+    /// ordering guarantee between them, so a late event for the
+    /// just-retired session id can still arrive after its replacement has
+    /// taken over the pid. Without a record of the supersession, that late
+    /// event would look like a brand-new session sharing the live pid and
+    /// would itself evict the replacement - producing a flickering
+    /// duplicate row that only resolves once events stop naming the dead
+    /// session. Such a late event is instead recognized as stale and
+    /// dropped as a no-op, returning whichever entry currently holds the
+    /// pid unchanged.
     pub fn upsert(&self, event: AgentEvent) -> UpsertOutcome {
         let mut state = self.state.lock().unwrap();
         let previous = state.agents.get(&event.session_id).cloned();
@@ -72,15 +127,36 @@ impl Registry {
                 agent,
                 is_new: false,
                 previous_status,
+                stale_event_ignored: false,
             };
         }
 
         if previous_status.is_none() {
-            state
+            if state.superseded_session_set.contains(&event.session_id) {
+                if let Some(current) = state.agents.values().find(|a| a.pid == event.pid).cloned() {
+                    return UpsertOutcome {
+                        previous_status: Some(current.status),
+                        is_new: false,
+                        agent: current,
+                        stale_event_ignored: true,
+                    };
+                }
+                // The superseded session id's pid isn't tracked under any
+                // live entry (should not happen given the invariants above,
+                // but falling through registers the event rather than
+                // silently discarding it with nothing to return).
+            }
+
+            let retiring: Vec<SessionId> = state
                 .agents
-                .retain(|session_id, agent| {
-                    !(agent.pid == event.pid && *session_id != event.session_id)
-                });
+                .iter()
+                .filter(|(session_id, agent)| agent.pid == event.pid && **session_id != event.session_id)
+                .map(|(session_id, _)| session_id.clone())
+                .collect();
+            for session_id in retiring {
+                state.agents.remove(&session_id);
+                state.record_superseded(session_id);
+            }
         }
 
         let now = now_ms();
@@ -104,6 +180,7 @@ impl Registry {
             agent,
             is_new: previous_status.is_none(),
             previous_status,
+            stale_event_ignored: false,
         }
     }
 
@@ -431,6 +508,96 @@ mod tests {
             "the old session-1 entry must be replaced, not left as a duplicate"
         );
         assert_eq!(snapshot[0].session_id, SessionId("session-2".to_string()));
+    }
+
+    #[test]
+    fn a_late_event_for_an_already_superseded_session_id_is_ignored() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        // A hook event for session-1, delayed enough that it arrives after
+        // session-2 (same pid) already took over - simulating the race
+        // between two independently-connecting, one-shot hook reports.
+        let outcome = registry.upsert(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Done)
+        });
+
+        assert_eq!(
+            outcome.agent.session_id,
+            SessionId("session-2".to_string()),
+            "the late event must not resurrect session-1 as a new entry"
+        );
+        assert_eq!(
+            outcome.agent.status,
+            AgentStatus::Running,
+            "session-2's status must be unaffected by the late session-1 event"
+        );
+        assert!(!outcome.is_new);
+
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "the late event must not leave session-1 lingering as a duplicate entry"
+        );
+        assert_eq!(snapshot[0].session_id, SessionId("session-2".to_string()));
+        assert_eq!(
+            snapshot[0].status,
+            AgentStatus::Running,
+            "the live session-2 entry must be completely unaffected by the late event"
+        );
+    }
+
+    #[test]
+    fn a_late_event_for_a_session_superseded_twice_over_is_still_ignored() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-a".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+        // session-b supersedes session-a on pid 123.
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-b".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+        // session-c supersedes session-b on the same pid - the pid has moved
+        // on again since session-a was first retired.
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-c".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        // A very late event for session-a, the original (twice-superseded)
+        // session id, finally arrives.
+        let outcome = registry.upsert(AgentEvent {
+            session_id: SessionId("session-a".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Done)
+        });
+
+        assert_eq!(
+            outcome.agent.session_id,
+            SessionId("session-c".to_string()),
+            "the late session-a event must not disturb session-c, the pid's current session"
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1, "only session-c should remain tracked");
+        assert_eq!(snapshot[0].session_id, SessionId("session-c".to_string()));
+        assert_eq!(snapshot[0].status, AgentStatus::Running);
     }
 
     #[test]
