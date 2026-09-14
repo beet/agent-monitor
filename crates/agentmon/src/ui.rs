@@ -1,16 +1,23 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatui::layout::Constraint;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
 use std::path::Path;
 
-use agentmon_proto::{AgentInfo, AgentStatus, TestRunInfo, TestRunStatus};
+use agentmon_proto::{AgentInfo, AgentStatus, LogEntry, TestRunInfo, TestRunStatus};
 
-use crate::app::{App, ConnectionStatus, DirectoryGroup};
+use crate::app::{App, ConnectionStatus, DirectoryGroup, LogSort, Modal, Tab};
+
+/// Background fill for the selected row in a table, used instead of
+/// reversed video so each status's own color/emoji survives selection
+/// rather than being inverted. A named ANSI color (not `Rgb`/`Indexed`) so
+/// it - like the status colors elsewhere in this file - is controlled by
+/// the terminal's own color scheme rather than a fixed literal value.
+const SELECTED_ROW_BG: Color = Color::Blue;
 
 /// The order distinct agent statuses appear in a project's combined STATUS
 /// cell - a fixed order so the same set of statuses always renders the same
@@ -31,20 +38,74 @@ pub fn render(frame: &mut Frame, app: &App) {
             frame,
             &format!("agentd is not running.\n\nStart it with: agentd\n\n({reason})"),
         ),
-        ConnectionStatus::Connected => render_agent_table(frame, app, None),
-        ConnectionStatus::Reconnecting => {
-            render_agent_table(frame, app, Some("reconnecting to agentd..."))
-        }
+        ConnectionStatus::Connected => render_body(frame, app, None),
+        ConnectionStatus::Reconnecting => render_body(frame, app, Some("reconnecting to agentd...")),
     }
 }
 
+fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(frame.area());
+
+    render_tab_bar(frame, app, chunks[0]);
+
+    match app.active_tab {
+        Tab::Agents => render_agent_table(frame, app, chunks[1], banner),
+        Tab::Logs => render_logs_tab(frame, app, chunks[1], banner),
+    }
+
+    if let Some(modal) = &app.modal {
+        render_modal(frame, app, modal);
+    }
+}
+
+/// Renders an explicit tab bar so the Agents/Logs split - and that `Tab`
+/// cycles between them - is visually obvious, rather than relying on the
+/// table's own border title to convey which tab is active. A bottom-only
+/// border separates it from the content below without boxing it in on the
+/// other three sides.
+fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::BOTTOM);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(inner);
+
+    let tab_style = |tab: Tab| {
+        if app.active_tab == tab {
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        }
+    };
+    let tabs_line = Line::from(vec![
+        Span::styled("Agents [a]", tab_style(Tab::Agents)),
+        Span::raw(" | "),
+        Span::styled("Logs [l]", tab_style(Tab::Logs)),
+        Span::styled("  (tab)", Style::new().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(tabs_line), columns[0]);
+
+    let title = Paragraph::new(Span::styled("agentmon", Style::new().add_modifier(Modifier::BOLD)))
+        .alignment(ratatui::layout::Alignment::Right);
+    frame.render_widget(title, columns[1]);
+}
+
 fn render_message(frame: &mut Frame, message: &str) {
-    let block = Block::default().title("agentmon").borders(Borders::ALL);
+    let block = Block::default()
+        .title("agentmon")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
     let paragraph = Paragraph::new(message).block(block);
     frame.render_widget(paragraph, frame.area());
 }
 
-fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
+fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
     let header = Row::new(["PROJECT", "STATUS", "UPDATED"]).style(Style::new().bold());
 
     let now = now_ms();
@@ -65,17 +126,349 @@ fn render_agent_table(frame: &mut Frame, app: &App, banner: Option<&str>) {
     ];
 
     let title = match banner {
-        Some(banner) => format!("agentmon - {banner}"),
+        Some(banner) => format!("Agents - {banner}"),
         None if app.agents.is_empty() && app.test_runs.is_empty() => {
-            "agentmon - no agents tracked yet".to_string()
+            "Agents - no agents tracked yet".to_string()
         }
-        None => "agentmon".to_string(),
+        None => "Agents".to_string(),
     };
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().title(title).borders(Borders::ALL));
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG))
+        .highlight_symbol("> ")
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
 
-    frame.render_widget(table, frame.area());
+    let selected = if groups.is_empty() { None } else { Some(app.agents_selected.min(groups.len() - 1)) };
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// Renders the Logs tab: every activity log entry the daemon has sent,
+/// aggregated across projects, filtered/sorted per `App`'s current state -
+/// see the "Logs tab shows an aggregated, paginated activity list" and
+/// "Logs tab supports sorting and filtering" requirements.
+fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
+    let header = Row::new(["TIME", "PROJECT", "CATEGORY", "STATUS"]).style(Style::new().bold());
+
+    let entries = app.visible_logs();
+    let rows = entries.iter().map(|entry| {
+        let (status_text, status_style) = log_entry_status_line(&app.logs, entry);
+        Row::new([
+            Cell::from(format_last_updated(entry.occurred_at_ms)),
+            Cell::from(project_name(&entry.working_dir)),
+            Cell::from(log_category_label(entry.category)),
+            Cell::from(Span::styled(status_text, status_style)),
+        ])
+    });
+
+    let widths = [
+        Constraint::Length(19),
+        Constraint::Fill(2),
+        Constraint::Length(10),
+        Constraint::Fill(1),
+    ];
+
+    let controls = logs_controls_hint(app);
+    let title = match banner {
+        Some(banner) => format!("Logs - {banner}  |  {controls}"),
+        None if app.logs.is_empty() => format!("Logs - no activity logged yet  |  {controls}"),
+        None => format!("Logs - {controls}"),
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG))
+        .highlight_symbol("> ")
+        .block(block);
+
+    let selected = if entries.is_empty() {
+        None
+    } else {
+        Some(app.logs_selected.min(entries.len() - 1))
+    };
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    // A filter that matches nothing is shown in the empty body beneath the
+    // header, not in the title - the title's job is the always-visible sort
+    // and filter controls, not transient result state.
+    if entries.is_empty() && !app.logs.is_empty() {
+        let message_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        frame.render_widget(
+            Paragraph::new("No activity matches the current filter")
+                .style(Style::new().fg(Color::DarkGray)),
+            message_area,
+        );
+    }
+}
+
+fn log_sort_label(sort: LogSort) -> &'static str {
+    match sort {
+        LogSort::Recency => "recency",
+        LogSort::Project => "project",
+        LogSort::Status => "status",
+    }
+}
+
+fn log_category_label(category: agentmon_proto::LogCategory) -> &'static str {
+    match category {
+        agentmon_proto::LogCategory::Agent => "agent",
+        agentmon_proto::LogCategory::TestRun => "test-run",
+    }
+}
+
+/// Maps a log entry's category and (loosely-typed, wire-format) status
+/// string back to the same emoji-marked label and color used for that
+/// status in the Agents tab, so the Logs tab's STATUS column is visually
+/// consistent with it rather than showing a plain, unstyled string.
+fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status: &str) -> (String, Style) {
+    match category {
+        agentmon_proto::LogCategory::Agent => match status {
+            "done" => owned(status_label_and_style(AgentStatus::Done)),
+            "needs_input" => owned(status_label_and_style(AgentStatus::NeedsInput)),
+            other => (other.to_string(), Style::new()),
+        },
+        agentmon_proto::LogCategory::TestRun => match status {
+            "started" => test_run_status_cell_text_and_style(TestRunStatus::Started),
+            "passed" => test_run_status_cell_text_and_style(TestRunStatus::Passed),
+            "failed" => test_run_status_cell_text_and_style(TestRunStatus::Failed),
+            other => (other.to_string(), Style::new()),
+        },
+    }
+}
+
+fn owned((label, style): (&'static str, Style)) -> (String, Style) {
+    (label.to_string(), style)
+}
+
+/// For a "passed" or "failed" test-run log entry, the elapsed time since the
+/// most recent preceding "started" entry for the same project. Log entries
+/// carry no run-start timestamp of their own (unlike the live `TestRunInfo`
+/// the Agents tab reads), so the pairing is reconstructed from the log's own
+/// history - at most one test run is ever tracked per directory at a time,
+/// so the nearest preceding "started" is always the one that finished here.
+fn log_test_run_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option<u64> {
+    if entry.category != agentmon_proto::LogCategory::TestRun {
+        return None;
+    }
+    if entry.status != "passed" && entry.status != "failed" {
+        return None;
+    }
+    all_logs
+        .iter()
+        .filter(|e| e.category == agentmon_proto::LogCategory::TestRun)
+        .filter(|e| e.working_dir == entry.working_dir)
+        .filter(|e| e.status == "started")
+        .filter(|e| e.occurred_at_ms <= entry.occurred_at_ms)
+        .max_by_key(|e| e.occurred_at_ms)
+        .map(|started| entry.occurred_at_ms.saturating_sub(started.occurred_at_ms))
+}
+
+/// Builds a log entry's styled status text, appending an elapsed duration
+/// for a completed test run so its total run time is visible the same way
+/// it already is on the Agents tab - see `log_test_run_duration_ms`.
+fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
+    let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
+    if let Some(duration_ms) = log_test_run_duration_ms(all_logs, entry) {
+        text.push(' ');
+        text.push_str(&format_running_duration(0, duration_ms));
+    }
+    (text, style)
+}
+
+/// Builds the always-visible sort/filter control hint shown in the Logs
+/// tab's title, e.g. `Sort [o]: recency  |  Filter: none.  Project [p]
+/// Status [s]  Clear [c]` - the keybinding hints stay present whether or not
+/// a filter is currently applied, so the user always knows how to reach
+/// them.
+fn logs_controls_hint(app: &App) -> String {
+    format!(
+        "Sort [o]: {}  |  Filter: {}.  Project [p]  Status [s]  Clear [c]",
+        log_sort_label(app.logs_sort),
+        logs_filter_state(app),
+    )
+}
+
+fn logs_filter_state(app: &App) -> String {
+    match (&app.logs_filter_project, &app.logs_filter_status) {
+        (None, None) => "none".to_string(),
+        (Some(project), None) => format!("project={project}"),
+        (None, Some(status)) => format!("status={status}"),
+        (Some(project), Some(status)) => format!("project={project}, status={status}"),
+    }
+}
+
+/// Draws `modal` centered on top of whatever tab is currently shown.
+fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) {
+    match modal {
+        Modal::Help => render_help_modal(frame),
+        Modal::Details(cwd) => render_details_modal(frame, app, cwd),
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+/// Renders the selected project's details modal: three panes covering its
+/// registered agents, its last test run (if any), and its recent activity
+/// log entries - see the "Project details modal" requirement.
+fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
+    let area = centered_rect(80, 80, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!("Details - {}", project_name(cwd)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Agents and Tests share the top third, side by side; Logs - typically
+    // the longest-running list - gets the remaining two-thirds beneath them.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+        .split(inner);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(rows[0]);
+    let (agents_area, tests_area, logs_area) = (top[0], top[1], rows[1]);
+
+    let group = app.directory_groups().into_iter().find(|g| g.cwd == cwd);
+    let now = now_ms();
+
+    let agents_lines: Vec<Line> = match &group {
+        Some(g) if !g.agents.is_empty() => g
+            .agents
+            .iter()
+            .map(|a| {
+                let (text, style) = status_cell_text_and_style(a, now);
+                Line::from(Span::styled(text, style))
+            })
+            .collect(),
+        _ => vec![Line::from("No agents")],
+    };
+    frame.render_widget(
+        Paragraph::new(agents_lines).block(
+            Block::default()
+                .title("Agents")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        ),
+        agents_area,
+    );
+
+    let tests_lines: Vec<Line> = match group.as_ref().and_then(|g| g.test_runs.first()) {
+        Some(test_run) => {
+            let (label, style) = test_run_status_cell_text_and_style(test_run.status);
+            let text = format!("{label} {}", format_test_run_duration(test_run, now));
+            vec![Line::from(Span::styled(text, style))]
+        }
+        None => vec![Line::from("No test run")],
+    };
+    frame.render_widget(
+        Paragraph::new(tests_lines).block(
+            Block::default()
+                .title("Tests")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        ),
+        tests_area,
+    );
+
+    let mut project_logs: Vec<&LogEntry> = app.logs.iter().filter(|e| e.working_dir == cwd).collect();
+    project_logs.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms));
+    let logs_lines: Vec<Line> = if project_logs.is_empty() {
+        vec![Line::from("No activity")]
+    } else {
+        project_logs
+            .iter()
+            .map(|entry| {
+                let (status_text, style) = log_entry_status_line(&app.logs, entry);
+                Line::from(vec![
+                    Span::raw(format!("{} ", format_last_updated(entry.occurred_at_ms))),
+                    Span::styled(status_text, style),
+                ])
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(logs_lines).block(
+            Block::default()
+                .title("Logs")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        ),
+        logs_area,
+    );
+}
+
+/// Renders the keyboard-shortcuts help overlay - see the "Keyboard shortcuts
+/// help modal" requirement.
+fn render_help_modal(frame: &mut Frame) {
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let text = [
+        "Tab       switch tabs",
+        "A / L     jump to Agents / Logs tab",
+        "j / down  move selection down",
+        "k / up    move selection up",
+        "d / PgDn  page down (Logs tab)",
+        "u / PgUp  page up (Logs tab)",
+        "Enter     open project details (Agents or Logs tab)",
+        "o         cycle log sort (Logs tab)",
+        "p         cycle project filter (Logs tab)",
+        "s         cycle status filter (Logs tab)",
+        "c         clear log filters (Logs tab)",
+        "?         toggle this help",
+        "Esc       close modal",
+        "q         quit",
+    ]
+    .join("\n");
+
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .title("Keyboard Shortcuts")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        ),
+        area,
+    );
 }
 
 /// Formats a unix-epoch-milliseconds timestamp in the system's local
@@ -279,6 +672,50 @@ mod tests {
         text
     }
 
+    /// Finds the first cell in the buffer (scanning top-to-bottom,
+    /// left-to-right) whose symbol matches `needle`, so style-comparison
+    /// tests don't need to hardcode a row index that shifts whenever the
+    /// surrounding layout changes (e.g. the tab bar's height).
+    fn find_cell<'a>(
+        buffer: &'a ratatui::buffer::Buffer,
+        needle: &str,
+    ) -> Option<&'a ratatui::buffer::Cell> {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)].symbol() == needle {
+                    return Some(&buffer[(x, y)]);
+                }
+            }
+        }
+        None
+    }
+
+    /// Finds the top-left position of the first row containing `needle` as a
+    /// contiguous substring, so tests can check layout (e.g. "this text is
+    /// right of that text, on the same row") without relying on a single
+    /// ambiguous character.
+    fn find_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        find_text_from(buffer, needle, 0)
+    }
+
+    /// Like `find_text`, but only considers rows at or after `min_y` - useful
+    /// when `needle` also appears elsewhere on screen (e.g. a pane title
+    /// that happens to match the tab bar's label) and the test only cares
+    /// about the occurrence within a specific area.
+    fn find_text_from(buffer: &ratatui::buffer::Buffer, needle: &str, min_y: u16) -> Option<(u16, u16)> {
+        for y in min_y..buffer.area.height {
+            let mut row = String::new();
+            for x in 0..buffer.area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(byte_idx) = row.find(needle) {
+                let x = row[..byte_idx].chars().count() as u16;
+                return Some((x, y));
+            }
+        }
+        None
+    }
+
     #[test]
     fn unreachable_daemon_renders_a_clear_message() {
         let mut term = terminal();
@@ -303,6 +740,54 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("project"), "expected project name, got:\n{text}");
         assert!(text.contains("running"), "expected status, got:\n{text}");
+    }
+
+    #[test]
+    fn borders_are_rounded_everywhere_except_the_tab_bars_underline() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            Vec::new(),
+        );
+
+        // Agents tab.
+        term.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('╭'), "Agents tab should use rounded corners, got:\n{text}");
+        assert!(!text.contains('┌'), "no sharp corners should remain, got:\n{text}");
+
+        // Logs tab.
+        app.set_tab(Tab::Logs);
+        term.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('╭'), "Logs tab should use rounded corners, got:\n{text}");
+
+        // Details modal (Agents/Tests/Logs panes, plus the outer frame).
+        app.set_tab(Tab::Agents);
+        app.open_details_modal();
+        term.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&term);
+        let rounded_corners = text.matches('╭').count();
+        assert!(
+            rounded_corners >= 4,
+            "expected at least 4 rounded top-left corners (outer frame + 3 panes), got {rounded_corners} in:\n{text}"
+        );
+        assert!(!text.contains('┌'), "no sharp corners should remain in the modal, got:\n{text}");
+
+        // Help modal.
+        app.close_modal();
+        app.open_help_modal();
+        term.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('╭'), "help modal should use rounded corners, got:\n{text}");
+
+        // The tab bar's bottom-only underline has no corners to round - it
+        // must still just be a plain horizontal line.
+        assert!(
+            find_text(term.backend().buffer(), "─").is_some(),
+            "tab bar underline should still be a plain horizontal line"
+        );
     }
 
     #[test]
@@ -396,19 +881,10 @@ mod tests {
         assert!(text.contains("running"));
 
         // ...and by style: locate the "NEEDS INPUT" span and confirm its
-        // foreground color differs from the "running" span's, within that
-        // same row.
+        // foreground color differs from the "running" span's.
         let buffer = term.backend().buffer();
-        let row = 2; // border + header, then the one combined project row
-        let needs_input_cell = (0..buffer.area.width)
-            .find(|&x| buffer[(x, row)].symbol() == "N")
-            .map(|x| &buffer[(x, row)]);
-        let running_cell = (0..buffer.area.width)
-            .find(|&x| buffer[(x, row)].symbol() == "r")
-            .map(|x| &buffer[(x, row)]);
-
-        let needs_input_cell = needs_input_cell.expect("NEEDS INPUT cell should be found");
-        let running_cell = running_cell.expect("running cell should be found");
+        let needs_input_cell = find_cell(buffer, "N").expect("NEEDS INPUT cell should be found");
+        let running_cell = find_cell(buffer, "r").expect("running cell should be found");
         assert_ne!(
             needs_input_cell.fg, running_cell.fg,
             "needs-input styling must differ from running styling"
@@ -573,16 +1049,8 @@ mod tests {
         assert!(text.contains("running"), "expected running status, got:\n{text}");
 
         let buffer = term.backend().buffer();
-        let row = 2; // border + header, then the one combined project row
-        let declined_cell = (0..buffer.area.width)
-            .find(|&x| buffer[(x, row)].symbol() == "d")
-            .map(|x| &buffer[(x, row)]);
-        let running_cell = (0..buffer.area.width)
-            .find(|&x| buffer[(x, row)].symbol() == "r")
-            .map(|x| &buffer[(x, row)]);
-
-        let declined_cell = declined_cell.expect("declined cell should be found");
-        let running_cell = running_cell.expect("running cell should be found");
+        let declined_cell = find_cell(buffer, "d").expect("declined cell should be found");
+        let running_cell = find_cell(buffer, "r").expect("running cell should be found");
         assert_ne!(
             declined_cell.fg, running_cell.fg,
             "declined styling must differ from running styling"
@@ -840,5 +1308,555 @@ mod tests {
             text.contains(&expected),
             "expected the more recent member's timestamp {expected:?}, got:\n{text}"
         );
+    }
+
+    fn log_entry(cwd: &str, category: agentmon_proto::LogCategory, status: &str, occurred_at_ms: u64) -> LogEntry {
+        LogEntry {
+            working_dir: PathBuf::from(cwd),
+            category,
+            status: status.to_string(),
+            occurred_at_ms,
+        }
+    }
+
+    #[test]
+    fn logs_tab_lists_entries_across_projects() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "done", 1_000),
+            log_entry("/tmp/project-b", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
+        ]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("project-a"), "got:\n{text}");
+        assert!(text.contains("project-b"), "got:\n{text}");
+        assert!(text.contains("done"), "got:\n{text}");
+        assert!(text.contains("failed"), "got:\n{text}");
+    }
+
+    #[test]
+    fn log_status_cell_uses_the_same_emoji_markers_as_the_agents_tab() {
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "done").0,
+            "✅ done"
+        );
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "needs_input").0,
+            "🔔 NEEDS INPUT"
+        );
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "started").0,
+            "⏳ test started"
+        );
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "passed").0,
+            "✅ tests passed"
+        );
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "failed").0,
+            "❌ tests failed"
+        );
+    }
+
+    #[test]
+    fn log_status_cell_style_matches_the_agents_tab() {
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "done").1,
+            status_label_and_style(AgentStatus::Done).1
+        );
+        assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "failed").1,
+            test_run_status_cell_text_and_style(TestRunStatus::Failed).1
+        );
+    }
+
+    #[test]
+    fn logs_tab_status_column_renders_the_emoji_marked_labels() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "needs_input", 1_000),
+            log_entry("/tmp/project-b", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
+        ]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        // Emoji are double-width in the terminal buffer, so check the glyph
+        // and its trailing label as separate substrings rather than one
+        // contiguous string spanning the wide-character boundary.
+        let text = buffer_text(&term);
+        assert!(text.contains('🔔'), "got:\n{text}");
+        assert!(text.contains("NEEDS INPUT"), "got:\n{text}");
+        assert!(text.contains('❌'), "got:\n{text}");
+        assert!(text.contains("tests failed"), "got:\n{text}");
+    }
+
+    #[test]
+    fn logs_tab_shows_a_completed_test_runs_duration() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::TestRun, "started", 0),
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::TestRun, "passed", 134_000),
+        ]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("2m14s"),
+            "expected the completed test run's total duration, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_shows_no_duration_for_a_started_run_with_no_completion_yet() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry(
+            "/tmp/project-a",
+            agentmon_proto::LogCategory::TestRun,
+            "started",
+            0,
+        )]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(
+            log_test_run_duration_ms(&app.logs, &app.logs[0]),
+            None,
+            "a lone started entry has no completion to compute a duration from"
+        );
+    }
+
+    #[test]
+    fn logs_tab_status_column_is_colored_by_status() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "done", 1_000),
+            log_entry("/tmp/project-b", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
+        ]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (done_x, done_y) = find_text(buffer, "done").expect("done status should be rendered");
+        let (failed_x, failed_y) = find_text(buffer, "tests failed").expect("failed status should be rendered");
+
+        let (_, done_style) = status_label_and_style(AgentStatus::Done);
+        let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed);
+        assert_eq!(buffer[(done_x, done_y)].fg, done_style.fg.unwrap_or_default());
+        assert_eq!(buffer[(failed_x, failed_y)].fg, failed_style.fg.unwrap_or_default());
+        assert_ne!(
+            buffer[(done_x, done_y)].fg,
+            buffer[(failed_x, failed_y)].fg,
+            "done and failed should be colored differently"
+        );
+    }
+
+    #[test]
+    fn logs_tab_shows_a_placeholder_when_empty() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("no activity logged yet"), "got:\n{text}");
+        assert!(
+            text.contains("Sort [o]"),
+            "sort control hint must be shown even with no activity, got:\n{text}"
+        );
+        assert!(
+            text.contains("Filter: none"),
+            "filter control hint must be shown even with no activity, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_shows_sort_and_filter_shortcut_hints_with_no_filter_applied() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry(
+            "/tmp/project-a",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            1_000,
+        )]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Sort [o]: recency"), "got:\n{text}");
+        assert!(text.contains("Filter: none."), "got:\n{text}");
+        assert!(text.contains("Project [p]"), "got:\n{text}");
+        assert!(text.contains("Status [s]"), "got:\n{text}");
+        assert!(text.contains("Clear [c]"), "got:\n{text}");
+    }
+
+    #[test]
+    fn logs_tab_retains_shortcut_hints_with_a_filter_applied() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry(
+            "/tmp/project-a",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            1_000,
+        )]);
+        app.cycle_logs_project_filter();
+        app.cycle_logs_sort();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Sort [o]: project"), "got:\n{text}");
+        assert!(text.contains("Filter: project=project-a."), "got:\n{text}");
+        assert!(
+            text.contains("Project [p]") && text.contains("Status [s]") && text.contains("Clear [c]"),
+            "shortcut hints must remain visible once a filter is applied, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_shows_a_gray_placeholder_in_the_table_body_not_the_title() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![
+            log_entry("/tmp/alpha", agentmon_proto::LogCategory::Agent, "done", 1_000),
+            log_entry("/tmp/beta", agentmon_proto::LogCategory::Agent, "needs_input", 2_000),
+        ]);
+        // "alpha" only ever has status "done" - combining it with the
+        // "needs_input" status filter matches nothing.
+        app.cycle_logs_project_filter(); // -> "alpha" (first alphabetically)
+        app.cycle_logs_status_filter(); // -> "done"
+        app.cycle_logs_status_filter(); // -> "needs_input"
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("no activity matches"),
+            "the empty-filter message must not appear in the title anymore, got:\n{text}"
+        );
+        let (msg_x, msg_y) =
+            find_text(buffer, "No activity matches the current filter").expect("got:\n{text}");
+        assert_eq!(
+            buffer[(msg_x, msg_y)].fg,
+            Color::DarkGray,
+            "the empty-filter message should be shown in gray"
+        );
+    }
+
+    #[test]
+    fn details_modal_shows_agents_tests_and_logs_panes() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            vec![test_run(999, TestRunStatus::Failed, 0)],
+        );
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::TestRun,
+            "failed",
+            0,
+        )]);
+        app.open_details_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Agents"), "got:\n{text}");
+        assert!(text.contains("Tests"), "got:\n{text}");
+        assert!(text.contains("Logs"), "got:\n{text}");
+        assert!(text.contains("running"), "expected the agent's status, got:\n{text}");
+        assert!(text.contains("tests failed"), "expected the test run's status, got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_reflects_new_events_while_open() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            Vec::new(),
+        );
+        app.open_details_modal();
+        term.draw(|frame| render(frame, &app)).unwrap();
+        assert!(buffer_text(&term).contains("running"), "sanity check before the update");
+
+        // Simulate an event arriving from the daemon while the modal stays
+        // open - the same `apply_update`/`apply_log_appended` calls
+        // `main.rs`'s event loop makes unconditionally, regardless of modal
+        // state.
+        app.apply_update(agent("a", AgentStatus::NeedsInput, HostContext::Terminal, 4242, 1_000));
+        app.apply_log_appended(log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "needs_input",
+            1_000,
+        ));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("NEEDS INPUT"),
+            "the modal's Agents pane should reflect the new status without closing/reopening, got:\n{text}"
+        );
+        assert_eq!(
+            text.matches("NEEDS INPUT").count(),
+            2,
+            "expected NEEDS INPUT once in the Agents pane and once in the Logs pane for the new entry, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_puts_agents_and_tests_side_by_side_above_logs() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            vec![test_run(999, TestRunStatus::Failed, 0)],
+        );
+        app.open_details_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        // "Agents" also appears as the tab bar's label and the background
+        // Agents-tab table's own title - restrict the search to rows below
+        // the modal's own "Details - ..." title to find its Agents pane.
+        let (_, details_y) = find_text(buffer, "Details -").expect("modal title should be rendered");
+        let (agents_x, agents_y) = find_text_from(buffer, "Agents", details_y + 1)
+            .expect("Agents pane title should be rendered");
+        let (tests_x, tests_y) = find_text_from(buffer, "Tests", details_y + 1)
+            .expect("Tests pane title should be rendered");
+        let (_, logs_y) = find_text_from(buffer, "Logs", details_y + 1)
+            .expect("Logs pane title should be rendered");
+
+        assert_eq!(agents_y, tests_y, "Agents and Tests panes must be on the same row");
+        assert!(tests_x > agents_x, "Tests pane must be to the right of Agents");
+        assert!(logs_y > agents_y, "Logs pane must be below Agents/Tests");
+    }
+
+    #[test]
+    fn details_modal_colors_agent_and_test_statuses_like_the_agents_tab() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::NeedsInput, HostContext::Terminal, 4242, 0)],
+            vec![test_run(999, TestRunStatus::Failed, 0)],
+        );
+        app.open_details_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (x, y) = find_text(buffer, "NEEDS INPUT").expect("agent status should be rendered");
+        let (_, expected_style) = status_label_and_style(AgentStatus::NeedsInput);
+        assert_eq!(buffer[(x, y)].fg, expected_style.fg.unwrap_or_default());
+
+        let (x, y) = find_text(buffer, "tests failed").expect("test run status should be rendered");
+        let (_, expected_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed);
+        assert_eq!(buffer[(x, y)].fg, expected_style.fg.unwrap_or_default());
+    }
+
+    #[test]
+    fn details_modal_logs_pane_shows_a_completed_test_runs_duration() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![
+            log_entry("/Users/beet/project", agentmon_proto::LogCategory::TestRun, "started", 0),
+            log_entry("/Users/beet/project", agentmon_proto::LogCategory::TestRun, "failed", 45_000),
+        ]);
+        app.agents_selected = 0;
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("45s"),
+            "expected the completed test run's duration in the Logs pane, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_shows_placeholders_when_no_test_run_or_activity() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("No test run"), "got:\n{text}");
+        assert!(text.contains("No activity"), "got:\n{text}");
+    }
+
+    #[test]
+    fn closing_the_details_modal_returns_to_the_agents_tab() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+        app.close_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(!text.contains("Details -"), "modal must not still be shown, got:\n{text}");
+        assert!(text.contains("Agents"), "got:\n{text}");
+    }
+
+    #[test]
+    fn tab_bar_shows_shortcut_hints_and_the_title() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Agents [a]"), "got:\n{text}");
+        assert!(text.contains("Logs [l]"), "got:\n{text}");
+        assert!(text.contains("(tab)"), "got:\n{text}");
+        assert!(text.contains("agentmon"), "got:\n{text}");
+    }
+
+    #[test]
+    fn tab_bar_title_is_on_the_same_line_as_the_tabs_far_right() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (tabs_x, tabs_y) = find_text(buffer, "Agents").expect("tab labels should be rendered");
+        let (title_x, title_y) = find_text(buffer, "agentmon").expect("agentmon title should be rendered");
+
+        assert_eq!(tabs_y, title_y, "the title must be on the same row as the tab labels");
+        assert!(
+            title_x > tabs_x,
+            "the title must be to the right of the tab labels, got title_x={title_x} tabs_x={tabs_x}"
+        );
+        assert!(
+            title_x as usize + "agentmon".len() == buffer.area.width as usize,
+            "the title must be flush against the far right edge, got title_x={title_x} width={}",
+            buffer.area.width
+        );
+
+        let title_cell = &buffer[(title_x, title_y)];
+        assert!(
+            title_cell.modifier.contains(Modifier::BOLD),
+            "the agentmon title should be bold"
+        );
+    }
+
+    #[test]
+    fn tab_bar_has_no_top_left_or_right_border() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        // Row 0 is the tab bar's content row - it must not carry a border
+        // character (┌, ┐, or │) on its edges.
+        assert_ne!(buffer[(0, 0)].symbol(), "┌", "no top-left corner expected");
+        assert_ne!(buffer[(buffer.area.width - 1, 0)].symbol(), "┐", "no top-right corner expected");
+        assert_ne!(buffer[(0, 0)].symbol(), "│", "no left border expected");
+        assert_ne!(buffer[(buffer.area.width - 1, 0)].symbol(), "│", "no right border expected");
+    }
+
+    #[test]
+    fn active_tab_is_visually_highlighted() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(Tab::Logs);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let logs_tab_cell = find_cell(term.backend().buffer(), "L").expect("Logs tab label should be rendered");
+        assert!(
+            logs_tab_cell.modifier.contains(Modifier::BOLD),
+            "the active tab should be visually highlighted"
+        );
+    }
+
+    #[test]
+    fn selected_row_uses_a_background_fill_rather_than_reversed_video() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::NeedsInput, HostContext::Terminal, 4242, 0)],
+            Vec::new(),
+        );
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (x, y) = find_text(buffer, "NEEDS INPUT").expect("selected row's status should be rendered");
+        let cell = &buffer[(x, y)];
+
+        assert_eq!(
+            cell.bg,
+            SELECTED_ROW_BG,
+            "the selected row should be marked with a background fill"
+        );
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "the selected row should not use reversed video, which inverts status colors"
+        );
+        let (_, needs_input_style) = status_label_and_style(AgentStatus::NeedsInput);
+        assert_eq!(
+            cell.fg,
+            needs_input_style.fg.unwrap_or_default(),
+            "the status's own color must survive selection, not be inverted"
+        );
+    }
+
+    #[test]
+    fn help_modal_lists_keyboard_shortcuts() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.open_help_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Keyboard Shortcuts"), "got:\n{text}");
+        assert!(text.contains("quit"), "got:\n{text}");
     }
 }

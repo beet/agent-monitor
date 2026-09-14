@@ -100,6 +100,29 @@ pub struct AgentInfo {
     pub status_since_ms: u64,
 }
 
+/// Category of event recorded in the activity log - see the activity-log
+/// spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogCategory {
+    Agent,
+    TestRun,
+}
+
+/// One notification-worthy event recorded in the daemon's bounded activity
+/// log, per the activity-log spec's "Activity log captures notification-worthy
+/// events" requirement. `status` reuses the same status strings already sent
+/// for agents/test-runs (e.g. "done", "needs_input", "started") rather than a
+/// parallel enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub working_dir: PathBuf,
+    pub category: LogCategory,
+    pub status: String,
+    /// Unix epoch milliseconds of when this event occurred.
+    pub occurred_at_ms: u64,
+}
+
 /// The first message a connection sends, telling the daemon whether it is a
 /// short-lived hook event report or a long-lived subscriber (e.g. the TUI).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,11 +148,15 @@ pub enum ServerMessage {
     Snapshot {
         agents: Vec<AgentInfo>,
         test_runs: Vec<TestRunInfo>,
+        /// The activity log's current entries, in the order they occurred.
+        logs: Vec<LogEntry>,
     },
     /// An incremental update to a single agent's state.
     AgentUpdate { agent: AgentInfo },
     /// An incremental update to a single test run's state.
     TestRunUpdate { test_run: TestRunInfo },
+    /// A new activity log entry, pushed as it's recorded.
+    LogAppended { entry: LogEntry },
 }
 
 #[cfg(test)]
@@ -202,11 +229,55 @@ mod tests {
         );
     }
 
+    fn sample_log_entry() -> LogEntry {
+        LogEntry {
+            working_dir: PathBuf::from("/Users/beet/Documents/Projects/enclaudinate"),
+            category: LogCategory::Agent,
+            status: "done".to_string(),
+            occurred_at_ms: 1_700_000_000_000,
+        }
+    }
+
     #[test]
     fn server_message_snapshot_round_trips_through_json() {
         let message = ServerMessage::Snapshot {
             agents: vec![sample_agent()],
             test_runs: vec![sample_test_run()],
+            logs: vec![sample_log_entry()],
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn log_entry_round_trips_through_json() {
+        let entry = sample_log_entry();
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn log_category_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LogCategory::Agent).unwrap(),
+            "\"agent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogCategory::TestRun).unwrap(),
+            "\"test_run\""
+        );
+    }
+
+    #[test]
+    fn server_message_log_appended_round_trips_through_json() {
+        let message = ServerMessage::LogAppended {
+            entry: sample_log_entry(),
         };
 
         let json = serde_json::to_string(&message).unwrap();

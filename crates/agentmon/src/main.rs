@@ -96,15 +96,17 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         match rx.recv() {
             Ok(AppEvent::Client(ClientEvent::Unreachable(reason))) => app.set_unreachable(reason),
             Ok(AppEvent::Client(ClientEvent::Reconnecting)) => app.set_reconnecting(),
-            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs))) => {
-                app.apply_snapshot(agents, test_runs)
+            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs, logs))) => {
+                app.apply_snapshot(agents, test_runs);
+                app.apply_log_snapshot(logs);
             }
             Ok(AppEvent::Client(ClientEvent::Update(agent))) => app.apply_update(agent),
             Ok(AppEvent::Client(ClientEvent::TestRunUpdate(test_run))) => {
                 app.apply_test_run_update(test_run)
             }
+            Ok(AppEvent::Client(ClientEvent::LogAppended(entry))) => app.apply_log_appended(entry),
             Ok(AppEvent::Key(key)) => {
-                if handle_key(key) == InputAction::Quit {
+                if handle_key(&mut app, key) == InputAction::Quit {
                     return Ok(());
                 }
             }

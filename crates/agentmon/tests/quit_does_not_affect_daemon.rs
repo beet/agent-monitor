@@ -104,7 +104,7 @@ fn quitting_a_tui_client_does_not_affect_the_daemon_or_its_tracked_agents() {
     let (tx2, rx2) = mpsc::channel();
     spawn_client(path, tx2);
     match rx2.recv_timeout(Duration::from_secs(2)) {
-        Ok(ClientEvent::Snapshot(agents, _)) => {
+        Ok(ClientEvent::Snapshot(agents, _, _)) => {
             assert_eq!(agents.len(), 1, "daemon should still be tracking the agent");
             assert_eq!(agents[0].session_id, SessionId("session-1".to_string()));
         }
