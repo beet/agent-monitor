@@ -83,6 +83,10 @@ stateDiagram-v2
 
 Tracked agents and test runs are grouped by exact working directory. A test run has no session id of its own - it can't, since Claude Code never propagates one into a Bash tool's subprocess tree, and a run may not even be agent-initiated - so `agentd` correlates it purely by directory instead. `agentmon`'s TUI shows each directory's tracked agent(s) together with any test run(s) there, rather than as unrelated rows.
 
+## Activity log
+
+`agentd` keeps a bounded, global history of the last 500 notification-worthy events - an agent going "done" or "needs input", and a test run starting, passing, or failing - so you can see what happened while you weren't watching, not just live state. The TUI's **Logs** tab (`Tab` or `L` to switch) lists that history across every project, most recent first, sortable and filterable by project or status. Pressing `Enter` on a project row (in either tab) opens a details modal with that project's tracked agents, its last test run, and its own activity log.
+
 ## Supported hosts
 
 Works for Claude Code sessions in a terminal or nvim's embedded terminal. The desktop app isn't supported — it runs sessions in a sandboxed environment that can't execute local hooks (it has its own built-in notifications instead).

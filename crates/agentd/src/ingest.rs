@@ -56,6 +56,15 @@ impl Ingestor {
     /// transition into "done" or "needs input".
     pub fn ingest_event(&self, event: AgentEvent) -> AgentInfo {
         let outcome = self.registry.upsert(event);
+        if outcome.stale_event_ignored {
+            // A late event for an already-superseded session id: `agent` and
+            // `previous_status` describe the pid's unaffected live entry,
+            // not a real transition, so notifying/logging off them would be
+            // spurious (see `UpsertOutcome::stale_event_ignored`'s doc
+            // comment) - most concretely, a live "needs input" status always
+            // notifies regardless of whether it changed.
+            return outcome.agent;
+        }
         if should_notify(outcome.previous_status, outcome.agent.status) {
             self.notifier.notify(&outcome.agent);
             self.record_log(LogEntry {
@@ -470,6 +479,59 @@ mod tests {
         ingestor.ingest_event(event(AgentStatus::Running));
 
         assert!(ingestor.activity_log().snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_late_event_for_a_superseded_session_does_not_notify_or_log_even_if_the_live_session_needs_input() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+
+        // session-1 is superseded by session-2 on the same pid (e.g.
+        // `/clear`), and session-2 then needs input - a status that always
+        // notifies on its own, regardless of whether it just changed.
+        ingestor.ingest_event(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 1,
+            ..event(AgentStatus::Running)
+        });
+        ingestor.ingest_event(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 1,
+            ..event(AgentStatus::Running)
+        });
+        ingestor.ingest_event(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 1,
+            ..event(AgentStatus::NeedsInput)
+        });
+        let calls_before_late_event = notifier.calls.lock().unwrap().len();
+        let logs_before_late_event = ingestor.activity_log().snapshot().len();
+
+        // A late hook event for session-1 - already superseded - finally
+        // arrives. Naively re-checking should_notify against the returned
+        // (unchanged) session-2 entry would wrongly notify again here,
+        // since session-2's live status is "needs input".
+        let agent = ingestor.ingest_event(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 1,
+            ..event(AgentStatus::Done)
+        });
+
+        assert_eq!(
+            agent.session_id,
+            SessionId("session-2".to_string()),
+            "the late event must resolve to session-2, the pid's live entry"
+        );
+        assert_eq!(
+            notifier.calls.lock().unwrap().len(),
+            calls_before_late_event,
+            "a stale, dropped event must not trigger a notification"
+        );
+        assert_eq!(
+            ingestor.activity_log().snapshot().len(),
+            logs_before_late_event,
+            "a stale, dropped event must not append an activity-log entry"
+        );
     }
 
     #[test]

@@ -17,7 +17,13 @@ use crate::app::{App, ConnectionStatus, DirectoryGroup, LogSort, Modal, Tab};
 /// rather than being inverted. A named ANSI color (not `Rgb`/`Indexed`) so
 /// it - like the status colors elsewhere in this file - is controlled by
 /// the terminal's own color scheme rather than a fixed literal value.
-const SELECTED_ROW_BG: Color = Color::Blue;
+/// Deliberately not any color used by a status's own foreground (see
+/// `status_label_and_style`/`test_run_status_cell_text_and_style`) - most
+/// notably not `Color::Blue`, which "running"/"started" use, since matching
+/// colors would render that status's label and emoji invisible on the
+/// selected row (including the row selected by default before the user has
+/// moved the cursor).
+const SELECTED_ROW_BG: Color = Color::Magenta;
 
 /// The order distinct agent statuses appear in a project's combined STATUS
 /// cell - a fixed order so the same set of statuses always renders the same
@@ -127,25 +133,38 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
 
     let title = match banner {
         Some(banner) => format!("Agents - {banner}"),
-        None if app.agents.is_empty() && app.test_runs.is_empty() => {
-            "Agents - no agents tracked yet".to_string()
-        }
         None => "Agents".to_string(),
     };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(Style::new().bg(SELECTED_ROW_BG))
         .highlight_symbol("> ")
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
+        .block(block);
 
     let selected = if groups.is_empty() { None } else { Some(app.agents_selected.min(groups.len() - 1)) };
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
+
+    // "No agents tracked yet" lives in the empty table body, not the title,
+    // matching the Logs tab's convention for its own empty states.
+    if groups.is_empty() {
+        let message_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        frame.render_widget(
+            Paragraph::new("No agents tracked yet").style(Style::new().fg(Color::DarkGray)),
+            message_area,
+        );
+    }
 }
 
 /// Renders the Logs tab: every activity log entry the daemon has sent,
@@ -176,7 +195,6 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let controls = logs_controls_hint(app);
     let title = match banner {
         Some(banner) => format!("Logs - {banner}  |  {controls}"),
-        None if app.logs.is_empty() => format!("Logs - no activity logged yet  |  {controls}"),
         None => format!("Logs - {controls}"),
     };
 
@@ -200,10 +218,16 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
 
-    // A filter that matches nothing is shown in the empty body beneath the
-    // header, not in the title - the title's job is the always-visible sort
-    // and filter controls, not transient result state.
-    if entries.is_empty() && !app.logs.is_empty() {
+    // Both the "nothing logged yet" and "filter matches nothing" empty
+    // states are shown in the body beneath the header, not the title - the
+    // title's job is the always-visible sort and filter controls, not
+    // transient result state.
+    if app.logs.is_empty() || entries.is_empty() {
+        let message = if app.logs.is_empty() {
+            "No activity logged yet"
+        } else {
+            "No activity matches the current filter"
+        };
         let message_area = Rect {
             x: inner.x,
             y: inner.y + 1,
@@ -211,8 +235,7 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
             height: inner.height.saturating_sub(1),
         };
         frame.render_widget(
-            Paragraph::new("No activity matches the current filter")
-                .style(Style::new().fg(Color::DarkGray)),
+            Paragraph::new(message).style(Style::new().fg(Color::DarkGray)),
             message_area,
         );
     }
@@ -730,6 +753,28 @@ mod tests {
     }
 
     #[test]
+    fn agents_tab_shows_a_gray_placeholder_in_the_table_body_when_empty() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("no agents tracked yet"),
+            "the empty-agents message must not appear in the title, got:\n{text}"
+        );
+        let (msg_x, msg_y) = find_text(buffer, "No agents tracked yet").expect("got:\n{text}");
+        assert_eq!(
+            buffer[(msg_x, msg_y)].fg,
+            Color::DarkGray,
+            "the empty-agents message should be shown in gray in the table body"
+        );
+    }
+
+    #[test]
     fn seeded_agents_are_rendered_in_the_table() {
         let mut term = terminal();
         let mut app = App::new();
@@ -740,6 +785,37 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("project"), "expected project name, got:\n{text}");
         assert!(text.contains("running"), "expected status, got:\n{text}");
+    }
+
+    #[test]
+    fn a_running_status_stays_legible_on_the_default_selected_row() {
+        let mut term = terminal();
+        let mut app = App::new();
+        // A single agent's row is the only one shown, so it's the row
+        // selected by default - before the user has pressed any navigation
+        // key - exercising the same highlighted-on-startup case a freshly
+        // started agent hits.
+        app.apply_snapshot(vec![agent("s", AgentStatus::Running, HostContext::Nvim, 4242, 0)], Vec::new());
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("🔧"), "expected the running emoji to render, got:\n{text}");
+        assert!(text.contains("running"), "expected the running label to render, got:\n{text}");
+
+        let buffer = term.backend().buffer();
+        let (x, y) = find_text(buffer, "running").expect("running status text should be rendered");
+        let running_cell = &buffer[(x, y)];
+        assert_eq!(
+            running_cell.bg,
+            SELECTED_ROW_BG,
+            "the only row should be highlighted as selected by default"
+        );
+        assert_ne!(
+            running_cell.fg,
+            SELECTED_ROW_BG,
+            "the running status's text must stay visible against the selected-row background"
+        );
     }
 
     #[test]
@@ -1193,6 +1269,42 @@ mod tests {
     }
 
     #[test]
+    fn no_status_foreground_color_matches_the_row_highlight_background() {
+        let agent_statuses = [
+            AgentStatus::Running,
+            AgentStatus::Idle,
+            AgentStatus::NeedsInput,
+            AgentStatus::Done,
+            AgentStatus::Stale,
+            AgentStatus::Declined,
+        ];
+        for status in agent_statuses {
+            let (_, style) = status_label_and_style(status);
+            assert_ne!(
+                style.fg,
+                Some(SELECTED_ROW_BG),
+                "{status:?}'s foreground color must not match the row-highlight \
+                 background, or its label/emoji would be invisible on a selected row"
+            );
+        }
+
+        let test_run_statuses = [
+            TestRunStatus::Started,
+            TestRunStatus::Passed,
+            TestRunStatus::Failed,
+        ];
+        for status in test_run_statuses {
+            let (_, style) = test_run_status_cell_text_and_style(status);
+            assert_ne!(
+                style.fg,
+                Some(SELECTED_ROW_BG),
+                "{status:?}'s foreground color must not match the row-highlight \
+                 background, or its label/emoji would be invisible on a selected row"
+            );
+        }
+    }
+
+    #[test]
     fn a_failing_test_run_is_visually_distinguished() {
         let mut term = terminal();
         let mut app = App::new();
@@ -1469,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn logs_tab_shows_a_placeholder_when_empty() {
+    fn logs_tab_shows_a_gray_placeholder_in_the_table_body_when_empty() {
         let mut term = terminal();
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
@@ -1477,8 +1589,12 @@ mod tests {
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
+        let buffer = term.backend().buffer();
         let text = buffer_text(&term);
-        assert!(text.contains("no activity logged yet"), "got:\n{text}");
+        assert!(
+            !text.contains("no activity logged yet"),
+            "the empty-log message must not appear in the title, got:\n{text}"
+        );
         assert!(
             text.contains("Sort [o]"),
             "sort control hint must be shown even with no activity, got:\n{text}"
@@ -1486,6 +1602,12 @@ mod tests {
         assert!(
             text.contains("Filter: none"),
             "filter control hint must be shown even with no activity, got:\n{text}"
+        );
+        let (msg_x, msg_y) = find_text(buffer, "No activity logged yet").expect("got:\n{text}");
+        assert_eq!(
+            buffer[(msg_x, msg_y)].fg,
+            Color::DarkGray,
+            "the empty-log message should be shown in gray in the table body"
         );
     }
 
