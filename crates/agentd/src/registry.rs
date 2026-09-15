@@ -83,6 +83,12 @@ pub struct UpsertOutcome {
     /// re-notify (e.g. if the live entry's status happens to be "needs
     /// input", which always notifies regardless of whether it changed).
     pub stale_event_ignored: bool,
+    /// Session ids retired by this upsert's same-pid dedup (see `upsert`'s
+    /// doc comment) - empty unless this event's pid just took over from a
+    /// different, now-retired session id. Callers broadcast a removal for
+    /// each one so already-connected clients drop the superseded entry
+    /// instead of keeping it as a frozen duplicate of the pid's new entry.
+    pub retired_session_ids: Vec<SessionId>,
 }
 
 impl Registry {
@@ -128,9 +134,11 @@ impl Registry {
                 is_new: false,
                 previous_status,
                 stale_event_ignored: false,
+                retired_session_ids: Vec::new(),
             };
         }
 
+        let mut retired_session_ids: Vec<SessionId> = Vec::new();
         if previous_status.is_none() {
             if state.superseded_session_set.contains(&event.session_id) {
                 if let Some(current) = state.agents.values().find(|a| a.pid == event.pid).cloned() {
@@ -139,6 +147,7 @@ impl Registry {
                         is_new: false,
                         agent: current,
                         stale_event_ignored: true,
+                        retired_session_ids: Vec::new(),
                     };
                 }
                 // The superseded session id's pid isn't tracked under any
@@ -147,15 +156,15 @@ impl Registry {
                 // silently discarding it with nothing to return).
             }
 
-            let retiring: Vec<SessionId> = state
+            retired_session_ids = state
                 .agents
                 .iter()
                 .filter(|(session_id, agent)| agent.pid == event.pid && **session_id != event.session_id)
                 .map(|(session_id, _)| session_id.clone())
                 .collect();
-            for session_id in retiring {
-                state.agents.remove(&session_id);
-                state.record_superseded(session_id);
+            for session_id in &retired_session_ids {
+                state.agents.remove(session_id);
+                state.record_superseded(session_id.clone());
             }
         }
 
@@ -192,6 +201,7 @@ impl Registry {
             is_new: previous_status.is_none(),
             previous_status,
             stale_event_ignored: false,
+            retired_session_ids,
         }
     }
 
@@ -622,11 +632,17 @@ mod tests {
             ..sample_event(AgentStatus::Running)
         });
 
-        registry.upsert(AgentEvent {
+        let outcome = registry.upsert(AgentEvent {
             session_id: SessionId("session-2".to_string()),
             pid: 123,
             ..sample_event(AgentStatus::Running)
         });
+
+        assert_eq!(
+            outcome.retired_session_ids,
+            vec![SessionId("session-1".to_string())],
+            "the outcome should report session-1 as retired so callers can broadcast its removal"
+        );
 
         let snapshot = registry.snapshot();
         assert_eq!(

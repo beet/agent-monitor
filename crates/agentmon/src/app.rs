@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use agentmon_proto::{AgentInfo, LogEntry, TestRunInfo};
+use agentmon_proto::{AgentInfo, LogEntry, SessionId, TestRunInfo};
 
 /// Number of lines a `d`/`u` page-down/page-up moves the Logs tab's
 /// selection by. See the "Paginated lists support keyboard navigation"
@@ -123,6 +123,16 @@ impl App {
             Some(existing) => *existing = agent,
             None => self.agents.push(agent),
         }
+        self.clamp_agents_selected();
+    }
+
+    /// Drops a retired session id from the tracked agents, per the "Live
+    /// agent list" requirement's handling of a daemon-pushed removal - e.g.
+    /// a same-pid `/clear` superseding this session. A no-op if the session
+    /// id isn't currently tracked (it may have already been replaced by a
+    /// later update that arrived first).
+    pub fn remove_agent(&mut self, session_id: &SessionId) {
+        self.agents.retain(|a| &a.session_id != session_id);
         self.clamp_agents_selected();
     }
 
@@ -427,6 +437,28 @@ mod tests {
         app.apply_update(agent("a", AgentStatus::Stale));
 
         assert_eq!(app.agents[0].status, AgentStatus::Stale);
+    }
+
+    #[test]
+    fn remove_agent_drops_a_retired_session_id() {
+        let mut app = App::new();
+        app.apply_update(agent("session-1", AgentStatus::Running));
+        app.apply_update(agent("session-2", AgentStatus::Running));
+
+        app.remove_agent(&SessionId("session-1".to_string()));
+
+        assert_eq!(app.agents.len(), 1);
+        assert_eq!(app.agents[0].session_id, SessionId("session-2".to_string()));
+    }
+
+    #[test]
+    fn remove_agent_is_a_no_op_for_an_unknown_session_id() {
+        let mut app = App::new();
+        app.apply_update(agent("session-1", AgentStatus::Running));
+
+        app.remove_agent(&SessionId("session-2".to_string()));
+
+        assert_eq!(app.agents.len(), 1, "removing an untracked session id must not affect other agents");
     }
 
     #[test]

@@ -168,6 +168,10 @@ pub enum ServerMessage {
     TestRunUpdate { test_run: TestRunInfo },
     /// A new activity log entry, pushed as it's recorded.
     LogAppended { entry: LogEntry },
+    /// A tracked agent's session id has been retired - e.g. a new session id
+    /// took over its pid (`/clear`) - and should be dropped from a client's
+    /// local state rather than lingering as a frozen duplicate.
+    AgentRemoved { session_id: SessionId },
 }
 
 #[cfg(test)]
@@ -313,6 +317,18 @@ mod tests {
     fn server_message_log_appended_round_trips_through_json() {
         let message = ServerMessage::LogAppended {
             entry: sample_log_entry(),
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn server_message_agent_removed_round_trips_through_json() {
+        let message = ServerMessage::AgentRemoved {
+            session_id: SessionId("session-123".to_string()),
         };
 
         let json = serde_json::to_string(&message).unwrap();

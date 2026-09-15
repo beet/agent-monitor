@@ -6,7 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use agentmon_proto::{
-    read_message, write_message, AgentInfo, ClientMessage, LogEntry, ServerMessage, TestRunInfo,
+    read_message, write_message, AgentInfo, ClientMessage, LogEntry, ServerMessage, SessionId,
+    TestRunInfo,
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -24,6 +25,9 @@ pub enum ClientEvent {
     Update(AgentInfo),
     TestRunUpdate(TestRunInfo),
     LogAppended(LogEntry),
+    /// A tracked agent's session id was retired (e.g. a same-pid `/clear`)
+    /// and should be dropped from the UI's local agent list.
+    AgentRemoved(SessionId),
 }
 
 /// Connects to the daemon at `socket_path`, subscribes, and forwards every
@@ -113,6 +117,11 @@ fn connect_and_stream(socket_path: &Path, events: &Sender<ClientEvent>) -> Strea
             }
             Ok(Some(ServerMessage::LogAppended { entry })) => {
                 if events.send(ClientEvent::LogAppended(entry)).is_err() {
+                    return StreamOutcome::ReceiverGone;
+                }
+            }
+            Ok(Some(ServerMessage::AgentRemoved { session_id })) => {
+                if events.send(ClientEvent::AgentRemoved(session_id)).is_err() {
                     return StreamOutcome::ReceiverGone;
                 }
             }
@@ -221,6 +230,53 @@ mod tests {
 
         let stale = rx.recv_timeout(Duration::from_secs(2)).expect("stale event");
         assert_eq!(stale, ClientEvent::Update(sample_agent(AgentStatus::Stale)));
+
+        server.join().expect("mock daemon thread should not panic");
+    }
+
+    #[test]
+    fn forwards_an_agent_removed_message_from_a_mock_daemon() {
+        let path = unique_socket_path("agent-removed");
+        let listener = UnixListener::bind(&path).expect("bind mock daemon listener");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client connection");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            let subscribe: ClientMessage = read_message(&mut reader)
+                .expect("read subscribe")
+                .expect("connection should not close before subscribing");
+            assert_eq!(subscribe, ClientMessage::Subscribe);
+
+            write_message(
+                &mut writer,
+                &ServerMessage::Snapshot {
+                    agents: Vec::new(),
+                    test_runs: Vec::new(),
+                    logs: Vec::new(),
+                },
+            )
+            .unwrap();
+            write_message(
+                &mut writer,
+                &ServerMessage::AgentRemoved {
+                    session_id: SessionId("session-1".to_string()),
+                },
+            )
+            .unwrap();
+        });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_client(path, tx);
+
+        let _snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
+
+        let removed = rx.recv_timeout(Duration::from_secs(2)).expect("removed event");
+        assert_eq!(
+            removed,
+            ClientEvent::AgentRemoved(SessionId("session-1".to_string()))
+        );
 
         server.join().expect("mock daemon thread should not panic");
     }

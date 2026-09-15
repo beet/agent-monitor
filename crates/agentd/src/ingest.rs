@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmon_proto::{
-    AgentEvent, AgentInfo, AgentStatus, LogCategory, LogEntry, TestRunInfo, TestRunStatus,
+    AgentEvent, AgentInfo, AgentStatus, LogCategory, LogEntry, SessionId, TestRunInfo, TestRunStatus,
 };
 
 use crate::activity_log::ActivityLog;
@@ -58,7 +58,11 @@ impl Ingestor {
     /// moves status into "running" from something else (or registers a
     /// brand-new entry already "running") - see the activity-log spec's
     /// "Activity log captures notification-worthy events" requirement.
-    pub fn ingest_event(&self, event: AgentEvent) -> AgentInfo {
+    ///
+    /// Also returns any session ids the registry retired while applying this
+    /// event (see `UpsertOutcome::retired_session_ids`), so the caller can
+    /// broadcast their removal to already-connected clients.
+    pub fn ingest_event(&self, event: AgentEvent) -> (AgentInfo, Vec<SessionId>) {
         let outcome = self.registry.upsert(event);
         if outcome.stale_event_ignored {
             // A late event for an already-superseded session id: `agent` and
@@ -67,7 +71,7 @@ impl Ingestor {
             // spurious (see `UpsertOutcome::stale_event_ignored`'s doc
             // comment) - most concretely, a live "needs input" status always
             // notifies regardless of whether it changed.
-            return outcome.agent;
+            return (outcome.agent, outcome.retired_session_ids);
         }
         if is_run_start(outcome.previous_status, outcome.agent.status) {
             // Uses `run_started_ms` (rather than a fresh `now_ms()` call) so
@@ -92,7 +96,7 @@ impl Ingestor {
                 pid: Some(outcome.agent.pid),
             });
         }
-        outcome.agent
+        (outcome.agent, outcome.retired_session_ids)
     }
 
     /// Updates the registry from a reported test-run event, notifying the
@@ -175,7 +179,7 @@ fn is_run_start(previous: Option<AgentStatus>, current: AgentStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentmon_proto::{HostContext, SessionId};
+    use agentmon_proto::HostContext;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -213,7 +217,7 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier);
 
-        let agent = ingestor.ingest_event(event(AgentStatus::Running));
+        let (agent, _) = ingestor.ingest_event(event(AgentStatus::Running));
 
         assert_eq!(agent.status, AgentStatus::Running);
         assert_eq!(ingestor.registry().snapshot().len(), 1);
@@ -290,7 +294,7 @@ mod tests {
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
 
         ingestor.ingest_event(event(AgentStatus::Done));
-        let agent = ingestor.ingest_event(event(AgentStatus::NeedsInput));
+        let (agent, _) = ingestor.ingest_event(event(AgentStatus::NeedsInput));
 
         assert_eq!(
             agent.status,
@@ -314,7 +318,7 @@ mod tests {
         // before it runs, once after), and this must stay a silent no-op
         // rather than notifying on every tool use.
         ingestor.ingest_event(event(AgentStatus::Running));
-        let agent = ingestor.ingest_event(event(AgentStatus::Running));
+        let (agent, _) = ingestor.ingest_event(event(AgentStatus::Running));
 
         assert_eq!(agent.status, AgentStatus::Running);
         assert_eq!(
@@ -678,7 +682,7 @@ mod tests {
         // arrives. Naively re-checking should_notify against the returned
         // (unchanged) session-2 entry would wrongly notify again here,
         // since session-2's live status is "needs input".
-        let agent = ingestor.ingest_event(AgentEvent {
+        let (agent, _) = ingestor.ingest_event(AgentEvent {
             session_id: SessionId("session-1".to_string()),
             pid: 1,
             ..event(AgentStatus::Done)

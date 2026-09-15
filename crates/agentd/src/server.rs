@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use agentmon_proto::{AgentInfo, ClientMessage, LogEntry, ServerMessage, TestRunInfo};
+use agentmon_proto::{AgentInfo, ClientMessage, LogEntry, ServerMessage, SessionId, TestRunInfo};
 
 use crate::ingest::Ingestor;
 use crate::liveness::spawn_liveness_sweep;
@@ -19,6 +19,9 @@ enum Update {
     Agent(AgentInfo),
     TestRun(TestRunInfo),
     Log(LogEntry),
+    /// A session id retired by the registry's same-pid dedup - see
+    /// `UpsertOutcome::retired_session_ids`.
+    AgentRemoved(SessionId),
 }
 
 /// Fans out registry updates to every currently-subscribed client.
@@ -80,8 +83,11 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
 
     match message {
         Some(ClientMessage::ReportEvent { event }) => {
-            let agent = ingestor.ingest_event(event);
+            let (agent, retired_session_ids) = ingestor.ingest_event(event);
             broadcaster.publish(Update::Agent(agent));
+            for session_id in retired_session_ids {
+                broadcaster.publish(Update::AgentRemoved(session_id));
+            }
         }
         Some(ClientMessage::ReportTestRun { cwd, pid, status }) => {
             let test_run = ingestor.ingest_test_run(cwd, pid, status);
@@ -104,6 +110,7 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
                     Update::Agent(agent) => ServerMessage::AgentUpdate { agent },
                     Update::TestRun(test_run) => ServerMessage::TestRunUpdate { test_run },
                     Update::Log(entry) => ServerMessage::LogAppended { entry },
+                    Update::AgentRemoved(session_id) => ServerMessage::AgentRemoved { session_id },
                 };
                 if write_message(&mut writer, &message).is_err() {
                     break;
@@ -647,6 +654,69 @@ mod tests {
             panic!("expected a TestRunUpdate message, got {update:?}");
         };
         assert_eq!(test_run.status, agentmon_proto::TestRunStatus::Failed);
+    }
+
+    #[test]
+    fn connected_subscriber_receives_an_agent_removed_message_on_same_pid_session_replacement() {
+        let (path, _notifier) = spawn_test_server("agent-removed");
+        let session_1 = SessionId("session-1".to_string());
+        let session_2 = SessionId("session-2".to_string());
+        let pid = 123;
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: AgentEvent {
+                        session_id: session_1.clone(),
+                        pid,
+                        ..sample_event(AgentStatus::Running)
+                    },
+                },
+            )
+            .expect("send session-1 running event");
+        }
+        wait_for_status(&path, &session_1, AgentStatus::Running);
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        // session-2 reuses the same pid (e.g. `/clear`), which should retire
+        // session-1 and broadcast its removal to this already-connected
+        // subscriber.
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: AgentEvent {
+                        session_id: session_2.clone(),
+                        pid,
+                        ..sample_event(AgentStatus::Running)
+                    },
+                },
+            )
+            .expect("send session-2 running event");
+        }
+
+        let removed_session_id = loop {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::AgentRemoved { session_id } = message {
+                break session_id;
+            }
+        };
+        assert_eq!(
+            removed_session_id, session_1,
+            "expected an AgentRemoved message naming the superseded session-1"
+        );
     }
 
     #[test]

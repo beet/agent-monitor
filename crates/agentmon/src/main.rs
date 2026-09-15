@@ -105,6 +105,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 app.apply_test_run_update(test_run)
             }
             Ok(AppEvent::Client(ClientEvent::LogAppended(entry))) => app.apply_log_appended(entry),
+            Ok(AppEvent::Client(ClientEvent::AgentRemoved(session_id))) => {
+                app.remove_agent(&session_id)
+            }
             Ok(AppEvent::Key(key)) => {
                 if handle_key(&mut app, key) == InputAction::Quit {
                     return Ok(());
