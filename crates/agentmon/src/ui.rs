@@ -12,18 +12,20 @@ use agentmon_proto::{AgentInfo, AgentStatus, LogEntry, TestRunInfo, TestRunStatu
 
 use crate::app::{App, ConnectionStatus, DirectoryGroup, LogSort, Modal, Tab};
 
-/// Background fill for the selected row in a table, used instead of
-/// reversed video so each status's own color/emoji survives selection
-/// rather than being inverted. A named ANSI color (not `Rgb`/`Indexed`) so
-/// it - like the status colors elsewhere in this file - is controlled by
-/// the terminal's own color scheme rather than a fixed literal value.
-/// Deliberately not any color used by a status's own foreground (see
-/// `status_label_and_style`/`test_run_status_cell_text_and_style`) - most
-/// notably not `Color::Blue`, which "running"/"started" use, since matching
-/// colors would render that status's label and emoji invisible on the
-/// selected row (including the row selected by default before the user has
-/// moved the cursor).
-const SELECTED_ROW_BG: Color = Color::Magenta;
+/// Background fill for the selected row in a table. A named ANSI color (not
+/// `Rgb`/`Indexed`) so it - like the status colors elsewhere in this file -
+/// is controlled by the terminal's own color scheme rather than a fixed
+/// literal value.
+const SELECTED_ROW_BG: Color = Color::Blue;
+
+/// Foreground for the selected row's text, forced to a single readable
+/// color rather than left as each status's own foreground. Applied after
+/// the row's cells are rendered (see the two `row_highlight_style` uses
+/// below), so it overrides `status_label_and_style`/
+/// `test_run_status_cell_text_and_style` colors on the selected row instead
+/// of leaving them to collide with `SELECTED_ROW_BG` (e.g. "running"'s blue
+/// text would otherwise vanish against a blue background).
+const SELECTED_ROW_FG: Color = Color::White;
 
 /// The order distinct agent statuses appear in a project's combined STATUS
 /// cell - a fixed order so the same set of statuses always renders the same
@@ -143,7 +145,7 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
 
     let table = Table::new(rows, widths)
         .header(header)
-        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG))
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
         .highlight_symbol("> ")
         .block(block);
 
@@ -206,7 +208,7 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
 
     let table = Table::new(rows, widths)
         .header(header)
-        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG))
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
         .highlight_symbol("> ")
         .block(block);
 
@@ -811,10 +813,12 @@ mod tests {
             SELECTED_ROW_BG,
             "the only row should be highlighted as selected by default"
         );
-        assert_ne!(
+        assert_eq!(
             running_cell.fg,
-            SELECTED_ROW_BG,
-            "the running status's text must stay visible against the selected-row background"
+            SELECTED_ROW_FG,
+            "the selected row's text must be forced to the selected-row foreground, \
+             overriding the running status's own color, so it stays visible against \
+             the selected-row background"
         );
     }
 
@@ -942,6 +946,10 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(
             vec![
+                // A more recently updated agent in another project sorts first and
+                // becomes the default selection instead, so the row under test here
+                // isn't repainted with the selected-row foreground override.
+                agent_in("/Users/beet/other-project", "c", AgentStatus::Idle, HostContext::Terminal, 4244, 5000),
                 agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
                 agent("b", AgentStatus::NeedsInput, HostContext::Terminal, 4243, 0),
             ],
@@ -957,12 +965,15 @@ mod tests {
         assert!(text.contains("running"));
 
         // ...and by style: locate the "NEEDS INPUT" span and confirm its
-        // foreground color differs from the "running" span's.
+        // foreground color differs from the "running" span's. Matched by
+        // whole word (not a single ambiguous character) so the match can't
+        // land on an unrelated cell, such as the "r" in "other-project".
         let buffer = term.backend().buffer();
-        let needs_input_cell = find_cell(buffer, "N").expect("NEEDS INPUT cell should be found");
-        let running_cell = find_cell(buffer, "r").expect("running cell should be found");
+        let (ni_x, ni_y) = find_text(buffer, "NEEDS INPUT").expect("NEEDS INPUT should be rendered");
+        let (r_x, r_y) = find_text(buffer, "running").expect("running should be rendered");
         assert_ne!(
-            needs_input_cell.fg, running_cell.fg,
+            buffer[(ni_x, ni_y)].fg,
+            buffer[(r_x, r_y)].fg,
             "needs-input styling must differ from running styling"
         );
     }
@@ -1112,6 +1123,10 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(
             vec![
+                // A more recently updated agent in another project sorts first and
+                // becomes the default selection instead, so the row under test here
+                // isn't repainted with the selected-row foreground override.
+                agent_in("/Users/beet/other-project", "c", AgentStatus::Idle, HostContext::Terminal, 4244, 5000),
                 agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
                 agent("b", AgentStatus::Declined, HostContext::Terminal, 4243, 0),
             ],
@@ -1124,11 +1139,14 @@ mod tests {
         assert!(text.contains("declined"), "expected declined status, got:\n{text}");
         assert!(text.contains("running"), "expected running status, got:\n{text}");
 
+        // Matched by whole word (not a single ambiguous character) so the
+        // match can't land on an unrelated cell, such as the "d" in "idle".
         let buffer = term.backend().buffer();
-        let declined_cell = find_cell(buffer, "d").expect("declined cell should be found");
-        let running_cell = find_cell(buffer, "r").expect("running cell should be found");
+        let (d_x, d_y) = find_text(buffer, "declined").expect("declined should be rendered");
+        let (r_x, r_y) = find_text(buffer, "running").expect("running should be rendered");
         assert_ne!(
-            declined_cell.fg, running_cell.fg,
+            buffer[(d_x, d_y)].fg,
+            buffer[(r_x, r_y)].fg,
             "declined styling must differ from running styling"
         );
     }
@@ -1266,42 +1284,6 @@ mod tests {
             test_run_status_cell_text_and_style(TestRunStatus::Failed).0,
             "❌ tests failed"
         );
-    }
-
-    #[test]
-    fn no_status_foreground_color_matches_the_row_highlight_background() {
-        let agent_statuses = [
-            AgentStatus::Running,
-            AgentStatus::Idle,
-            AgentStatus::NeedsInput,
-            AgentStatus::Done,
-            AgentStatus::Stale,
-            AgentStatus::Declined,
-        ];
-        for status in agent_statuses {
-            let (_, style) = status_label_and_style(status);
-            assert_ne!(
-                style.fg,
-                Some(SELECTED_ROW_BG),
-                "{status:?}'s foreground color must not match the row-highlight \
-                 background, or its label/emoji would be invisible on a selected row"
-            );
-        }
-
-        let test_run_statuses = [
-            TestRunStatus::Started,
-            TestRunStatus::Passed,
-            TestRunStatus::Failed,
-        ];
-        for status in test_run_statuses {
-            let (_, style) = test_run_status_cell_text_and_style(status);
-            assert_ne!(
-                style.fg,
-                Some(SELECTED_ROW_BG),
-                "{status:?}'s foreground color must not match the row-highlight \
-                 background, or its label/emoji would be invisible on a selected row"
-            );
-        }
     }
 
     #[test]
@@ -1561,6 +1543,11 @@ mod tests {
         app.apply_log_snapshot(vec![
             log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "done", 1_000),
             log_entry("/tmp/project-b", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
+            // Most recent of the three, so it sorts first under the default
+            // recency sort and absorbs the default selection instead of
+            // "done" or "failed" - leaving their rows' colors un-overridden
+            // by the selected-row foreground.
+            log_entry("/tmp/project-c", agentmon_proto::LogCategory::Agent, "idle", 3_000),
         ]);
 
         term.draw(|frame| render(frame, &app)).unwrap();
@@ -1960,11 +1947,12 @@ mod tests {
             !cell.modifier.contains(Modifier::REVERSED),
             "the selected row should not use reversed video, which inverts status colors"
         );
-        let (_, needs_input_style) = status_label_and_style(AgentStatus::NeedsInput);
         assert_eq!(
             cell.fg,
-            needs_input_style.fg.unwrap_or_default(),
-            "the status's own color must survive selection, not be inverted"
+            SELECTED_ROW_FG,
+            "the selected row's text color must be forced to the selected-row \
+             foreground, overriding the status's own color, so it stays legible \
+             against the selected-row background"
         );
     }
 

@@ -96,7 +96,7 @@ The TUI's PROJECT column SHALL NOT be capped at a fixed 20-character width. Its 
 - **THEN** the PROJECT column clips the name to the space available, consistent with existing table-rendering behavior
 
 ### Requirement: Status is visually distinguishable
-The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) and test-run statuses (started, passed, failed) from one another so the user can scan the list and immediately identify agents or test runs needing attention. Each agent status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 🕸️, and declined with 🚫. Each test-run status SHALL be prefixed with a distinct emoji marker: started with ⏳, passed with ✅, and failed with ❌. When a project's row combines more than one status - two or more tracked agents in different statuses, and/or an agent alongside a test run - the row SHALL show each distinct status present rather than collapsing them into a single "winning" status, so no status needing attention is hidden behind another. No status's text color SHALL match the Agents tab's row-highlight background color, since a status rendered in that color would become invisible - emoji included - on whichever row is currently selected (including the initially-selected row shown as soon as any project is tracked, before the user has moved the selection).
+The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) and test-run statuses (started, passed, failed) from one another so the user can scan the list and immediately identify agents or test runs needing attention. Each agent status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 🕸️, and declined with 🚫. Each test-run status SHALL be prefixed with a distinct emoji marker: started with ⏳, passed with ✅, and failed with ❌. When a project's row combines more than one status - two or more tracked agents in different statuses, and/or an agent alongside a test run - the row SHALL show each distinct status present rather than collapsing them into a single "winning" status, so no status needing attention is hidden behind another. On the currently-selected row in the Agents tab or the Logs tab, the TUI SHALL override every status's own foreground color with a single fixed foreground color chosen to stay legible against the row-highlight background, rather than requiring the row-highlight background to avoid every status's own color.
 
 #### Scenario: An agent needs input
 - **WHEN** an agent's status is "needs input"
@@ -128,7 +128,11 @@ The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs inp
 
 #### Scenario: A running status stays legible on the selected row
 - **WHEN** a project row showing the "running" status is the currently-selected (highlighted) row in the Agents tab
-- **THEN** the status's label and emoji remain visible, styled in a color distinct from the row-highlight background
+- **THEN** the status's label and emoji remain visible, rendered in the row's fixed selected-row foreground color rather than the status's own color
+
+#### Scenario: A selected row's text overrides every status's own color
+- **WHEN** any row in the Agents tab or the Logs tab is the currently-selected (highlighted) row, regardless of which status or statuses it shows
+- **THEN** all of that row's status text renders in the same fixed selected-row foreground color, rather than in each status's own color
 
 ### Requirement: Navigation and quit do not affect tracked agents
 The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
