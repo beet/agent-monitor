@@ -98,6 +98,14 @@ pub struct AgentInfo {
     /// its current status, unlike `last_updated_ms` which also bumps on
     /// same-status events (e.g. each tool call while running).
     pub status_since_ms: u64,
+    /// Unix epoch milliseconds of when this agent most recently transitioned
+    /// into "running" (or was registered for the first time already
+    /// "running"). Unlike `TestRunInfo::run_started_ms`, which resets on a
+    /// new pid because a test run's pid *is* one run, this resets on every
+    /// transition into running - including "done" -> "running" - because one
+    /// agent's pid persists across many started -> running -> done turns
+    /// over the life of a session.
+    pub run_started_ms: u64,
 }
 
 /// Category of event recorded in the activity log - see the activity-log
@@ -121,6 +129,9 @@ pub struct LogEntry {
     pub status: String,
     /// Unix epoch milliseconds of when this event occurred.
     pub occurred_at_ms: u64,
+    /// The reporting process id, when known. Populated for agent-category
+    /// entries; test-run entries may leave this `None`.
+    pub pid: Option<u32>,
 }
 
 /// The first message a connection sends, telling the daemon whether it is a
@@ -182,6 +193,7 @@ mod tests {
             status: AgentStatus::Running,
             last_updated_ms: 1_700_000_000_000,
             status_since_ms: 1_700_000_000_000,
+            run_started_ms: 1_700_000_000_000,
         }
     }
 
@@ -213,6 +225,10 @@ mod tests {
             json.contains("\"status_since_ms\":1700000000000"),
             "expected status_since_ms field in JSON, got: {json}"
         );
+        assert!(
+            json.contains("\"run_started_ms\":1700000000000"),
+            "expected run_started_ms field in JSON, got: {json}"
+        );
     }
 
     #[test]
@@ -235,6 +251,7 @@ mod tests {
             category: LogCategory::Agent,
             status: "done".to_string(),
             occurred_at_ms: 1_700_000_000_000,
+            pid: Some(4242),
         }
     }
 
@@ -260,6 +277,24 @@ mod tests {
         let decoded: LogEntry = serde_json::from_str(&json).unwrap();
 
         assert_eq!(entry, decoded);
+        assert!(
+            json.contains("\"pid\":4242"),
+            "expected pid field in JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn log_entry_with_no_pid_round_trips_through_json() {
+        let entry = LogEntry {
+            pid: None,
+            ..sample_log_entry()
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, decoded);
+        assert_eq!(decoded.pid, None);
     }
 
     #[test]

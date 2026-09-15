@@ -1,21 +1,4 @@
-# agent-monitor-tui Specification
-
-## Purpose
-
-Gives the user a single, live-updating terminal view of every Claude Code agent session tracked by the daemon, across nvim, standalone terminals, and the desktop app.
-
-## Requirements
-
-### Requirement: Connect to the daemon
-The TUI SHALL connect to the daemon's local socket on startup and clearly inform the user when the daemon is unreachable.
-
-#### Scenario: Daemon is running
-- **WHEN** the TUI starts and the daemon's socket is reachable
-- **THEN** the TUI connects and begins displaying tracked agents
-
-#### Scenario: Daemon is not running
-- **WHEN** the TUI starts and cannot reach the daemon's socket
-- **THEN** the TUI displays a clear message that the daemon is not running instead of showing a blank or misleading agent list
+## MODIFIED Requirements
 
 ### Requirement: Live agent list
 The TUI SHALL display tracked agents and test runs grouped by working directory as one row per project: each distinct working directory forms exactly one row showing that project's name (derived from the working directory), its tracked agent(s)' status(es) in an Agents cell, that project's test run status (if any) in a Tests cell, and the most recent last-updated time among those members (in the system's local timezone, formatted `%Y-%m-%d %H:%M:%S`), updating as the daemon reports changes. A project row SHALL NOT display per-agent host context or process id as separate columns; the daemon continues tracking that data, it is simply not rendered in the collapsed row. Project rows SHALL be ordered by the most recent last-updated time of any member (agent or test run) within them, most recent first. An agent whose status is "running" SHALL contribute a live, counting-up duration to the row, computed from the current time minus that agent's status-since timestamp, formatted as a compact counter (e.g. `2m14s`) and kept current by the TUI's own periodic redraw rather than only refreshing when the daemon pushes an update. An agent whose status is "done" SHALL contribute a fixed duration to the row, computed from that agent's run-started timestamp (the beginning of the run that just completed) to its status-since timestamp (the time it completed) - unlike the "running" duration, this fixed duration does not change on further redraws. An agent in any other status (idle, needs input, stale, or declined) SHALL NOT contribute a duration. A test run whose status is "started" SHALL likewise contribute a live, counting-up duration computed from its run-start timestamp. Once a test run reaches "passed" or "failed", its row SHALL continue to show a duration - the total elapsed time from its run-start timestamp to its last-updated timestamp - rather than showing no duration.
@@ -142,42 +125,6 @@ The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs inp
 - **WHEN** any row in the Agents tab or the Logs tab is the currently-selected (highlighted) row, regardless of which status or statuses it shows
 - **THEN** all of that row's status text renders in the same fixed selected-row foreground color, rather than in each status's own color
 
-### Requirement: Navigation and quit do not affect tracked agents
-The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
-
-#### Scenario: User quits the TUI
-- **WHEN** the user presses the quit key
-- **THEN** the TUI process exits while the daemon keeps running and continues tracking agents
-
-### Requirement: Reconnect after daemon restart
-The TUI SHALL detect when its connection to the daemon drops and attempt to reconnect, resuming display of current agent state once reconnected.
-
-#### Scenario: Daemon restarts while the TUI is open
-- **WHEN** the daemon process restarts (e.g. after an update) while the TUI is running
-- **THEN** the TUI detects the dropped connection, retries connecting, and repopulates the agent list once the daemon is back
-
-### Requirement: Tab navigation between Agents and Logs
-The TUI SHALL organize its display into two tabs: **Agents** (the existing project table) and **Logs** (an aggregated activity log view). The user SHALL be able to cycle between tabs with the `Tab` key, and jump directly to a tab with `A` (Agents) or `L` (Logs).
-
-#### Scenario: Cycling tabs
-- **WHEN** the user presses `Tab`
-- **THEN** the TUI switches to the other tab
-
-#### Scenario: Jumping directly to a tab
-- **WHEN** the user presses `A` or `L`
-- **THEN** the TUI switches to the Agents or Logs tab respectively, even if that tab is already active
-
-### Requirement: Agents tab supports row selection
-The Agents tab SHALL support moving a selection cursor over its project rows using the `j`/`down` (next row) and `k`/`up` (previous row) keys, so a specific project can be chosen for its details view. The selection SHALL be visually distinguished from unselected rows.
-
-#### Scenario: Moving the selection down
-- **WHEN** the user presses `j` or the down arrow while the Agents tab is active
-- **THEN** the selection cursor moves to the next project row, if one exists
-
-#### Scenario: Moving the selection up
-- **WHEN** the user presses `k` or the up arrow while the Agents tab is active
-- **THEN** the selection cursor moves to the previous project row, if one exists
-
 ### Requirement: Project details modal
 The TUI SHALL open a details modal overlay for a project when the user presses `Enter` on a selected row in either the Agents tab (a project row) or the Logs tab (an activity log entry, using that entry's project) - the same modal, reached from either tab. The modal SHALL show three panes: an Agents pane listing every agent registered for that project with its status and process id, a Tests pane showing that project's last test run if any, and a Logs pane showing that project's activity log entries, most recent first, with each agent-category entry additionally showing the reporting agent's process id. The Agents and Tests panes SHALL be arranged side by side occupying the top third of the modal, and the Logs pane SHALL occupy the remaining bottom two-thirds. Agent and test-run statuses in the Agents and Tests panes, and log entry statuses in the Logs pane, SHALL use the same emoji markers, color styling, and duration as their counterparts in the Agents tab and Logs tab respectively, so status is visually consistent wherever it appears; the Agents and Tests panes SHALL omit the category-word prefix used in the Agents and Logs tabs, while the Logs pane SHALL keep it, consistent with the top-level Logs tab it mirrors. The user SHALL be able to close the modal with `Esc`, returning to whichever tab was active without altering the underlying agent or test-run state.
 
@@ -244,53 +191,7 @@ The Logs tab SHALL display the activity log entries received from the daemon, ag
 - **WHEN** the Logs tab renders a "started" test-run entry
 - **THEN** the row shows no duration for it, since the run has not yet completed in the log
 
-### Requirement: Logs tab supports sorting and filtering
-The Logs tab SHALL support sorting its entries by recency (the default), by Project, or by Status, and filtering the displayed entries by Project or by Status.
-
-#### Scenario: Changing sort order
-- **WHEN** the user selects Project or Status as the sort option on the Logs tab
-- **THEN** the displayed entries reorder accordingly instead of by recency
-
-#### Scenario: Filtering by project
-- **WHEN** the user applies a Project filter on the Logs tab
-- **THEN** only entries belonging to that project are displayed
-
-#### Scenario: Filtering by status
-- **WHEN** the user applies a Status filter on the Logs tab
-- **THEN** only entries matching that status are displayed
-
-### Requirement: Paginated lists support keyboard navigation
-Any paginated list in the TUI (the Logs tab's activity list) SHALL support `j`/`down` and `k`/`up` to move the selection one line at a time, and `d`/page-down and `u`/page-up to move by a full page.
-
-#### Scenario: Moving one line at a time
-- **WHEN** the user presses `j`, `down`, `k`, or `up` on a paginated list
-- **THEN** the selection moves by exactly one line in the corresponding direction, if a line is available in that direction
-
-#### Scenario: Paging
-- **WHEN** the user presses `d`, page-down, `u`, or page-up on a paginated list
-- **THEN** the list scrolls by a full page in the corresponding direction, if a page is available in that direction
-
-### Requirement: Keyboard shortcuts help modal
-The TUI SHALL open a help modal listing all available keyboard shortcuts when the user presses `?`. The user SHALL be able to close it with `Esc`.
-
-#### Scenario: Opening help
-- **WHEN** the user presses `?`
-- **THEN** the TUI displays a modal overlay listing the available keyboard shortcuts
-
-#### Scenario: Closing help
-- **WHEN** the user presses `Esc` while the help modal is open
-- **THEN** the TUI closes the help modal and returns to the previously active tab
-
-### Requirement: Empty-state placeholders appear in the table body, not the pane title
-When the Agents tab has no tracked agents or test runs, and when the Logs tab's full (unfiltered) activity log is empty, the TUI SHALL show that empty state as gray placeholder text in the table body beneath the header, matching the existing convention used when a Logs tab filter matches nothing. The pane title SHALL NOT carry this placeholder text; the Logs tab's title SHALL continue to show its sort/filter control hints regardless of whether the log is empty.
-
-#### Scenario: No agents tracked yet
-- **WHEN** the daemon reports no tracked agents and no test runs
-- **THEN** the Agents tab's title reads "Agents" and its table body shows gray placeholder text indicating no agents are tracked yet
-
-#### Scenario: No activity logged yet
-- **WHEN** the daemon's activity log is empty
-- **THEN** the Logs tab's title shows only its sort/filter control hints (no empty-state text) and its table body shows gray placeholder text indicating no activity has been logged yet
+## ADDED Requirements
 
 ### Requirement: Agents tab splits agent and test-run status into separate columns
 The Agents tab SHALL display a project's agent status(es) and its test-run status in two separate columns, **Agents** and **Tests**, instead of one combined STATUS column. The Agents column SHALL show that project's tracked agent(s)' status(es); the Tests column SHALL show that project's test run status, if any, or remain empty if the project has no tracked test run.

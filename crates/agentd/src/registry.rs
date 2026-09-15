@@ -164,6 +164,16 @@ impl Registry {
             Some(agent) if agent.status == event.status => agent.status_since_ms,
             _ => now,
         };
+        // Resets on every transition into "running" - including from "done" -
+        // rather than only at entry creation or pid replacement, since one
+        // agent's pid persists across many started -> running -> done turns
+        // over the life of a session (unlike a test run's pid-scoped
+        // `run_started_ms`, where a new pid *is* a new run).
+        let run_started_ms = match &previous {
+            Some(agent) if agent.status != AgentStatus::Running && event.status == AgentStatus::Running => now,
+            Some(agent) => agent.run_started_ms,
+            None => now,
+        };
 
         let agent = AgentInfo {
             session_id: event.session_id.clone(),
@@ -173,6 +183,7 @@ impl Registry {
             status: event.status,
             last_updated_ms: now,
             status_since_ms,
+            run_started_ms,
         };
         state.agents.insert(agent.session_id.clone(), agent.clone());
 
@@ -345,6 +356,122 @@ mod tests {
         assert!(
             snapshot[0].last_updated_ms > status_since_ms,
             "last_updated_ms must still advance even when status is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_new_agent_sets_run_started_ms_to_its_creation_time() {
+        let registry = Registry::new();
+
+        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+
+        assert_eq!(outcome.agent.run_started_ms, outcome.agent.last_updated_ms);
+        assert_eq!(registry.snapshot()[0].run_started_ms, outcome.agent.run_started_ms);
+    }
+
+    #[test]
+    fn same_status_event_leaves_run_started_ms_unchanged() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        let run_started_ms = registry.snapshot()[0].run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        registry.upsert(sample_event(AgentStatus::Running));
+
+        assert_eq!(
+            registry.snapshot()[0].run_started_ms, run_started_ms,
+            "a same-status event must not reset run_started_ms"
+        );
+    }
+
+    #[test]
+    fn transitioning_away_from_running_leaves_run_started_ms_unchanged() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        let run_started_ms = registry.snapshot()[0].run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        registry.upsert(sample_event(AgentStatus::NeedsInput));
+
+        assert_eq!(
+            registry.snapshot()[0].run_started_ms, run_started_ms,
+            "leaving running must not change run_started_ms - it still marks when the run that just ended began"
+        );
+    }
+
+    #[test]
+    fn transitioning_between_two_non_running_statuses_leaves_run_started_ms_unchanged() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::NeedsInput));
+        let run_started_ms = registry.snapshot()[0].run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        registry.upsert(sample_event(AgentStatus::Declined));
+
+        assert_eq!(
+            registry.snapshot()[0].run_started_ms, run_started_ms,
+            "moving between two non-running statuses must not change run_started_ms"
+        );
+    }
+
+    #[test]
+    fn a_transition_into_running_resets_run_started_ms() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        let first_run_started_ms = registry.snapshot()[0].run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+        registry.upsert(sample_event(AgentStatus::NeedsInput));
+
+        registry.upsert(sample_event(AgentStatus::Running));
+
+        assert!(
+            registry.snapshot()[0].run_started_ms > first_run_started_ms,
+            "resuming into running from a different status must reset run_started_ms"
+        );
+    }
+
+    #[test]
+    fn a_done_to_running_transition_resets_run_started_ms_for_the_new_turn() {
+        // An agent's pid persists across many started -> running -> done
+        // turns, unlike a test run's pid-scoped run_started_ms, so this must
+        // reset on every re-entry into running - including from "done" -
+        // rather than staying pinned to the session's very first turn.
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Done));
+        let first_turn_run_started_ms = registry.snapshot()[0].run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+
+        assert!(
+            outcome.agent.run_started_ms > first_turn_run_started_ms,
+            "done -> running must begin a new turn's run_started_ms, not keep the first turn's"
+        );
+        assert_eq!(registry.snapshot()[0].run_started_ms, outcome.agent.run_started_ms);
+    }
+
+    #[test]
+    fn a_new_session_id_for_a_tracked_pid_resets_run_started_ms() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+        let first_run_started_ms = registry.snapshot()[0].run_started_ms;
+        thread::sleep(Duration::from_millis(10));
+
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        assert!(
+            registry.snapshot()[0].run_started_ms > first_run_started_ms,
+            "a pid-replacement entry must get its own creation-time run_started_ms, not inherit the replaced entry's"
         );
     }
 

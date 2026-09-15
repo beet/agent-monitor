@@ -27,9 +27,9 @@ const SELECTED_ROW_BG: Color = Color::Blue;
 /// text would otherwise vanish against a blue background).
 const SELECTED_ROW_FG: Color = Color::White;
 
-/// The order distinct agent statuses appear in a project's combined STATUS
-/// cell - a fixed order so the same set of statuses always renders the same
-/// way, independent of the order agents happen to be tracked in.
+/// The order distinct agent statuses appear in a project's AGENTS cell - a
+/// fixed order so the same set of statuses always renders the same way,
+/// independent of the order agents happen to be tracked in.
 const AGENT_STATUS_ORDER: [AgentStatus; 6] = [
     AgentStatus::Running,
     AgentStatus::Idle,
@@ -114,7 +114,7 @@ fn render_message(frame: &mut Frame, message: &str) {
 }
 
 fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
-    let header = Row::new(["PROJECT", "STATUS", "UPDATED"]).style(Style::new().bold());
+    let header = Row::new(["PROJECT", "AGENTS", "TESTS", "UPDATED"]).style(Style::new().bold());
 
     let now = now_ms();
     let groups = app.directory_groups();
@@ -122,14 +122,20 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
         let project = project_name(&group.cwd);
         Row::new([
             Cell::from(project),
-            Cell::from(project_status_line(group, now)),
+            Cell::from(agents_status_line(group, now, true)),
+            Cell::from(tests_status_line(group, now, true)),
             Cell::from(format_last_updated(group.most_recent_update_ms())),
         ])
     });
 
+    // Agents gets a bit more than Tests (it can hold several joined status
+    // segments where Tests holds at most one), and together they still
+    // receive the majority of space beyond PROJECT/UPDATED (5 fill units
+    // vs PROJECT's 2).
     let widths = [
         Constraint::Fill(2),
         Constraint::Fill(3),
+        Constraint::Fill(2),
         Constraint::Length(19),
     ];
 
@@ -261,43 +267,46 @@ fn log_category_label(category: agentmon_proto::LogCategory) -> &'static str {
 /// Maps a log entry's category and (loosely-typed, wire-format) status
 /// string back to the same emoji-marked label and color used for that
 /// status in the Agents tab, so the Logs tab's STATUS column is visually
-/// consistent with it rather than showing a plain, unstyled string.
+/// consistent with it rather than showing a plain, unstyled string. Always
+/// includes the category-word prefix ("agent"/"tests") - every caller of
+/// this function is a cross-category view (the Logs tab, or the details
+/// modal's Logs pane, which mirrors it), never a category-scoped pane.
 fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status: &str) -> (String, Style) {
     match category {
         agentmon_proto::LogCategory::Agent => match status {
-            "done" => owned(status_label_and_style(AgentStatus::Done)),
-            "needs_input" => owned(status_label_and_style(AgentStatus::NeedsInput)),
+            "started" => agent_started_text_and_style(),
+            "done" => agent_status_text_and_style(AgentStatus::Done, true),
+            "needs_input" => agent_status_text_and_style(AgentStatus::NeedsInput, true),
             other => (other.to_string(), Style::new()),
         },
         agentmon_proto::LogCategory::TestRun => match status {
-            "started" => test_run_status_cell_text_and_style(TestRunStatus::Started),
-            "passed" => test_run_status_cell_text_and_style(TestRunStatus::Passed),
-            "failed" => test_run_status_cell_text_and_style(TestRunStatus::Failed),
+            "started" => test_run_status_cell_text_and_style(TestRunStatus::Started, true),
+            "passed" => test_run_status_cell_text_and_style(TestRunStatus::Passed, true),
+            "failed" => test_run_status_cell_text_and_style(TestRunStatus::Failed, true),
             other => (other.to_string(), Style::new()),
         },
     }
 }
 
-fn owned((label, style): (&'static str, Style)) -> (String, Style) {
-    (label.to_string(), style)
-}
-
-/// For a "passed" or "failed" test-run log entry, the elapsed time since the
-/// most recent preceding "started" entry for the same project. Log entries
-/// carry no run-start timestamp of their own (unlike the live `TestRunInfo`
-/// the Agents tab reads), so the pairing is reconstructed from the log's own
-/// history - at most one test run is ever tracked per directory at a time,
-/// so the nearest preceding "started" is always the one that finished here.
-fn log_test_run_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option<u64> {
-    if entry.category != agentmon_proto::LogCategory::TestRun {
-        return None;
-    }
-    if entry.status != "passed" && entry.status != "failed" {
+/// For a completed run/task log entry - a "passed"/"failed" test-run entry
+/// or a "done" agent entry - the elapsed time since the most recent
+/// preceding "started" entry of the same category for the same project. Log
+/// entries carry no run-start timestamp of their own (unlike the live
+/// `AgentInfo`/`TestRunInfo` the Agents tab reads), so the pairing is
+/// reconstructed from the log's own history.
+fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option<u64> {
+    let is_completion = matches!(
+        (entry.category, entry.status.as_str()),
+        (agentmon_proto::LogCategory::TestRun, "passed")
+            | (agentmon_proto::LogCategory::TestRun, "failed")
+            | (agentmon_proto::LogCategory::Agent, "done")
+    );
+    if !is_completion {
         return None;
     }
     all_logs
         .iter()
-        .filter(|e| e.category == agentmon_proto::LogCategory::TestRun)
+        .filter(|e| e.category == entry.category)
         .filter(|e| e.working_dir == entry.working_dir)
         .filter(|e| e.status == "started")
         .filter(|e| e.occurred_at_ms <= entry.occurred_at_ms)
@@ -306,13 +315,26 @@ fn log_test_run_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option<u
 }
 
 /// Builds a log entry's styled status text, appending an elapsed duration
-/// for a completed test run so its total run time is visible the same way
-/// it already is on the Agents tab - see `log_test_run_duration_ms`.
+/// for a completed run/task so its total time is visible the same way it
+/// already is on the Agents tab - see `log_completion_duration_ms`.
 fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
     let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
-    if let Some(duration_ms) = log_test_run_duration_ms(all_logs, entry) {
+    if let Some(duration_ms) = log_completion_duration_ms(all_logs, entry) {
         text.push(' ');
         text.push_str(&format_running_duration(0, duration_ms));
+    }
+    (text, style)
+}
+
+/// Appends `entry`'s reporting process id to an already-built status line,
+/// for agent-category entries only - used by the details modal's Logs pane,
+/// which shows pid where the top-level Logs tab does not.
+fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
+    let (mut text, style) = log_entry_status_line(all_logs, entry);
+    if entry.category == agentmon_proto::LogCategory::Agent {
+        if let Some(pid) = entry.pid {
+            text.push_str(&format!("  pid {pid}"));
+        }
     }
     (text, style)
 }
@@ -400,8 +422,11 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
             .agents
             .iter()
             .map(|a| {
-                let (text, style) = status_cell_text_and_style(a, now);
-                Line::from(Span::styled(text, style))
+                let (text, style) = status_cell_text_and_style(a, now, false);
+                Line::from(vec![
+                    Span::styled(text, style),
+                    Span::raw(format!("  pid {}", a.pid)),
+                ])
             })
             .collect(),
         _ => vec![Line::from("No agents")],
@@ -418,7 +443,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
 
     let tests_lines: Vec<Line> = match group.as_ref().and_then(|g| g.test_runs.first()) {
         Some(test_run) => {
-            let (label, style) = test_run_status_cell_text_and_style(test_run.status);
+            let (label, style) = test_run_status_cell_text_and_style(test_run.status, false);
             let text = format!("{label} {}", format_test_run_duration(test_run, now));
             vec![Line::from(Span::styled(text, style))]
         }
@@ -442,7 +467,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
         project_logs
             .iter()
             .map(|entry| {
-                let (status_text, style) = log_entry_status_line(&app.logs, entry);
+                let (status_text, style) = log_entry_line_with_pid(&app.logs, entry);
                 Line::from(vec![
                     Span::raw(format!("{} ", format_last_updated(entry.occurred_at_ms))),
                     Span::styled(status_text, style),
@@ -538,12 +563,12 @@ fn project_name(cwd: &Path) -> String {
         .unwrap_or_else(|| cwd.display().to_string())
 }
 
-/// Builds a project's combined STATUS cell: one styled segment per distinct
-/// agent status present (in `AGENT_STATUS_ORDER`, so the same set of
-/// statuses always renders in the same order), followed by the test run's
-/// segment if the project has one - joined by " · " so no status is hidden
-/// behind another, per the "Status is visually distinguishable" requirement.
-fn project_status_line(group: &DirectoryGroup, now_ms: u64) -> Line<'static> {
+/// Builds a project's AGENTS cell: one styled segment per distinct agent
+/// status present (in `AGENT_STATUS_ORDER`, so the same set of statuses
+/// always renders in the same order), joined by " · " so no status is
+/// hidden behind another, per the "Status is visually distinguishable"
+/// requirement.
+fn agents_status_line(group: &DirectoryGroup, now_ms: u64, with_category_prefix: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     for &status in AGENT_STATUS_ORDER.iter() {
@@ -557,25 +582,28 @@ fn project_status_line(group: &DirectoryGroup, now_ms: u64) -> Line<'static> {
         // A duration is only attached when exactly one agent holds this
         // status - with two or more, there's no single elapsed time that
         // isn't arbitrary to pick, so the segment shows just the label.
-        let (text, style) = if status == AgentStatus::Running && matching.len() == 1 {
-            status_cell_text_and_style(first, now_ms)
+        let (text, style) = if matches!(status, AgentStatus::Running | AgentStatus::Done) && matching.len() == 1 {
+            status_cell_text_and_style(first, now_ms, with_category_prefix)
         } else {
-            let (label, style) = status_label_and_style(status);
-            (label.to_string(), style)
+            agent_status_text_and_style(status, with_category_prefix)
         };
         spans.push(Span::styled(text, style));
     }
 
-    if let Some(test_run) = group.test_runs.first() {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" · "));
-        }
-        let (label, style) = test_run_status_cell_text_and_style(test_run.status);
-        let duration = format_test_run_duration(test_run, now_ms);
-        spans.push(Span::styled(format!("{label} {duration}"), style));
-    }
-
     Line::from(spans)
+}
+
+/// Builds a project's TESTS cell: its test run's status and duration, or
+/// empty if the project has no tracked test run.
+fn tests_status_line(group: &DirectoryGroup, now_ms: u64, with_category_prefix: bool) -> Line<'static> {
+    match group.test_runs.first() {
+        Some(test_run) => {
+            let (label, style) = test_run_status_cell_text_and_style(test_run.status, with_category_prefix);
+            let duration = format_test_run_duration(test_run, now_ms);
+            Line::from(Span::styled(format!("{label} {duration}"), style))
+        }
+        None => Line::from(""),
+    }
 }
 
 /// A test run's duration: live and counting up while "started" (computed
@@ -592,22 +620,29 @@ fn format_test_run_duration(test_run: &TestRunInfo, now_ms: u64) -> String {
 }
 
 /// The STATUS cell's text and style for one agent: the running status gets
-/// an appended elapsed-duration counter (see `format_running_duration`);
+/// an appended live elapsed-duration counter and the done status gets an
+/// appended fixed total-duration counter (see `format_running_duration`);
 /// every other status renders as just its label.
-fn status_cell_text_and_style(agent: &AgentInfo, now_ms: u64) -> (String, Style) {
-    let (label, style) = status_label_and_style(agent.status);
-    let text = match agent.status {
+fn status_cell_text_and_style(agent: &AgentInfo, now_ms: u64, with_category_prefix: bool) -> (String, Style) {
+    let (mut text, style) = agent_status_text_and_style(agent.status, with_category_prefix);
+    match agent.status {
         AgentStatus::Running => {
-            format!("{label} {}", format_running_duration(agent.status_since_ms, now_ms))
+            text.push(' ');
+            text.push_str(&format_running_duration(agent.status_since_ms, now_ms));
         }
-        _ => label.to_string(),
-    };
+        AgentStatus::Done => {
+            text.push(' ');
+            text.push_str(&format_running_duration(agent.run_started_ms, agent.status_since_ms));
+        }
+        _ => {}
+    }
     (text, style)
 }
 
 /// Every status gets both a distinct label and a distinct style, so the
 /// distinction survives even in a plain-text rendering (as asserted by
-/// tests) and not only through color.
+/// tests) and not only through color. Bare - carries no category-word
+/// prefix; see `agent_status_text_and_style` for that.
 fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
     match status {
         AgentStatus::Running => ("🔧 running", Style::new().fg(Color::Blue)),
@@ -618,7 +653,11 @@ fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
         ),
         AgentStatus::Done => ("✅ done", Style::new().fg(Color::Green)),
         AgentStatus::Stale => (
-            "🕸️ stale",
+            // 🕸️ (U+1F578 + VS16) rendered half-width in some terminal
+            // fonts, corrupting the selected-row highlight; 👻 (U+1F47B) has
+            // default emoji presentation with no variation selector needed,
+            // so it doesn't depend on a terminal correctly honoring VS16.
+            "👻 stale",
             Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -627,20 +666,58 @@ fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
     }
 }
 
-/// The STATUS cell's text and style for a test run. Labels are worded
-/// distinctly from agent statuses (e.g. "tests passed" vs "done") so a
-/// passed test run and a done agent aren't visually confused even though
-/// both use a ✅ marker.
-fn test_run_status_cell_text_and_style(status: TestRunStatus) -> (String, Style) {
+/// Inserts `category_word` right after `label`'s leading emoji and before
+/// its status word (e.g. `("🔧 running", "agent")` -> `"🔧 agent running"`),
+/// per the "Status labels are prefixed by category outside dedicated panes"
+/// requirement.
+fn with_category_word(label: &str, category_word: &str) -> String {
+    match label.split_once(' ') {
+        Some((emoji, rest)) => format!("{emoji} {category_word} {rest}"),
+        None => format!("{label} {category_word}"),
+    }
+}
+
+/// An agent status's label and style, with the "agent" category-word prefix
+/// applied when `with_category_prefix` is set - true for the Agents tab and
+/// the Logs tab/pane, false for the details modal's Agents pane.
+fn agent_status_text_and_style(status: AgentStatus, with_category_prefix: bool) -> (String, Style) {
+    let (label, style) = status_label_and_style(status);
+    let text = if with_category_prefix {
+        with_category_word(label, "agent")
+    } else {
+        label.to_string()
+    };
+    (text, style)
+}
+
+/// The label and style for a log-only "agent started" entry - not a real
+/// `AgentStatus` variant (see the activity-log spec's "started" capture),
+/// so it has no bare/pane form: it only ever appears in a cross-category
+/// view (the Logs tab or the details modal's Logs pane), never in the
+/// Agents tab's AGENTS column or the modal's Agents pane.
+fn agent_started_text_and_style() -> (String, Style) {
+    ("⏳ agent started".to_string(), Style::new().fg(Color::Blue))
+}
+
+/// The STATUS cell's text and style for a test run, with the "tests"
+/// category-word prefix applied when `with_category_prefix` is set - true
+/// for the Agents tab and the Logs tab/pane, false for the details modal's
+/// Tests pane.
+fn test_run_status_cell_text_and_style(status: TestRunStatus, with_category_prefix: bool) -> (String, Style) {
     let (label, style) = match status {
-        TestRunStatus::Started => ("⏳ test started", Style::new().fg(Color::Blue)),
-        TestRunStatus::Passed => ("✅ tests passed", Style::new().fg(Color::Green)),
+        TestRunStatus::Started => ("⏳ started", Style::new().fg(Color::Blue)),
+        TestRunStatus::Passed => ("✅ passed", Style::new().fg(Color::Green)),
         TestRunStatus::Failed => (
-            "❌ tests failed",
+            "❌ failed",
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
     };
-    (label.to_string(), style)
+    let text = if with_category_prefix {
+        with_category_word(label, "tests")
+    } else {
+        label.to_string()
+    };
+    (text, style)
 }
 
 #[cfg(test)]
@@ -664,6 +741,7 @@ mod tests {
             status,
             last_updated_ms,
             status_since_ms: last_updated_ms,
+            run_started_ms: last_updated_ms,
         }
     }
 
@@ -880,7 +958,8 @@ mod tests {
 
         let text = buffer_text(&term);
         assert!(text.contains("PROJECT"), "got:\n{text}");
-        assert!(text.contains("STATUS"), "got:\n{text}");
+        assert!(text.contains("AGENTS"), "got:\n{text}");
+        assert!(text.contains("TESTS"), "got:\n{text}");
         assert!(text.contains("UPDATED"), "got:\n{text}");
         assert!(!text.contains("HOST"), "HOST column should be removed, got:\n{text}");
         assert!(!text.contains("PID"), "PID column should be removed, got:\n{text}");
@@ -942,7 +1021,10 @@ mod tests {
 
     #[test]
     fn needs_input_is_visually_distinguished_from_other_statuses() {
-        let mut term = terminal();
+        // Wider than the default test terminal: this row combines two
+        // agent statuses (with the "agent " category-word prefix) in one
+        // AGENTS cell, which needs more room than a single status does.
+        let mut term = Terminal::new(TestBackend::new(140, 10)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(
             vec![
@@ -950,7 +1032,10 @@ mod tests {
                 // becomes the default selection instead, so the row under test here
                 // isn't repainted with the selected-row foreground override.
                 agent_in("/Users/beet/other-project", "c", AgentStatus::Idle, HostContext::Terminal, 4244, 5000),
-                agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
+                // status_since_ms close to "now" keeps the running duration
+                // short, so it plus the "agent "/"NEEDS INPUT" segment still
+                // fits the AGENTS column's test-terminal width.
+                agent_with_status_since("a", AgentStatus::Running, HostContext::Terminal, 4242, 0, now_ms()),
                 agent("b", AgentStatus::NeedsInput, HostContext::Terminal, 4243, 0),
             ],
             Vec::new(),
@@ -1094,7 +1179,7 @@ mod tests {
             866_000,
         );
 
-        let (text, _) = status_cell_text_and_style(&running, 1_000_000);
+        let (text, _) = status_cell_text_and_style(&running, 1_000_000, false);
 
         assert_eq!(text, "🔧 running 2m14s");
     }
@@ -1103,7 +1188,7 @@ mod tests {
     fn a_non_running_agent_shows_no_duration() {
         let idle = agent("s", AgentStatus::Idle, HostContext::Terminal, 4242, 0);
 
-        let (text, _) = status_cell_text_and_style(&idle, 1_000_000);
+        let (text, _) = status_cell_text_and_style(&idle, 1_000_000, false);
 
         assert_eq!(text, "💤 idle");
     }
@@ -1112,14 +1197,41 @@ mod tests {
     fn a_declined_agent_shows_no_duration() {
         let declined = agent("s", AgentStatus::Declined, HostContext::Terminal, 4242, 0);
 
-        let (text, _) = status_cell_text_and_style(&declined, 1_000_000);
+        let (text, _) = status_cell_text_and_style(&declined, 1_000_000, false);
 
         assert_eq!(text, "🚫 declined");
     }
 
     #[test]
+    fn a_done_agent_shows_its_total_duration() {
+        let done = AgentInfo {
+            run_started_ms: 866_000,
+            status_since_ms: 1_000_000,
+            ..agent("s", AgentStatus::Done, HostContext::Terminal, 4242, 1_000_000)
+        };
+
+        let (text, _) = status_cell_text_and_style(&done, 999_999_999, false);
+
+        assert_eq!(
+            text, "✅ done 2m14s",
+            "done's duration must be fixed (status_since - run_started), not computed against `now`"
+        );
+    }
+
+    #[test]
+    fn status_cell_text_and_style_applies_the_category_prefix_when_requested() {
+        let running = agent("s", AgentStatus::Running, HostContext::Terminal, 4242, 0);
+
+        let (text, _) = status_cell_text_and_style(&running, 0, true);
+
+        assert_eq!(text, "🔧 agent running 0s");
+    }
+
+    #[test]
     fn declined_is_visually_distinguished_from_other_statuses() {
-        let mut term = terminal();
+        // Wider than the default test terminal, for the same reason as
+        // `needs_input_is_visually_distinguished_from_other_statuses`.
+        let mut term = Terminal::new(TestBackend::new(140, 10)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(
             vec![
@@ -1127,7 +1239,7 @@ mod tests {
                 // becomes the default selection instead, so the row under test here
                 // isn't repainted with the selected-row foreground override.
                 agent_in("/Users/beet/other-project", "c", AgentStatus::Idle, HostContext::Terminal, 4244, 5000),
-                agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
+                agent_with_status_since("a", AgentStatus::Running, HostContext::Terminal, 4242, 0, now_ms()),
                 agent("b", AgentStatus::Declined, HostContext::Terminal, 4243, 0),
             ],
             Vec::new(),
@@ -1201,11 +1313,13 @@ mod tests {
 
     #[test]
     fn two_agents_with_different_statuses_show_both_in_one_row() {
-        let mut term = terminal();
+        // Wider than the default test terminal, for the same reason as
+        // `needs_input_is_visually_distinguished_from_other_statuses`.
+        let mut term = Terminal::new(TestBackend::new(140, 10)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(
             vec![
-                agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0),
+                agent_with_status_since("a", AgentStatus::Running, HostContext::Terminal, 4242, 0, now_ms()),
                 agent("b", AgentStatus::NeedsInput, HostContext::Terminal, 4243, 0),
             ],
             Vec::new(),
@@ -1251,7 +1365,7 @@ mod tests {
 
         let text = buffer_text(&term);
         assert!(text.contains("project"), "expected project name, got:\n{text}");
-        assert!(text.contains("test started"), "expected test-run status, got:\n{text}");
+        assert!(text.contains("tests started"), "expected test-run status, got:\n{text}");
     }
 
     #[test]
@@ -1273,16 +1387,32 @@ mod tests {
     #[test]
     fn each_test_run_status_has_a_distinct_emoji_marker() {
         assert_eq!(
-            test_run_status_cell_text_and_style(TestRunStatus::Started).0,
-            "⏳ test started"
+            test_run_status_cell_text_and_style(TestRunStatus::Started, true).0,
+            "⏳ tests started"
         );
         assert_eq!(
-            test_run_status_cell_text_and_style(TestRunStatus::Passed).0,
+            test_run_status_cell_text_and_style(TestRunStatus::Passed, true).0,
             "✅ tests passed"
         );
         assert_eq!(
-            test_run_status_cell_text_and_style(TestRunStatus::Failed).0,
+            test_run_status_cell_text_and_style(TestRunStatus::Failed, true).0,
             "❌ tests failed"
+        );
+    }
+
+    #[test]
+    fn test_run_status_cell_omits_the_category_prefix_when_not_requested() {
+        assert_eq!(
+            test_run_status_cell_text_and_style(TestRunStatus::Started, false).0,
+            "⏳ started"
+        );
+        assert_eq!(
+            test_run_status_cell_text_and_style(TestRunStatus::Passed, false).0,
+            "✅ passed"
+        );
+        assert_eq!(
+            test_run_status_cell_text_and_style(TestRunStatus::Failed, false).0,
+            "❌ failed"
         );
     }
 
@@ -1297,7 +1427,7 @@ mod tests {
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
-        let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed);
+        let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed, true);
         let (_, running_style) = status_label_and_style(AgentStatus::Running);
         assert_ne!(
             failed_style.fg, running_style.fg,
@@ -1316,12 +1446,18 @@ mod tests {
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
+        let buffer = term.backend().buffer();
         let text = buffer_text(&term);
         assert!(text.contains("running"), "got:\n{text}");
         assert!(text.contains("tests failed"), "got:\n{text}");
+        // Each status now lives in its own column (AGENTS vs TESTS) rather
+        // than sharing one cell joined by a separator.
+        let (running_x, running_y) = find_text(buffer, "running").expect("running should be rendered");
+        let (failed_x, failed_y) = find_text(buffer, "tests failed").expect("tests failed should be rendered");
+        assert_eq!(running_y, failed_y, "both statuses belong to the same project row");
         assert!(
-            text.contains(" · "),
-            "expected the agent and test-run statuses joined by a separator, got:\n{text}"
+            failed_x > running_x,
+            "the Tests column's status must render to the right of the Agents column's"
         );
     }
 
@@ -1410,6 +1546,7 @@ mod tests {
             category,
             status: status.to_string(),
             occurred_at_ms,
+            pid: Some(1),
         }
     }
 
@@ -1436,16 +1573,20 @@ mod tests {
     #[test]
     fn log_status_cell_uses_the_same_emoji_markers_as_the_agents_tab() {
         assert_eq!(
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "started").0,
+            "⏳ agent started"
+        );
+        assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "done").0,
-            "✅ done"
+            "✅ agent done"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "needs_input").0,
-            "🔔 NEEDS INPUT"
+            "🔔 agent NEEDS INPUT"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "started").0,
-            "⏳ test started"
+            "⏳ tests started"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "passed").0,
@@ -1465,7 +1606,7 @@ mod tests {
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "failed").1,
-            test_run_status_cell_text_and_style(TestRunStatus::Failed).1
+            test_run_status_cell_text_and_style(TestRunStatus::Failed, true).1
         );
     }
 
@@ -1513,6 +1654,102 @@ mod tests {
     }
 
     #[test]
+    fn logs_tab_shows_a_completed_agent_tasks_duration() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "started", 0),
+            log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "done", 134_000),
+        ]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("2m14s"),
+            "expected the completed agent task's total duration, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_renders_an_agent_started_entry() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry(
+            "/tmp/project-a",
+            agentmon_proto::LogCategory::Agent,
+            "started",
+            0,
+        )]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains('⏳'), "got:\n{text}");
+        assert!(text.contains("agent started"), "got:\n{text}");
+    }
+
+    #[test]
+    fn the_agents_column_never_renders_a_started_label() {
+        // "started" is a one-time log event, not an ongoing AgentStatus, so
+        // it must never appear as a live status in the Agents tab/pane -
+        // only the six real AgentStatus labels can.
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0),
+                agent_in("/tmp/b", "b", AgentStatus::Idle, HostContext::Terminal, 2, 0),
+                agent_in("/tmp/c", "c", AgentStatus::NeedsInput, HostContext::Terminal, 3, 0),
+                agent_in("/tmp/d", "d", AgentStatus::Done, HostContext::Terminal, 4, 0),
+                agent_in("/tmp/e", "e", AgentStatus::Stale, HostContext::Terminal, 5, 0),
+                agent_in("/tmp/f", "f", AgentStatus::Declined, HostContext::Terminal, 6, 0),
+            ],
+            Vec::new(),
+        );
+        // Also log a "started" entry, so it exists in the log but must not
+        // leak into the Agents tab's column.
+        app.apply_log_snapshot(vec![log_entry(
+            "/tmp/project",
+            agentmon_proto::LogCategory::Agent,
+            "started",
+            0,
+        )]);
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("started"),
+            "the Agents tab must never render a \"started\" label, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_renders_an_agent_started_entry() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "started",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains('⏳'), "got:\n{text}");
+        assert!(text.contains("agent started"), "got:\n{text}");
+    }
+
+    #[test]
     fn logs_tab_shows_no_duration_for_a_started_run_with_no_completion_yet() {
         let mut term = terminal();
         let mut app = App::new();
@@ -1528,7 +1765,7 @@ mod tests {
         term.draw(|frame| render(frame, &app)).unwrap();
 
         assert_eq!(
-            log_test_run_duration_ms(&app.logs, &app.logs[0]),
+            log_completion_duration_ms(&app.logs, &app.logs[0]),
             None,
             "a lone started entry has no completion to compute a duration from"
         );
@@ -1557,7 +1794,7 @@ mod tests {
         let (failed_x, failed_y) = find_text(buffer, "tests failed").expect("failed status should be rendered");
 
         let (_, done_style) = status_label_and_style(AgentStatus::Done);
-        let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed);
+        let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed, true);
         assert_eq!(buffer[(done_x, done_y)].fg, done_style.fg.unwrap_or_default());
         assert_eq!(buffer[(failed_x, failed_y)].fg, failed_style.fg.unwrap_or_default());
         assert_ne!(
@@ -1790,8 +2027,10 @@ mod tests {
         let (_, expected_style) = status_label_and_style(AgentStatus::NeedsInput);
         assert_eq!(buffer[(x, y)].fg, expected_style.fg.unwrap_or_default());
 
-        let (x, y) = find_text(buffer, "tests failed").expect("test run status should be rendered");
-        let (_, expected_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed);
+        // The modal's Tests pane omits the "tests" category-word prefix
+        // (unlike the top-level Agents tab it mirrors styling from).
+        let (x, y) = find_text(buffer, "failed").expect("test run status should be rendered");
+        let (_, expected_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed, false);
         assert_eq!(buffer[(x, y)].fg, expected_style.fg.unwrap_or_default());
     }
 
@@ -1828,6 +2067,58 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("No test run"), "got:\n{text}");
         assert!(text.contains("No activity"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_agents_pane_shows_each_agents_pid() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 777_777, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("pid 777777"),
+            "expected the agent's pid in the Agents pane, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_shows_pid_for_agent_activities_but_not_test_runs() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![
+            LogEntry {
+                working_dir: PathBuf::from("/Users/beet/project"),
+                category: agentmon_proto::LogCategory::Agent,
+                status: "done".to_string(),
+                occurred_at_ms: 1_000,
+                pid: Some(555_555),
+            },
+            LogEntry {
+                working_dir: PathBuf::from("/Users/beet/project"),
+                category: agentmon_proto::LogCategory::TestRun,
+                status: "failed".to_string(),
+                occurred_at_ms: 2_000,
+                pid: Some(666_666),
+            },
+        ]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("pid 555555"),
+            "expected the agent entry's pid in the Logs pane, got:\n{text}"
+        );
+        assert!(
+            !text.contains("pid 666666"),
+            "a test-run entry must not show a pid in the Logs pane, got:\n{text}"
+        );
     }
 
     #[test]

@@ -53,7 +53,11 @@ impl Ingestor {
 
     /// Updates the registry from a hook-reported event, notifying the user
     /// and recording an activity-log entry if the resulting status is a new
-    /// transition into "done" or "needs input".
+    /// transition into "done" or "needs input". Independent of any
+    /// notification, also records a "started" entry whenever the transition
+    /// moves status into "running" from something else (or registers a
+    /// brand-new entry already "running") - see the activity-log spec's
+    /// "Activity log captures notification-worthy events" requirement.
     pub fn ingest_event(&self, event: AgentEvent) -> AgentInfo {
         let outcome = self.registry.upsert(event);
         if outcome.stale_event_ignored {
@@ -65,6 +69,19 @@ impl Ingestor {
             // notifies regardless of whether it changed.
             return outcome.agent;
         }
+        if is_run_start(outcome.previous_status, outcome.agent.status) {
+            // Uses `run_started_ms` (rather than a fresh `now_ms()` call) so
+            // this entry's timestamp exactly matches the value the registry
+            // just set/reset it to - the same value a "done" entry's
+            // Logs-tab duration will later be measured from.
+            self.record_log(LogEntry {
+                working_dir: outcome.agent.cwd.clone(),
+                category: LogCategory::Agent,
+                status: "started".to_string(),
+                occurred_at_ms: outcome.agent.run_started_ms,
+                pid: Some(outcome.agent.pid),
+            });
+        }
         if should_notify(outcome.previous_status, outcome.agent.status) {
             self.notifier.notify(&outcome.agent);
             self.record_log(LogEntry {
@@ -72,6 +89,7 @@ impl Ingestor {
                 category: LogCategory::Agent,
                 status: agent_log_status(outcome.agent.status).to_string(),
                 occurred_at_ms: now_ms(),
+                pid: Some(outcome.agent.pid),
             });
         }
         outcome.agent
@@ -90,6 +108,7 @@ impl Ingestor {
             category: LogCategory::TestRun,
             status: test_run_log_status(status).to_string(),
             occurred_at_ms: now_ms(),
+            pid: Some(test_run.pid),
         });
         test_run
     }
@@ -142,6 +161,15 @@ fn should_notify(previous: Option<AgentStatus>, current: AgentStatus) -> bool {
         AgentStatus::Done => previous != Some(current),
         _ => false,
     }
+}
+
+/// Whether this transition begins a new run of work, warranting a "started"
+/// activity-log entry: entering "running" from any other status (including
+/// no previous status at all, i.e. a brand-new registration), but not a
+/// same-status "running" event continuing an already-running turn. Mirrors
+/// exactly the condition the registry uses to reset `run_started_ms`.
+fn is_run_start(previous: Option<AgentStatus>, current: AgentStatus) -> bool {
+    current == AgentStatus::Running && previous != Some(AgentStatus::Running)
 }
 
 #[cfg(test)]
@@ -407,10 +435,15 @@ mod tests {
         ingestor.ingest_event(event(AgentStatus::Done));
 
         let logs = ingestor.activity_log().snapshot();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].category, agentmon_proto::LogCategory::Agent);
-        assert_eq!(logs[0].status, "done");
-        assert_eq!(logs[0].working_dir, PathBuf::from("/tmp/project"));
+        assert_eq!(
+            logs.len(),
+            2,
+            "the initial run-start is logged in addition to the done entry"
+        );
+        assert_eq!(logs[0].status, "started");
+        assert_eq!(logs[1].category, agentmon_proto::LogCategory::Agent);
+        assert_eq!(logs[1].status, "done");
+        assert_eq!(logs[1].working_dir, PathBuf::from("/tmp/project"));
     }
 
     #[test]
@@ -463,22 +496,156 @@ mod tests {
         ingestor.ingest_event(event(AgentStatus::Running));
         ingestor.ingest_event(event(AgentStatus::Declined));
 
+        let logs = ingestor.activity_log().snapshot();
         assert!(
-            ingestor.activity_log().snapshot().is_empty(),
-            "declined transitions must not be logged, matching no-notification behavior"
+            logs.iter().all(|entry| entry.status != "declined"),
+            "the declined transition itself must not produce a log entry, got: {logs:?}"
         );
+        assert_eq!(
+            logs.len(),
+            1,
+            "only the preceding run-start (from the Running event) should be logged"
+        );
+        assert_eq!(logs[0].status, "started");
     }
 
     #[test]
-    fn non_attention_transitions_do_not_append_log_entries() {
+    fn idle_transitions_do_not_append_log_entries() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier);
 
         ingestor.ingest_event(event(AgentStatus::Running));
         ingestor.ingest_event(event(AgentStatus::Idle));
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(
+            logs.len(),
+            1,
+            "only the run-start from the Running event should be logged, not the Idle transition"
+        );
+        assert_eq!(logs[0].status, "started");
+    }
+
+    #[test]
+    fn a_new_agents_first_running_event_logs_started_with_its_pid() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
         ingestor.ingest_event(event(AgentStatus::Running));
 
-        assert!(ingestor.activity_log().snapshot().is_empty());
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].category, agentmon_proto::LogCategory::Agent);
+        assert_eq!(logs[0].status, "started");
+        assert_eq!(
+            logs[0].pid,
+            Some(1),
+            "a started entry must carry the reporting agent's process id"
+        );
+    }
+
+    #[test]
+    fn repeated_running_status_does_not_append_a_started_log_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        // Models repeated PreToolUse/PostToolUse events during the same
+        // running turn - no additional transition, so no additional entry.
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Running));
+
+        assert_eq!(
+            ingestor.activity_log().snapshot().len(),
+            1,
+            "continuing an already-running turn must not append another started entry"
+        );
+    }
+
+    #[test]
+    fn resuming_into_running_from_each_status_logs_exactly_one_started_entry() {
+        for from in [
+            AgentStatus::Idle,
+            AgentStatus::NeedsInput,
+            AgentStatus::Done,
+            AgentStatus::Declined,
+        ] {
+            let notifier = Arc::new(RecordingNotifier::default());
+            let ingestor = Ingestor::new(Registry::new(), notifier);
+
+            ingestor.ingest_event(event(AgentStatus::Running));
+            ingestor.ingest_event(event(from));
+            let logs_before_resume = ingestor.activity_log().snapshot().len();
+
+            ingestor.ingest_event(event(AgentStatus::Running));
+
+            let logs = ingestor.activity_log().snapshot();
+            assert_eq!(
+                logs.len(),
+                logs_before_resume + 1,
+                "resuming into running from {from:?} must append exactly one more entry"
+            );
+            assert_eq!(logs.last().unwrap().status, "started");
+        }
+    }
+
+    #[test]
+    fn resuming_into_running_from_stale_logs_a_started_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let registry = Registry::new();
+        let ingestor = Ingestor::new(registry.clone(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        registry
+            .mark_stale(&SessionId("session-1".to_string()))
+            .expect("agent should be marked stale");
+        let logs_before_resume = ingestor.activity_log().snapshot().len();
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs.len(), logs_before_resume + 1);
+        assert_eq!(logs.last().unwrap().status, "started");
+    }
+
+    #[test]
+    fn a_session_cycling_through_several_turns_logs_one_started_entry_per_turn() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        // Three full started -> running -> done turns under the same pid.
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Done));
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Done));
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Done));
+
+        let logs = ingestor.activity_log().snapshot();
+        let started_count = logs.iter().filter(|entry| entry.status == "started").count();
+        let done_count = logs.iter().filter(|entry| entry.status == "done").count();
+        assert_eq!(
+            started_count, 3,
+            "each of the three turns must log its own started entry, not just the first"
+        );
+        assert_eq!(done_count, 3);
+    }
+
+    #[test]
+    fn done_and_needs_input_log_entries_carry_the_agents_pid() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::NeedsInput));
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Done));
+
+        let logs = ingestor.activity_log().snapshot();
+        let needs_input_entry = logs.iter().find(|entry| entry.status == "needs_input").unwrap();
+        let done_entry = logs.iter().find(|entry| entry.status == "done").unwrap();
+        assert_eq!(needs_input_entry.pid, Some(1));
+        assert_eq!(done_entry.pid, Some(1));
     }
 
     #[test]

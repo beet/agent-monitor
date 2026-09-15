@@ -374,6 +374,7 @@ mod tests {
             status,
             last_updated_ms: 0,
             status_since_ms: 0,
+            run_started_ms: 0,
         }
     }
 
@@ -519,6 +520,7 @@ mod tests {
             category: agentmon_proto::LogCategory::Agent,
             status: status.to_string(),
             occurred_at_ms,
+            pid: Some(1),
         }
     }
 

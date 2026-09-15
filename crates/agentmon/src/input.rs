@@ -186,6 +186,7 @@ mod tests {
                     status: AgentStatus::Running,
                     last_updated_ms: 2_000,
                     status_since_ms: 0,
+                    run_started_ms: 0,
                 },
                 AgentInfo {
                     session_id: SessionId("b".to_string()),
@@ -195,6 +196,7 @@ mod tests {
                     status: AgentStatus::Running,
                     last_updated_ms: 1_000,
                     status_since_ms: 0,
+                    run_started_ms: 0,
                 },
             ],
             Vec::new(),
@@ -221,6 +223,7 @@ mod tests {
                 status: AgentStatus::Running,
                 last_updated_ms: 0,
                 status_since_ms: 0,
+                run_started_ms: 0,
             }],
             Vec::new(),
         );
@@ -242,6 +245,7 @@ mod tests {
             category: LogCategory::Agent,
             status: "done".to_string(),
             occurred_at_ms: 1,
+            pid: Some(1),
         }]);
 
         handle_key(&mut app, key(KeyCode::Enter));
@@ -260,12 +264,14 @@ mod tests {
                 category: LogCategory::Agent,
                 status: "done".to_string(),
                 occurred_at_ms: 1,
+                pid: Some(1),
             },
             LogEntry {
                 working_dir: "/tmp/b".into(),
                 category: LogCategory::Agent,
                 status: "done".to_string(),
                 occurred_at_ms: 2,
+                pid: Some(1),
             },
         ]);
 
@@ -292,6 +298,7 @@ mod tests {
                     category: LogCategory::Agent,
                     status: "done".to_string(),
                     occurred_at_ms: i,
+                    pid: Some(1),
                 })
                 .collect(),
         );
@@ -313,6 +320,7 @@ mod tests {
             category: LogCategory::Agent,
             status: "done".to_string(),
             occurred_at_ms: 1,
+            pid: Some(1),
         }]);
 
         handle_key(&mut app, key(KeyCode::Char('o')));

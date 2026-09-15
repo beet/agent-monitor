@@ -303,6 +303,75 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].session_id, SessionId("session-1".to_string()));
         assert_eq!(agents[0].status, AgentStatus::Running);
+        assert_eq!(
+            agents[0].run_started_ms, agents[0].last_updated_ms,
+            "a freshly registered agent's run_started_ms should equal its creation time"
+        );
+    }
+
+    #[test]
+    fn run_started_ms_refreshes_on_transition_into_running_but_not_otherwise() {
+        let (path, _notifier) = spawn_test_server("run-started-ms");
+        let session_id = SessionId("session-1".to_string());
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Running),
+                },
+            )
+            .expect("send running event");
+        }
+        let running_agents = wait_for_status(&path, &session_id, AgentStatus::Running);
+        let first_run_started_ms = running_agents[0].run_started_ms;
+
+        thread::sleep(Duration::from_millis(10));
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Done),
+                },
+            )
+            .expect("send done event");
+        }
+        let done_agents = wait_for_status(&path, &session_id, AgentStatus::Done);
+        assert_eq!(
+            done_agents[0].run_started_ms, first_run_started_ms,
+            "transitioning away from running must leave run_started_ms unchanged"
+        );
+
+        thread::sleep(Duration::from_millis(10));
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Running),
+                },
+            )
+            .expect("send second running event");
+        }
+
+        // Poll until run_started_ms itself has advanced past the first turn's
+        // value, since `wait_for_status` alone can't distinguish "still on
+        // the first running turn" from "back to running for a second turn".
+        let mut second_run_started_ms = first_run_started_ms;
+        for _ in 0..50 {
+            let agents = wait_for_status(&path, &session_id, AgentStatus::Running);
+            second_run_started_ms = agents[0].run_started_ms;
+            if second_run_started_ms > first_run_started_ms {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            second_run_started_ms > first_run_started_ms,
+            "done -> running must refresh run_started_ms for the new turn"
+        );
     }
 
     #[test]

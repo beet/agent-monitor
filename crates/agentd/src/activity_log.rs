@@ -50,6 +50,7 @@ mod tests {
             category: LogCategory::Agent,
             status: "done".to_string(),
             occurred_at_ms,
+            pid: None,
         }
     }
 
