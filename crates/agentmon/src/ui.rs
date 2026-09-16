@@ -461,22 +461,23 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
 
     let mut project_logs: Vec<&LogEntry> = app.logs.iter().filter(|e| e.working_dir == cwd).collect();
     project_logs.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms));
-    let logs_lines: Vec<Line> = if project_logs.is_empty() {
-        vec![Line::from("No activity")]
+    let logs_rows: Vec<Row> = if project_logs.is_empty() {
+        vec![Row::new([Cell::from("No activity"), Cell::from("")])]
     } else {
         project_logs
             .iter()
             .map(|entry| {
                 let (status_text, style) = log_entry_line_with_pid(&app.logs, entry);
-                Line::from(vec![
-                    Span::styled(status_text, style),
-                    Span::raw(format!("  {}", format_last_updated(entry.occurred_at_ms))),
+                Row::new([
+                    Cell::from(Span::styled(status_text, style)),
+                    Cell::from(format_last_updated(entry.occurred_at_ms)),
                 ])
             })
             .collect()
     };
+    let logs_widths = [Constraint::Fill(1), Constraint::Length(19)];
     frame.render_widget(
-        Paragraph::new(logs_lines).block(
+        Table::new(logs_rows, logs_widths).block(
             Block::default()
                 .title("Logs")
                 .borders(Borders::ALL)
@@ -2128,6 +2129,45 @@ mod tests {
         assert!(
             !text.contains("pid 666666"),
             "a test-run entry must not show a pid in the Logs pane, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_aligns_timestamps_in_a_fixed_far_right_column() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        let short_entry = LogEntry {
+            working_dir: PathBuf::from("/Users/beet/project"),
+            category: agentmon_proto::LogCategory::TestRun,
+            status: "failed".to_string(),
+            occurred_at_ms: 0,
+            pid: Some(1),
+        };
+        let long_entry = LogEntry {
+            working_dir: PathBuf::from("/Users/beet/project"),
+            category: agentmon_proto::LogCategory::Agent,
+            status: "started".to_string(),
+            occurred_at_ms: 5_000_000_000,
+            pid: Some(555_555),
+        };
+        app.apply_log_snapshot(vec![short_entry.clone(), long_entry.clone()]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let short_ts = format_last_updated(short_entry.occurred_at_ms);
+        let long_ts = format_last_updated(long_entry.occurred_at_ms);
+        let (short_x, _) = find_text(buffer, &short_ts)
+            .unwrap_or_else(|| panic!("expected to find '{short_ts}' in the Logs pane"));
+        let (long_x, _) = find_text(buffer, &long_ts)
+            .unwrap_or_else(|| panic!("expected to find '{long_ts}' in the Logs pane"));
+        assert_eq!(
+            short_x, long_x,
+            "expected both entries' timestamps to start at the same fixed column despite \
+             differently-lengthed status text (short entry's text is much shorter than the long \
+             entry's 'agent started ... pid 555555'), got short_x={short_x} long_x={long_x}"
         );
     }
 
