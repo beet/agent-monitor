@@ -264,6 +264,17 @@ fn log_category_label(category: agentmon_proto::LogCategory) -> &'static str {
     }
 }
 
+/// The details modal's Logs pane visually nests test-run entries beneath the
+/// agent activity that ran them by prefixing them with a tree branch marker;
+/// agent entries render unprefixed, forming the trunk of the list. Purely
+/// visual - it does not affect entry ordering or the top-level Logs tab.
+fn log_entry_tree_prefix(category: agentmon_proto::LogCategory) -> &'static str {
+    match category {
+        agentmon_proto::LogCategory::Agent => "",
+        agentmon_proto::LogCategory::TestRun => "├─ ",
+    }
+}
+
 /// Maps a log entry's category and (loosely-typed, wire-format) status
 /// string back to the same emoji-marked label and color used for that
 /// status in the Agents tab, so the Logs tab's STATUS column is visually
@@ -468,8 +479,12 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
             .iter()
             .map(|entry| {
                 let (status_text, style) = log_entry_line_with_pid(&app.logs, entry);
+                let prefix = log_entry_tree_prefix(entry.category);
                 Row::new([
-                    Cell::from(Span::styled(status_text, style)),
+                    Cell::from(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(status_text, style),
+                    ])),
                     Cell::from(format_last_updated(entry.occurred_at_ms)),
                 ])
             })
@@ -2129,6 +2144,119 @@ mod tests {
         assert!(
             !text.contains("pid 666666"),
             "a test-run entry must not show a pid in the Logs pane, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_nests_a_test_run_entry_under_the_tree_prefix() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::TestRun,
+            "passed",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("├─ ✅"),
+            "expected the test-run entry to be prefixed with a tree branch marker, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_renders_agent_entries_without_a_tree_prefix() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("├─"),
+            "an agent entry must not render a tree branch prefix, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_prefixes_each_consecutive_test_run_entry() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![
+            log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "started", 0),
+            log_entry("/Users/beet/project", agentmon_proto::LogCategory::TestRun, "started", 1_000),
+            log_entry("/Users/beet/project", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
+            log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "done", 3_000),
+        ]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        let branch_count = text.matches("├─ ").count();
+        assert_eq!(
+            branch_count, 2,
+            "expected both consecutive test-run entries to each get their own branch marker, got:\n{text}"
+        );
+        assert!(text.contains("agent started"), "got:\n{text}");
+        assert!(text.contains("agent done"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_logs_pane_tree_prefix_coexists_with_an_agent_entrys_pid() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![
+            LogEntry {
+                working_dir: PathBuf::from("/Users/beet/project"),
+                category: agentmon_proto::LogCategory::Agent,
+                status: "done".to_string(),
+                occurred_at_ms: 1_000,
+                pid: Some(555_555),
+            },
+            LogEntry {
+                working_dir: PathBuf::from("/Users/beet/project"),
+                category: agentmon_proto::LogCategory::TestRun,
+                status: "failed".to_string(),
+                occurred_at_ms: 2_000,
+                pid: Some(666_666),
+            },
+        ]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| render(frame, &app)).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("pid 555555"),
+            "expected the agent entry's pid in the Logs pane, got:\n{text}"
+        );
+        for line in text.lines() {
+            if line.contains("pid 555555") {
+                assert!(
+                    !line.trim_start().starts_with("├─"),
+                    "the agent entry's own line must not start with a tree prefix, got line:\n{line}"
+                );
+            }
+        }
+        assert!(
+            text.contains("├─ ❌"),
+            "expected the test-run entry to keep its tree prefix, got:\n{text}"
         );
     }
 
