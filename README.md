@@ -76,12 +76,110 @@ stateDiagram-v2
     Running --> Done: Stop
     Done --> Running: UserPromptSubmit / PreToolUse / PostToolUse (next turn starts)
     Done --> Done: Notification (needs-input event dropped - a finished session can't need input again until it's running)
+    Running --> Declined: PermissionDenied
+    NeedsInput --> Declined: PermissionDenied
+    Done --> Declined: PermissionDenied
+    Stale --> Declined: PermissionDenied
+    Declined --> Running: UserPromptSubmit / PreToolUse / PostToolUse
+    Declined --> Done: Stop
     Running --> Stale: liveness sweep - pid no longer running
     NeedsInput --> Stale: liveness sweep - pid no longer running
     Done --> Stale: liveness sweep - pid no longer running
+    Declined --> Stale: liveness sweep - pid no longer running
 ```
 
 Tracked agents and test runs are grouped by exact working directory. A test run has no session id of its own - it can't, since Claude Code never propagates one into a Bash tool's subprocess tree, and a run may not even be agent-initiated - so `agentd` correlates it purely by directory instead. `agentmon`'s TUI shows each directory's tracked agent(s) together with any test run(s) there, rather than as unrelated rows.
+
+## Data model
+
+`agentmon-proto` defines the wire types shared by `agentd` and its clients (`agentmon`, `agentmon-report`). `AgentEvent` is what a hook reports in; `AgentInfo` and `TestRunInfo` are what the daemon tracks and sends back out; `LogEntry` is what lands in the [activity log](#activity-log). `ClientMessage` and `ServerMessage` are the envelopes each side actually sends over the socket.
+
+```mermaid
+classDiagram
+    class AgentEvent {
+        +SessionId session_id
+        +PathBuf cwd
+        +HostContext host_context
+        +u32 pid
+        +AgentStatus status
+    }
+    class AgentInfo {
+        +SessionId session_id
+        +PathBuf cwd
+        +HostContext host_context
+        +u32 pid
+        +AgentStatus status
+        +u64 last_updated_ms
+        +u64 status_since_ms
+        +u64 run_started_ms
+    }
+    class TestRunInfo {
+        +PathBuf cwd
+        +u32 pid
+        +TestRunStatus status
+        +u64 last_updated_ms
+        +u64 run_started_ms
+    }
+    class LogEntry {
+        +PathBuf working_dir
+        +LogCategory category
+        +String status
+        +u64 occurred_at_ms
+        +Option~u32~ pid
+    }
+    class AgentStatus {
+        <<enumeration>>
+        Running
+        Idle
+        NeedsInput
+        Done
+        Stale
+        Declined
+    }
+    class TestRunStatus {
+        <<enumeration>>
+        Running
+        Passed
+        Failed
+    }
+    class HostContext {
+        <<enumeration>>
+        Nvim
+        Terminal
+        Desktop
+    }
+    class LogCategory {
+        <<enumeration>>
+        Agent
+        TestRun
+    }
+    class ClientMessage {
+        <<enumeration>>
+        ReportEvent
+        ReportTestRun
+        Subscribe
+    }
+    class ServerMessage {
+        <<enumeration>>
+        Snapshot
+        AgentUpdate
+        TestRunUpdate
+        LogAppended
+        AgentRemoved
+    }
+
+    AgentEvent --> AgentStatus : status
+    AgentEvent --> HostContext : host_context
+    AgentInfo --> AgentStatus : status
+    AgentInfo --> HostContext : host_context
+    TestRunInfo --> TestRunStatus : status
+    LogEntry --> LogCategory : category
+    ClientMessage --> AgentEvent : ReportEvent(event)
+    ClientMessage --> TestRunStatus : ReportTestRun(status)
+    ServerMessage --> AgentInfo : Snapshot(agents) / AgentUpdate(agent)
+    ServerMessage --> TestRunInfo : Snapshot(test_runs) / TestRunUpdate(test_run)
+    ServerMessage --> LogEntry : Snapshot(logs) / LogAppended(entry)
+```
 
 ## Activity log
 
