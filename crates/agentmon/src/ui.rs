@@ -180,24 +180,24 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
 /// see the "Logs tab shows an aggregated, paginated activity list" and
 /// "Logs tab supports sorting and filtering" requirements.
 fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
-    let header = Row::new(["TIME", "PROJECT", "CATEGORY", "STATUS"]).style(Style::new().bold());
+    let header = Row::new(["PROJECT", "CATEGORY", "STATUS", "TIME"]).style(Style::new().bold());
 
     let entries = app.visible_logs();
     let rows = entries.iter().map(|entry| {
         let (status_text, status_style) = log_entry_status_line(&app.logs, entry);
         Row::new([
-            Cell::from(format_last_updated(entry.occurred_at_ms)),
             Cell::from(project_name(&entry.working_dir)),
             Cell::from(log_category_label(entry.category)),
             Cell::from(Span::styled(status_text, status_style)),
+            Cell::from(format_last_updated(entry.occurred_at_ms)),
         ])
     });
 
     let widths = [
-        Constraint::Length(19),
         Constraint::Fill(2),
         Constraint::Length(10),
         Constraint::Fill(1),
+        Constraint::Length(19),
     ];
 
     let controls = logs_controls_hint(app);
@@ -469,8 +469,8 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
             .map(|entry| {
                 let (status_text, style) = log_entry_line_with_pid(&app.logs, entry);
                 Line::from(vec![
-                    Span::raw(format!("{} ", format_last_updated(entry.occurred_at_ms))),
                     Span::styled(status_text, style),
+                    Span::raw(format!("  {}", format_last_updated(entry.occurred_at_ms))),
                 ])
             })
             .collect()
