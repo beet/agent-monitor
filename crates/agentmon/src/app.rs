@@ -465,7 +465,7 @@ mod tests {
     fn apply_test_run_update_adds_a_new_test_run() {
         let mut app = App::new();
 
-        app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Started, 0));
+        app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Running, 0));
 
         assert_eq!(app.test_runs.len(), 1);
     }
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn apply_test_run_update_updates_the_same_cwd_and_pid_in_place() {
         let mut app = App::new();
-        app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Started, 0));
+        app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Running, 0));
 
         app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Failed, 100));
 
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn directory_groups_includes_a_test_run_only_group() {
         let mut app = App::new();
-        app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Started, 0));
+        app.apply_test_run_update(test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Running, 0));
 
         let groups = app.directory_groups();
 
@@ -518,7 +518,7 @@ mod tests {
                 last_updated_ms: 1_000,
                 ..agent_in("/tmp/older", "a", AgentStatus::Running)
             }],
-            vec![test_run_in("/tmp/newer", 1, agentmon_proto::TestRunStatus::Started, 2_000)],
+            vec![test_run_in("/tmp/newer", 1, agentmon_proto::TestRunStatus::Running, 2_000)],
         );
 
         let groups = app.directory_groups();
@@ -536,7 +536,7 @@ mod tests {
                 last_updated_ms: 1_000,
                 ..agent_in("/tmp/project", "a", AgentStatus::Running)
             }],
-            vec![test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Started, 2_000)],
+            vec![test_run_in("/tmp/project", 1, agentmon_proto::TestRunStatus::Running, 2_000)],
         );
 
         let groups = app.directory_groups();

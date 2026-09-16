@@ -769,18 +769,18 @@ mod tests {
     fn first_started_event_creates_a_test_run_entry() {
         let registry = Registry::new();
 
-        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
         assert_eq!(test_run.cwd, PathBuf::from("/tmp/project"));
         assert_eq!(test_run.pid, 999);
-        assert_eq!(test_run.status, TestRunStatus::Started);
+        assert_eq!(test_run.status, TestRunStatus::Running);
         assert_eq!(registry.snapshot_test_runs().len(), 1);
     }
 
     #[test]
     fn a_later_event_for_the_same_key_updates_in_place() {
         let registry = Registry::new();
-        registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
         let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Failed);
 
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn a_same_pid_completion_event_preserves_run_started_ms() {
         let registry = Registry::new();
-        let started = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        let started = registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
         let run_started_ms = started.run_started_ms;
         thread::sleep(Duration::from_millis(10));
 
@@ -812,11 +812,11 @@ mod tests {
     #[test]
     fn a_different_pid_event_resets_run_started_ms() {
         let registry = Registry::new();
-        let first = registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Started);
+        let first = registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Running);
         let first_run_started_ms = first.run_started_ms;
         thread::sleep(Duration::from_millis(10));
 
-        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Started);
+        let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Running);
 
         assert!(
             test_run.run_started_ms > first_run_started_ms,
@@ -827,9 +827,9 @@ mod tests {
     #[test]
     fn different_pids_in_the_same_directory_collapse_to_one_entry() {
         let registry = Registry::new();
-        registry.upsert_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Started);
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Running);
 
-        registry.upsert_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Started);
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Running);
 
         assert_eq!(
             registry.snapshot_test_runs().len(),
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn a_later_test_run_from_a_different_pid_replaces_the_previous_one() {
         let registry = Registry::new();
-        registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Started);
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 111, TestRunStatus::Running);
 
         let test_run = registry.upsert_test_run(PathBuf::from("/tmp/project"), 222, TestRunStatus::Failed);
 
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn directory_groups_includes_a_directory_with_only_test_runs() {
         let registry = Registry::new();
-        registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
         let groups = registry.directory_groups();
 
@@ -902,7 +902,7 @@ mod tests {
     fn directory_groups_includes_a_directory_with_both() {
         let registry = Registry::new();
         registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
         let groups = registry.directory_groups();
 

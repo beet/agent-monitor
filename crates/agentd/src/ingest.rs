@@ -140,7 +140,7 @@ fn agent_log_status(status: AgentStatus) -> &'static str {
 /// matching the wire format's snake_case spelling.
 fn test_run_log_status(status: TestRunStatus) -> &'static str {
     match status {
-        TestRunStatus::Started => "started",
+        TestRunStatus::Running => "started",
         TestRunStatus::Passed => "passed",
         TestRunStatus::Failed => "failed",
     }
@@ -346,9 +346,9 @@ mod tests {
         let ingestor = Ingestor::new(Registry::new(), notifier);
 
         let test_run =
-            ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+            ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
-        assert_eq!(test_run.status, TestRunStatus::Started);
+        assert_eq!(test_run.status, TestRunStatus::Running);
         assert_eq!(ingestor.registry().snapshot_test_runs().len(), 1);
     }
 
@@ -396,11 +396,11 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
 
-        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
         assert_eq!(
             notifier.test_run_calls.lock().unwrap().as_slice(),
-            [(PathBuf::from("/tmp/project"), TestRunStatus::Started)]
+            [(PathBuf::from("/tmp/project"), TestRunStatus::Running)]
         );
     }
 
@@ -412,18 +412,18 @@ mod tests {
         // Two distinct runs (each its own pid) starting and failing in the
         // same directory over the life of one long agent session - each
         // event must notify on its own, not just the first.
-        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Running);
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Failed);
-        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Running);
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 2, TestRunStatus::Failed);
 
         let calls = notifier.test_run_calls.lock().unwrap();
         assert_eq!(
             calls.as_slice(),
             [
-                (PathBuf::from("/tmp/project"), TestRunStatus::Started),
+                (PathBuf::from("/tmp/project"), TestRunStatus::Running),
                 (PathBuf::from("/tmp/project"), TestRunStatus::Failed),
-                (PathBuf::from("/tmp/project"), TestRunStatus::Started),
+                (PathBuf::from("/tmp/project"), TestRunStatus::Running),
                 (PathBuf::from("/tmp/project"), TestRunStatus::Failed),
             ],
             "each lifecycle event must notify independently, got: {calls:?}"
@@ -710,7 +710,7 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier);
 
-        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Running);
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Passed);
 
         let logs = ingestor.activity_log().snapshot();
@@ -741,7 +741,7 @@ mod tests {
         ingestor.set_log_listener(move |entry| received_clone.lock().unwrap().push(entry));
 
         ingestor.ingest_event(event(AgentStatus::Done));
-        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Started);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Running);
 
         assert_eq!(received.lock().unwrap().len(), 2);
     }

@@ -45,7 +45,7 @@ impl Notifier for OsaScriptNotifier {
 /// event or with an agent notification by ear.
 fn test_run_notification_script(cwd: &Path, status: TestRunStatus) -> String {
     let (status_label, sound_name) = match status {
-        TestRunStatus::Started => ("tests started", "Pop"),
+        TestRunStatus::Running => ("tests started", "Pop"),
         TestRunStatus::Passed => ("tests passed", "Tink"),
         TestRunStatus::Failed => ("tests failed", "Basso"),
     };
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_run_notification_script_uses_pop_sound_when_started() {
-        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Started);
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Running);
         assert!(
             script.ends_with("sound name \"Pop\""),
             "script did not end with the Pop sound clause: {script}"

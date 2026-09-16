@@ -52,7 +52,15 @@ pub enum AgentStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestRunStatus {
-    Started,
+    /// The run is in progress. Named to match `AgentStatus::Running` rather
+    /// than the "started" word used for the one-time event that begins a
+    /// run (reported by the RSpec formatter, and used for the activity
+    /// log's entry and the notification text) - renamed here on purpose so
+    /// the ongoing/live status reads "running" wherever it's displayed,
+    /// while `#[serde(rename = "started")]` keeps the wire JSON value
+    /// unchanged, so the formatter and daemon need no changes.
+    #[serde(rename = "started")]
+    Running,
     Passed,
     Failed,
 }
@@ -182,7 +190,7 @@ mod tests {
         TestRunInfo {
             cwd: PathBuf::from("/Users/beet/Documents/Projects/enclaudinate"),
             pid: 5150,
-            status: TestRunStatus::Started,
+            status: TestRunStatus::Running,
             last_updated_ms: 1_700_000_000_000,
             run_started_ms: 1_700_000_000_000,
         }
@@ -366,7 +374,7 @@ mod tests {
     #[test]
     fn test_run_status_serializes_as_snake_case() {
         assert_eq!(
-            serde_json::to_string(&TestRunStatus::Started).unwrap(),
+            serde_json::to_string(&TestRunStatus::Running).unwrap(),
             "\"started\""
         );
         assert_eq!(
@@ -377,6 +385,15 @@ mod tests {
             serde_json::to_string(&TestRunStatus::Failed).unwrap(),
             "\"failed\""
         );
+    }
+
+    #[test]
+    fn test_run_status_running_round_trips_through_the_started_wire_value() {
+        let json = serde_json::to_string(&TestRunStatus::Running).unwrap();
+        assert_eq!(json, "\"started\"", "the wire value must stay \"started\"");
+
+        let decoded: TestRunStatus = serde_json::from_str("\"started\"").unwrap();
+        assert_eq!(decoded, TestRunStatus::Running);
     }
 
     #[test]

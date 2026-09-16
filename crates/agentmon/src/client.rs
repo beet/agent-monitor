@@ -407,7 +407,7 @@ mod tests {
                 &mut writer,
                 &ServerMessage::Snapshot {
                     agents: Vec::new(),
-                    test_runs: vec![sample_test_run(agentmon_proto::TestRunStatus::Started)],
+                    test_runs: vec![sample_test_run(agentmon_proto::TestRunStatus::Running)],
                     logs: Vec::new(),
                 },
             )
@@ -429,7 +429,7 @@ mod tests {
             snapshot,
             ClientEvent::Snapshot(
                 Vec::new(),
-                vec![sample_test_run(agentmon_proto::TestRunStatus::Started)],
+                vec![sample_test_run(agentmon_proto::TestRunStatus::Running)],
                 Vec::new()
             )
         );

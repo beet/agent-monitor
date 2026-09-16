@@ -280,7 +280,7 @@ fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status:
             other => (other.to_string(), Style::new()),
         },
         agentmon_proto::LogCategory::TestRun => match status {
-            "started" => test_run_status_cell_text_and_style(TestRunStatus::Started, true),
+            "started" => test_run_started_text_and_style(),
             "passed" => test_run_status_cell_text_and_style(TestRunStatus::Passed, true),
             "failed" => test_run_status_cell_text_and_style(TestRunStatus::Failed, true),
             other => (other.to_string(), Style::new()),
@@ -606,13 +606,13 @@ fn tests_status_line(group: &DirectoryGroup, now_ms: u64, with_category_prefix: 
     }
 }
 
-/// A test run's duration: live and counting up while "started" (computed
+/// A test run's duration: live and counting up while "running" (computed
 /// against the current time, like a running agent's), and the fixed total
 /// elapsed time once "passed" or "failed" (computed against its own
 /// last-updated time instead, so it stops advancing once the run is done).
 fn format_test_run_duration(test_run: &TestRunInfo, now_ms: u64) -> String {
     match test_run.status {
-        TestRunStatus::Started => format_running_duration(test_run.run_started_ms, now_ms),
+        TestRunStatus::Running => format_running_duration(test_run.run_started_ms, now_ms),
         TestRunStatus::Passed | TestRunStatus::Failed => {
             format_running_duration(test_run.run_started_ms, test_run.last_updated_ms)
         }
@@ -699,13 +699,23 @@ fn agent_started_text_and_style() -> (String, Style) {
     ("⏳ agent started".to_string(), Style::new().fg(Color::Blue))
 }
 
+/// The Logs tab/pane's one-time "a test run began" log entry, independent of
+/// `TestRunStatus` - mirrors `agent_started_text_and_style` exactly: this
+/// label always carries the "tests" category-word prefix, so it has no
+/// bare/pane form; it only ever appears in a cross-category view, never in
+/// the Agents tab's TESTS column or the modal's Tests pane (which show the
+/// live `TestRunStatus::Running` status as "running" instead).
+fn test_run_started_text_and_style() -> (String, Style) {
+    ("⏳ tests started".to_string(), Style::new().fg(Color::Blue))
+}
+
 /// The STATUS cell's text and style for a test run, with the "tests"
 /// category-word prefix applied when `with_category_prefix` is set - true
 /// for the Agents tab and the Logs tab/pane, false for the details modal's
 /// Tests pane.
 fn test_run_status_cell_text_and_style(status: TestRunStatus, with_category_prefix: bool) -> (String, Style) {
     let (label, style) = match status {
-        TestRunStatus::Started => ("⏳ started", Style::new().fg(Color::Blue)),
+        TestRunStatus::Running => ("⏳ running", Style::new().fg(Color::Blue)),
         TestRunStatus::Passed => ("✅ passed", Style::new().fg(Color::Green)),
         TestRunStatus::Failed => (
             "❌ failed",
@@ -1359,13 +1369,13 @@ mod tests {
     fn a_directory_with_no_tracked_agent_still_shows_its_test_run() {
         let mut term = terminal();
         let mut app = App::new();
-        app.apply_test_run_update(test_run(999, TestRunStatus::Started, 0));
+        app.apply_test_run_update(test_run(999, TestRunStatus::Running, 0));
 
         term.draw(|frame| render(frame, &app)).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("project"), "expected project name, got:\n{text}");
-        assert!(text.contains("tests started"), "expected test-run status, got:\n{text}");
+        assert!(text.contains("tests running"), "expected test-run status, got:\n{text}");
     }
 
     #[test]
@@ -1387,8 +1397,8 @@ mod tests {
     #[test]
     fn each_test_run_status_has_a_distinct_emoji_marker() {
         assert_eq!(
-            test_run_status_cell_text_and_style(TestRunStatus::Started, true).0,
-            "⏳ tests started"
+            test_run_status_cell_text_and_style(TestRunStatus::Running, true).0,
+            "⏳ tests running"
         );
         assert_eq!(
             test_run_status_cell_text_and_style(TestRunStatus::Passed, true).0,
@@ -1403,8 +1413,8 @@ mod tests {
     #[test]
     fn test_run_status_cell_omits_the_category_prefix_when_not_requested() {
         assert_eq!(
-            test_run_status_cell_text_and_style(TestRunStatus::Started, false).0,
-            "⏳ started"
+            test_run_status_cell_text_and_style(TestRunStatus::Running, false).0,
+            "⏳ running"
         );
         assert_eq!(
             test_run_status_cell_text_and_style(TestRunStatus::Passed, false).0,
@@ -1462,10 +1472,10 @@ mod tests {
     }
 
     #[test]
-    fn format_test_run_duration_for_a_started_run_is_live() {
-        let started = test_run_with_start(1, TestRunStatus::Started, 0, 0);
+    fn format_test_run_duration_for_a_running_run_is_live() {
+        let running = test_run_with_start(1, TestRunStatus::Running, 0, 0);
 
-        assert_eq!(format_test_run_duration(&started, 9_000), "9s");
+        assert_eq!(format_test_run_duration(&running, 9_000), "9s");
     }
 
     #[test]
@@ -1476,11 +1486,11 @@ mod tests {
     }
 
     #[test]
-    fn a_started_test_run_shows_a_live_elapsed_duration() {
+    fn a_running_test_run_shows_a_live_elapsed_duration() {
         let mut term = terminal();
         let mut app = App::new();
         let now = now_ms();
-        app.apply_test_run_update(test_run_with_start(999, TestRunStatus::Started, now - 134_000, now));
+        app.apply_test_run_update(test_run_with_start(999, TestRunStatus::Running, now - 134_000, now));
 
         term.draw(|frame| render(frame, &app)).unwrap();
 

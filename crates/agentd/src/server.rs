@@ -609,7 +609,7 @@ mod tests {
                 &ClientMessage::ReportTestRun {
                     cwd: PathBuf::from("/tmp/project"),
                     pid: 999,
-                    status: agentmon_proto::TestRunStatus::Started,
+                    status: agentmon_proto::TestRunStatus::Running,
                 },
             )
             .expect("send test-run event");
@@ -619,7 +619,7 @@ mod tests {
 
         assert_eq!(test_runs.len(), 1);
         assert_eq!(test_runs[0].cwd, PathBuf::from("/tmp/project"));
-        assert_eq!(test_runs[0].status, agentmon_proto::TestRunStatus::Started);
+        assert_eq!(test_runs[0].status, agentmon_proto::TestRunStatus::Running);
     }
 
     #[test]
@@ -730,7 +730,7 @@ mod tests {
                 &ClientMessage::ReportTestRun {
                     cwd: PathBuf::from("/tmp/project"),
                     pid: 999,
-                    status: agentmon_proto::TestRunStatus::Started,
+                    status: agentmon_proto::TestRunStatus::Running,
                 },
             )
             .expect("send test-run event");
