@@ -139,7 +139,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
 
     app.open_details_modal();
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
-    term.draw(|frame| render(frame, &app)).unwrap();
+    term.draw(|frame| { render(frame, &app); }).unwrap();
     let text = buffer_text(&term);
 
     // Both the modal's Agents pane and its Logs pane mention this pid (the

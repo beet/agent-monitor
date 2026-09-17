@@ -1,16 +1,19 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState,
+};
 use ratatui::Frame;
 
 use std::path::Path;
 
 use agentmon_proto::{AgentInfo, AgentStatus, LogEntry, TestRunInfo, TestRunStatus};
 
-use crate::app::{App, ConnectionStatus, DirectoryGroup, LogSort, Modal, Tab};
+use crate::app::{needs_pagination, App, ConnectionStatus, DirectoryGroup, LogSort, Modal, PageSizes, Tab};
 
 /// Background fill for the selected row in a table. A named ANSI color (not
 /// `Rgb`/`Indexed`) so it - like the status colors elsewhere in this file -
@@ -39,19 +42,33 @@ const AGENT_STATUS_ORDER: [AgentStatus; 6] = [
     AgentStatus::Declined,
 ];
 
-pub fn render(frame: &mut Frame, app: &App) {
+/// Renders one frame and reports back how many rows each paginated list
+/// (the Logs tab, the details modal's Logs pane) actually fit on screen, so
+/// the caller can thread that `page_size` into the next key press's paging
+/// math - see `PageSizes` and design.md's "`page_size` is a parameter"
+/// decision. A pane that wasn't rendered this frame (e.g. the Agents tab is
+/// active, or no modal is open) reports `0`, which is never consulted since
+/// the same condition that skipped rendering it also skips routing keys to
+/// it.
+pub fn render(frame: &mut Frame, app: &App) -> PageSizes {
     match &app.connection {
-        ConnectionStatus::Connecting => render_message(frame, "Connecting to agentd..."),
-        ConnectionStatus::Unreachable(reason) => render_message(
-            frame,
-            &format!("agentd is not running.\n\nStart it with: agentd\n\n({reason})"),
-        ),
+        ConnectionStatus::Connecting => {
+            render_message(frame, "Connecting to agentd...");
+            PageSizes::default()
+        }
+        ConnectionStatus::Unreachable(reason) => {
+            render_message(
+                frame,
+                &format!("agentd is not running.\n\nStart it with: agentd\n\n({reason})"),
+            );
+            PageSizes::default()
+        }
         ConnectionStatus::Connected => render_body(frame, app, None),
         ConnectionStatus::Reconnecting => render_body(frame, app, Some("reconnecting to agentd...")),
     }
 }
 
-fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) {
+fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) -> PageSizes {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
@@ -59,14 +76,20 @@ fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) {
 
     render_tab_bar(frame, app, chunks[0]);
 
-    match app.active_tab {
-        Tab::Agents => render_agent_table(frame, app, chunks[1], banner),
+    let logs_tab = match app.active_tab {
+        Tab::Agents => {
+            render_agent_table(frame, app, chunks[1], banner);
+            0
+        }
         Tab::Logs => render_logs_tab(frame, app, chunks[1], banner),
-    }
+    };
 
-    if let Some(modal) = &app.modal {
-        render_modal(frame, app, modal);
-    }
+    let modal_logs = match &app.modal {
+        Some(modal) => render_modal(frame, app, modal),
+        None => 0,
+    };
+
+    PageSizes { logs_tab, modal_logs }
 }
 
 /// Renders an explicit tab bar so the Agents/Logs split - and that `Tab`
@@ -179,7 +202,7 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
 /// aggregated across projects, filtered/sorted per `App`'s current state -
 /// see the "Logs tab shows an aggregated, paginated activity list" and
 /// "Logs tab supports sorting and filtering" requirements.
-fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
+fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) -> usize {
     let header = Row::new(["PROJECT", "CATEGORY", "STATUS", "TIME"]).style(Style::new().bold());
 
     let entries = app.visible_logs();
@@ -200,17 +223,19 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
         Constraint::Length(19),
     ];
 
-    let controls = logs_controls_hint(app);
+    // Computed from the un-titled block so a page is however many data rows
+    // (the header row aside) actually fit in the pane at the current
+    // terminal size - see design.md's "`page_size` is a parameter" decision.
+    let bare_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let inner = bare_block.inner(area);
+    let page_size = inner.height.saturating_sub(1) as usize;
+
+    let controls = logs_controls_hint(app, entries.len(), page_size);
     let title = match banner {
         Some(banner) => format!("Logs - {banner}  |  {controls}"),
         None => format!("Logs - {controls}"),
     };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(area);
+    let block = bare_block.title(title);
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -221,10 +246,15 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let selected = if entries.is_empty() {
         None
     } else {
-        Some(app.logs_selected.min(entries.len() - 1))
+        Some(app.logs_pagination.display_selected(entries.len()))
     };
-    let mut state = TableState::default().with_selected(selected);
+    let top = app.logs_pagination.display_top(entries.len(), page_size);
+    let mut state = TableState::default().with_selected(selected).with_offset(top);
     frame.render_stateful_widget(table, area, &mut state);
+
+    if needs_pagination(entries.len(), page_size) {
+        render_pagination_scrollbar(frame, area, entries.len(), top, page_size);
+    }
 
     // Both the "nothing logged yet" and "filter matches nothing" empty
     // states are shown in the body beneath the header, not the title - the
@@ -247,6 +277,21 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
             message_area,
         );
     }
+
+    page_size
+}
+
+/// Renders a Ratatui vertical scrollbar along `area`'s right edge, reflecting
+/// a paginated list's current window - used by both the Logs tab and the
+/// details modal's Logs pane once their entries overflow a single page, per
+/// the "Paginated lists support keyboard navigation" requirement. `area` is
+/// the pane's full bordered rect (not its inner content area): the 1-row
+/// vertical margin keeps the scrollbar off the border's corner cells.
+fn render_pagination_scrollbar(frame: &mut Frame, area: Rect, len: usize, top: usize, page_size: usize) {
+    let mut state = ScrollbarState::new(len).position(top).viewport_content_length(page_size);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+    let scrollbar_area = area.inner(Margin { vertical: 1, horizontal: 0 });
+    frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
 }
 
 fn log_sort_label(sort: LogSort) -> &'static str {
@@ -355,12 +400,22 @@ fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry) -> (String, 
 /// Status [s]  Clear [c]` - the keybinding hints stay present whether or not
 /// a filter is currently applied, so the user always knows how to reach
 /// them.
-fn logs_controls_hint(app: &App) -> String {
-    format!(
+fn logs_controls_hint(app: &App, len: usize, page_size: usize) -> String {
+    let base = format!(
         "Sort [o]: {}  |  Filter: {}.  Project [p]  Status [s]  Clear [c]",
         log_sort_label(app.logs_sort),
         logs_filter_state(app),
-    )
+    );
+    if needs_pagination(len, page_size) {
+        // Prepended, not appended: this hint's whole reason for existing is
+        // to stay discoverable, so it must survive Ratatui's title
+        // truncation on realistic terminal widths - the already-long
+        // sort/filter hint alone can already reach the ~80-column ballpark,
+        // pushing anything appended after it off the border entirely.
+        format!("Page [d/u]  |  {base}")
+    } else {
+        base
+    }
 }
 
 fn logs_filter_state(app: &App) -> String {
@@ -373,9 +428,12 @@ fn logs_filter_state(app: &App) -> String {
 }
 
 /// Draws `modal` centered on top of whatever tab is currently shown.
-fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) {
+fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) -> usize {
     match modal {
-        Modal::Help => render_help_modal(frame),
+        Modal::Help => {
+            render_help_modal(frame);
+            0
+        }
         Modal::Details(cwd) => render_details_modal(frame, app, cwd),
     }
 }
@@ -401,8 +459,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 /// Renders the selected project's details modal: three panes covering its
 /// registered agents, its last test run (if any), and its recent activity
-/// log entries - see the "Project details modal" requirement.
-fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
+/// log entries - see the "Project details modal" requirement. Returns the
+/// Logs pane's `page_size` (see `render` / `PageSizes`).
+fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, area);
 
@@ -470,8 +529,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
         tests_area,
     );
 
-    let mut project_logs: Vec<&LogEntry> = app.logs.iter().filter(|e| e.working_dir == cwd).collect();
-    project_logs.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms));
+    let project_logs = app.project_logs(cwd);
     let logs_rows: Vec<Row> = if project_logs.is_empty() {
         vec![Row::new([Cell::from("No activity"), Cell::from("")])]
     } else {
@@ -491,15 +549,38 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) {
             .collect()
     };
     let logs_widths = [Constraint::Fill(1), Constraint::Length(19)];
-    frame.render_widget(
-        Table::new(logs_rows, logs_widths).block(
-            Block::default()
-                .title("Logs")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        ),
-        logs_area,
-    );
+
+    // No header row in this pane (per the "Project details modal"
+    // requirement), so every visible row is content - unlike the Logs tab,
+    // whose header eats one row of its page size.
+    let bare_logs_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let logs_inner = bare_logs_block.inner(logs_area);
+    let logs_page_size = logs_inner.height as usize;
+    let paginated = needs_pagination(project_logs.len(), logs_page_size);
+    let logs_title = if paginated { "Logs  |  Page [d/u]" } else { "Logs" };
+    let logs_block = bare_logs_block.title(logs_title);
+
+    let logs_table = Table::new(logs_rows, logs_widths)
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
+        .block(logs_block);
+
+    // The highlight, like the scrollbar and heading hint, only appears once
+    // pagination is actually needed - a project whose activity fits on one
+    // page renders exactly as it did before this pane could scroll.
+    let selected = if paginated {
+        Some(app.modal_logs_pagination.display_selected(project_logs.len()))
+    } else {
+        None
+    };
+    let logs_top = app.modal_logs_pagination.display_top(project_logs.len(), logs_page_size);
+    let mut logs_state = TableState::default().with_selected(selected).with_offset(logs_top);
+    frame.render_stateful_widget(logs_table, logs_area, &mut logs_state);
+
+    if paginated {
+        render_pagination_scrollbar(frame, logs_area, project_logs.len(), logs_top, logs_page_size);
+    }
+
+    logs_page_size
 }
 
 /// Renders the keyboard-shortcuts help overlay - see the "Keyboard shortcuts
@@ -513,8 +594,8 @@ fn render_help_modal(frame: &mut Frame) {
         "A / L     jump to Agents / Logs tab",
         "j / down  move selection down",
         "k / up    move selection up",
-        "d / PgDn  page down (Logs tab)",
-        "u / PgUp  page up (Logs tab)",
+        "d / PgDn  page down (Logs tab, or the details modal's Logs pane)",
+        "u / PgUp  page up (Logs tab, or the details modal's Logs pane)",
         "Enter     open project details (Agents or Logs tab)",
         "o         cycle log sort (Logs tab)",
         "p         cycle project filter (Logs tab)",
@@ -851,7 +932,7 @@ mod tests {
         let mut app = App::new();
         app.set_unreachable("connection refused".to_string());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("agentd is not running"), "got:\n{text}");
@@ -864,7 +945,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let text = buffer_text(&term);
@@ -886,7 +967,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(vec![agent("s", AgentStatus::Running, HostContext::Nvim, 4242, 0)], Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("project"), "expected project name, got:\n{text}");
@@ -903,7 +984,7 @@ mod tests {
         // started agent hits.
         app.apply_snapshot(vec![agent("s", AgentStatus::Running, HostContext::Nvim, 4242, 0)], Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("🔧"), "expected the running emoji to render, got:\n{text}");
@@ -936,21 +1017,21 @@ mod tests {
         );
 
         // Agents tab.
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains('╭'), "Agents tab should use rounded corners, got:\n{text}");
         assert!(!text.contains('┌'), "no sharp corners should remain, got:\n{text}");
 
         // Logs tab.
         app.set_tab(Tab::Logs);
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains('╭'), "Logs tab should use rounded corners, got:\n{text}");
 
         // Details modal (Agents/Tests/Logs panes, plus the outer frame).
         app.set_tab(Tab::Agents);
         app.open_details_modal();
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
         let text = buffer_text(&term);
         let rounded_corners = text.matches('╭').count();
         assert!(
@@ -962,7 +1043,7 @@ mod tests {
         // Help modal.
         app.close_modal();
         app.open_help_modal();
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains('╭'), "help modal should use rounded corners, got:\n{text}");
 
@@ -980,7 +1061,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(vec![agent("s", AgentStatus::Running, HostContext::Nvim, 4242, 0)], Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("PROJECT"), "got:\n{text}");
@@ -1010,7 +1091,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1036,7 +1117,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1067,7 +1148,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         // Distinguished by label text - both statuses combine into the same
         // project's single row...
@@ -1101,7 +1182,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         let newer_pos = text.find("newer-project").expect("newer project should be rendered");
@@ -1134,7 +1215,7 @@ mod tests {
             3_000,
         ));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         let a_pos = text.find("project-a").expect("project-a should be rendered");
@@ -1161,7 +1242,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         // Computed independently at test time (not hardcoded) since the
         // expected string depends on the machine's local timezone.
@@ -1271,7 +1352,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("declined"), "expected declined status, got:\n{text}");
@@ -1306,7 +1387,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1327,7 +1408,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert_eq!(
@@ -1351,7 +1432,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("running"), "got:\n{text}");
@@ -1387,7 +1468,7 @@ mod tests {
         let mut app = App::new();
         app.apply_test_run_update(test_run(999, TestRunStatus::Running, 0));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("project"), "expected project name, got:\n{text}");
@@ -1403,7 +1484,7 @@ mod tests {
             vec![test_run(999, TestRunStatus::Failed, 0)],
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("running"), "expected the agent row, got:\n{text}");
@@ -1451,7 +1532,7 @@ mod tests {
             vec![test_run(999, TestRunStatus::Failed, 0)],
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let (_, failed_style) = test_run_status_cell_text_and_style(TestRunStatus::Failed, true);
         let (_, running_style) = status_label_and_style(AgentStatus::Running);
@@ -1470,7 +1551,7 @@ mod tests {
             vec![test_run(999, TestRunStatus::Failed, 0)],
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let text = buffer_text(&term);
@@ -1508,7 +1589,7 @@ mod tests {
         let now = now_ms();
         app.apply_test_run_update(test_run_with_start(999, TestRunStatus::Running, now - 134_000, now));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1523,7 +1604,7 @@ mod tests {
         let mut app = App::new();
         app.apply_test_run_update(test_run_with_start(999, TestRunStatus::Passed, 0, 134_000));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("tests passed"), "got:\n{text}");
@@ -1536,7 +1617,7 @@ mod tests {
         let mut app = App::new();
         app.apply_test_run_update(test_run_with_start(999, TestRunStatus::Failed, 0, 45_000));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("tests failed"), "got:\n{text}");
@@ -1552,7 +1633,7 @@ mod tests {
             vec![test_run(999, TestRunStatus::Failed, 2_000)],
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let expected = chrono::DateTime::from_timestamp_millis(2_000)
             .unwrap()
@@ -1587,7 +1668,7 @@ mod tests {
             log_entry("/tmp/project-b", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
         ]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("project-a"), "got:\n{text}");
@@ -1647,7 +1728,7 @@ mod tests {
             log_entry("/tmp/project-b", agentmon_proto::LogCategory::TestRun, "failed", 2_000),
         ]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         // Emoji are double-width in the terminal buffer, so check the glyph
         // and its trailing label as separate substrings rather than one
@@ -1670,7 +1751,7 @@ mod tests {
             log_entry("/tmp/project-a", agentmon_proto::LogCategory::TestRun, "passed", 134_000),
         ]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1690,7 +1771,7 @@ mod tests {
             log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "done", 134_000),
         ]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1712,7 +1793,7 @@ mod tests {
             0,
         )]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains('⏳'), "got:\n{text}");
@@ -1746,7 +1827,7 @@ mod tests {
             0,
         )]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -1768,11 +1849,121 @@ mod tests {
         )]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains('⏳'), "got:\n{text}");
         assert!(text.contains("agent started"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_logs_pane_highlights_the_selected_row_once_entries_overflow_a_page() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(
+            (0..20u64)
+                .map(|i| log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (x, y) = find_text(buffer, "done").expect("a log entry's status text should be rendered");
+        assert_eq!(
+            buffer[(x, y)].bg, SELECTED_ROW_BG,
+            "the top (selected) row should be highlighted once the pane paginates"
+        );
+        assert_eq!(buffer[(x, y)].fg, SELECTED_ROW_FG);
+    }
+
+    #[test]
+    fn details_modal_logs_pane_shows_a_scrollbar_only_once_entries_overflow_a_page() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains('▲'), "no scrollbar expected with a single entry, got:\n{text}");
+
+        app.apply_log_snapshot(
+            (0..20u64)
+                .map(|i| log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('▲'), "expected a scrollbar once entries overflow a page, got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_logs_pane_title_gains_a_pagination_hint_once_entries_overflow_a_page() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains("Page [d/u]"), "no pagination hint expected with a single entry, got:\n{text}");
+
+        app.apply_log_snapshot(
+            (0..20u64)
+                .map(|i| log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Page [d/u]"),
+            "expected the Logs pane title to gain a pagination hint once entries overflow a page, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_shows_no_selection_scrollbar_or_hint_when_entries_fit_on_one_page() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(!text.contains('▲'), "no scrollbar expected when entries fit on one page, got:\n{text}");
+        assert!(!text.contains("Page [d/u]"), "no pagination hint expected when entries fit on one page, got:\n{text}");
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    SELECTED_ROW_BG,
+                    "no row should be highlighted in the Logs pane when it isn't paginated"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1788,7 +1979,7 @@ mod tests {
             0,
         )]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         assert_eq!(
             log_completion_duration_ms(&app.logs, &app.logs[0]),
@@ -1813,7 +2004,7 @@ mod tests {
             log_entry("/tmp/project-c", agentmon_proto::LogCategory::Agent, "idle", 3_000),
         ]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let (done_x, done_y) = find_text(buffer, "done").expect("done status should be rendered");
@@ -1837,7 +2028,7 @@ mod tests {
         app.apply_snapshot(Vec::new(), Vec::new());
         app.set_tab(crate::app::Tab::Logs);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let text = buffer_text(&term);
@@ -1874,7 +2065,7 @@ mod tests {
             1_000,
         )]);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("Sort [o]: recency"), "got:\n{text}");
@@ -1899,7 +2090,7 @@ mod tests {
         app.cycle_logs_project_filter();
         app.cycle_logs_sort();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("Sort [o]: project"), "got:\n{text}");
@@ -1907,6 +2098,89 @@ mod tests {
         assert!(
             text.contains("Project [p]") && text.contains("Status [s]") && text.contains("Clear [c]"),
             "shortcut hints must remain visible once a filter is applied, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_pages_by_a_full_page_with_a_1_row_overlap_and_scrolls_the_window() {
+        // 100x10 -> an 8-row body, a 6-row bordered pane, and (minus the
+        // header row) a 5-row page - see render_logs_tab's page_size.
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(
+            (0..12u64)
+                .map(|i| log_entry(&format!("/tmp/p{i:02}"), agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        // Most recent first: p11..p07 fill the first 5-row page.
+        for i in 7..12 {
+            assert!(text.contains(&format!("p{i:02}")), "expected p{i:02} on the first page, got:\n{text}");
+        }
+        for i in 0..7 {
+            assert!(!text.contains(&format!("p{i:02}")), "p{i:02} should not be visible on the first page, got:\n{text}");
+        }
+
+        app.page_logs(1, 5); // page down: advances by page_size - 1 = 4 rows
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        // The new page runs from p07 through p03, overlapping the previous
+        // page's last row (p07) by exactly 1 row.
+        for i in 3..8 {
+            assert!(text.contains(&format!("p{i:02}")), "expected p{i:02} on the second page, got:\n{text}");
+        }
+        assert!(!text.contains("p02"), "p02 should not be visible yet, got:\n{text}");
+        assert!(!text.contains("p09"), "p09 should have scrolled off the previous page, got:\n{text}");
+    }
+
+    #[test]
+    fn logs_tab_shows_a_scrollbar_only_once_entries_overflow_a_page() {
+        let mut term = terminal(); // page_size = 5, see above
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry("/tmp/a", agentmon_proto::LogCategory::Agent, "done", 1)]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains('▲'), "no scrollbar expected with a single entry, got:\n{text}");
+
+        app.apply_log_snapshot(
+            (0..8u64)
+                .map(|i| log_entry(&format!("/tmp/p{i}"), agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('▲'), "expected a scrollbar once entries overflow a page, got:\n{text}");
+    }
+
+    #[test]
+    fn logs_tab_shows_a_pagination_hint_only_once_entries_overflow_a_page() {
+        let mut term = terminal(); // page_size = 5, see above
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry("/tmp/a", agentmon_proto::LogCategory::Agent, "done", 1)]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains("Page [d/u]"), "no pagination hint expected with a single entry, got:\n{text}");
+
+        app.apply_log_snapshot(
+            (0..8u64)
+                .map(|i| log_entry(&format!("/tmp/p{i}"), agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Page [d/u]"),
+            "expected a pagination hint alongside the sort/filter hints once entries overflow a page, got:\n{text}"
         );
     }
 
@@ -1926,7 +2200,7 @@ mod tests {
         app.cycle_logs_status_filter(); // -> "done"
         app.cycle_logs_status_filter(); // -> "needs_input"
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let text = buffer_text(&term);
@@ -1959,7 +2233,7 @@ mod tests {
         )]);
         app.open_details_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("Agents"), "got:\n{text}");
@@ -1978,7 +2252,7 @@ mod tests {
             Vec::new(),
         );
         app.open_details_modal();
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
         assert!(buffer_text(&term).contains("running"), "sanity check before the update");
 
         // Simulate an event arriving from the daemon while the modal stays
@@ -1993,7 +2267,7 @@ mod tests {
             1_000,
         ));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2017,7 +2291,7 @@ mod tests {
         );
         app.open_details_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         // "Agents" also appears as the tab bar's label and the background
@@ -2046,7 +2320,7 @@ mod tests {
         );
         app.open_details_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let (x, y) = find_text(buffer, "NEEDS INPUT").expect("agent status should be rendered");
@@ -2072,7 +2346,7 @@ mod tests {
         app.agents_selected = 0;
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2088,7 +2362,7 @@ mod tests {
         app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
         app.open_details_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("No test run"), "got:\n{text}");
@@ -2102,7 +2376,7 @@ mod tests {
         app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 777_777, 0)], Vec::new());
         app.open_details_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2134,7 +2408,7 @@ mod tests {
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2160,7 +2434,7 @@ mod tests {
         )]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2182,7 +2456,7 @@ mod tests {
         )]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2204,7 +2478,7 @@ mod tests {
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         let branch_count = text.matches("├─ ").count();
@@ -2239,7 +2513,7 @@ mod tests {
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(
@@ -2282,7 +2556,7 @@ mod tests {
         app.apply_log_snapshot(vec![short_entry.clone(), long_entry.clone()]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let short_ts = format_last_updated(short_entry.occurred_at_ms);
@@ -2307,7 +2581,7 @@ mod tests {
         app.open_details_modal();
         app.close_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(!text.contains("Details -"), "modal must not still be shown, got:\n{text}");
@@ -2320,7 +2594,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("Agents [a]"), "got:\n{text}");
@@ -2335,7 +2609,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let (tabs_x, tabs_y) = find_text(buffer, "Agents").expect("tab labels should be rendered");
@@ -2365,7 +2639,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         // Row 0 is the tab bar's content row - it must not carry a border
@@ -2383,7 +2657,7 @@ mod tests {
         app.apply_snapshot(Vec::new(), Vec::new());
         app.set_tab(Tab::Logs);
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let logs_tab_cell = find_cell(term.backend().buffer(), "L").expect("Logs tab label should be rendered");
         assert!(
@@ -2401,7 +2675,7 @@ mod tests {
             Vec::new(),
         );
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
         let (x, y) = find_text(buffer, "NEEDS INPUT").expect("selected row's status should be rendered");
@@ -2432,7 +2706,7 @@ mod tests {
         app.apply_snapshot(Vec::new(), Vec::new());
         app.open_help_modal();
 
-        term.draw(|frame| render(frame, &app)).unwrap();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
         assert!(text.contains("Keyboard Shortcuts"), "got:\n{text}");

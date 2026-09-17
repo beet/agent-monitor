@@ -3,10 +3,113 @@ use std::path::{Path, PathBuf};
 
 use agentmon_proto::{AgentInfo, LogEntry, SessionId, TestRunInfo};
 
-/// Number of lines a `d`/`u` page-down/page-up moves the Logs tab's
-/// selection by. See the "Paginated lists support keyboard navigation"
-/// requirement in agent-monitor-tui's spec.
-pub const LOGS_PAGE_SIZE: usize = 10;
+/// A paginated list's selection and scroll-window state - shared by the Logs
+/// tab and the details modal's Logs pane so their `j`/`k`/`d`/`u` behavior
+/// stays identical by construction. See the "Paginated lists support
+/// keyboard navigation" requirement.
+///
+/// `page_size` (how many rows currently fit in the list's rendered area) is
+/// supplied by callers rather than stored here, since it comes from the
+/// terminal's actual rendered height and `App` stays terminal-independent -
+/// see design.md's "`page_size` is a parameter" decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Paginator {
+    pub selected: usize,
+    pub top: usize,
+}
+
+impl Paginator {
+    /// Moves the selection by `delta` lines, clamped to `[0, len - 1]`, and
+    /// scrolls the window by the minimum amount needed to keep the new
+    /// selection visible.
+    pub fn move_by(&mut self, delta: isize, len: usize, page_size: usize) {
+        self.selected = clamp_index(self.selected, delta, len);
+        self.top = synced_top(self.top, self.selected, len, page_size);
+    }
+
+    /// Moves by a full page in `direction` (+1 down, -1 up), overlapping the
+    /// previous page by exactly 1 row: the window's top row advances by
+    /// `page_size - 1` rows and the selection snaps to that new top row,
+    /// clamped so the window never scrolls past the list's first or last
+    /// entry. A no-op if there's nothing to page (`len` or `page_size` is 0).
+    pub fn page(&mut self, direction: isize, len: usize, page_size: usize) {
+        if page_size == 0 || len == 0 {
+            return;
+        }
+        let step = page_size.saturating_sub(1).max(1) as isize;
+        let max_top = len.saturating_sub(page_size) as isize;
+        let new_top = (self.top as isize + direction * step).clamp(0, max_top) as usize;
+        self.top = new_top;
+        self.selected = new_top;
+    }
+
+    /// Clamps the selection to `[0, len - 1]` - e.g. after a filter shrinks
+    /// the visible list. Leaves `top` as-is; it self-heals on the next
+    /// render via `display_top`, and on the next `move_by`/`page` call.
+    pub fn clamp_selected(&mut self, len: usize) {
+        self.selected = clamp_index(self.selected, 0, len);
+    }
+
+    /// Resets to the top of the list - used when the details modal (re)opens
+    /// so its Logs pane always starts unscrolled, matching today's behavior.
+    pub fn reset(&mut self) {
+        self.selected = 0;
+        self.top = 0;
+    }
+
+    /// The top-of-window row to render this frame. Non-mutating and
+    /// recomputed fresh from the current `len`/`page_size` rather than
+    /// trusting the stored `top`, so a stale window (e.g. right after a
+    /// terminal resize changes `page_size`, before the next key press)
+    /// self-heals for display instead of showing a truncated page.
+    pub fn display_top(&self, len: usize, page_size: usize) -> usize {
+        synced_top(self.top, self.display_selected(len), len, page_size)
+    }
+
+    /// The selection to render this frame, defensively clamped to `len` the
+    /// same way `TableState`'s selection is clamped elsewhere in `ui.rs`.
+    pub fn display_selected(&self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            self.selected.min(len - 1)
+        }
+    }
+}
+
+/// Scrolls `top` by the minimum amount needed to keep `selected` within
+/// `[top, top + page_size)`, then clamps it so the window never runs past
+/// the end of the list. Shared by `Paginator::move_by` (mutating) and
+/// `Paginator::display_top` (a pure recomputation for rendering).
+fn synced_top(top: usize, selected: usize, len: usize, page_size: usize) -> usize {
+    if page_size == 0 {
+        return 0;
+    }
+    let mut top = top;
+    if selected < top {
+        top = selected;
+    } else if selected >= top + page_size {
+        top = selected + 1 - page_size;
+    }
+    top.min(len.saturating_sub(page_size))
+}
+
+/// Whether a paginated list needs pagination controls (scrollbar, heading
+/// hint) at all - true only once it holds more rows than fit on one page.
+pub fn needs_pagination(len: usize, page_size: usize) -> bool {
+    page_size > 0 && len > page_size
+}
+
+/// How many rows each paginated list actually rendered on the most recent
+/// frame, as computed by `ui.rs` from the pane's real inner height. Threaded
+/// into `handle_key` so paging math reflects what's really on screen rather
+/// than a fixed guess - see design.md's "`page_size` is a parameter"
+/// decision.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageSizes {
+    pub logs_tab: usize,
+    pub modal_logs: usize,
+}
 
 /// Which tab is currently shown - see the "Tab navigation between Agents and
 /// Logs" requirement.
@@ -74,11 +177,14 @@ pub struct App {
     pub active_tab: Tab,
     pub agents_selected: usize,
     pub logs: Vec<LogEntry>,
-    pub logs_selected: usize,
+    pub logs_pagination: Paginator,
     pub logs_sort: LogSort,
     pub logs_filter_project: Option<String>,
     pub logs_filter_status: Option<String>,
     pub modal: Option<Modal>,
+    /// The details modal's Logs pane's own selection/scroll state, separate
+    /// from the Logs tab's - reset whenever `open_details_modal` runs.
+    pub modal_logs_pagination: Paginator,
 }
 
 impl App {
@@ -90,11 +196,12 @@ impl App {
             active_tab: Tab::Agents,
             agents_selected: 0,
             logs: Vec::new(),
-            logs_selected: 0,
+            logs_pagination: Paginator::default(),
             logs_sort: LogSort::Recency,
             logs_filter_project: None,
             logs_filter_status: None,
             modal: None,
+            modal_logs_pagination: Paginator::default(),
         }
     }
 
@@ -236,9 +343,13 @@ impl App {
     pub fn open_details_modal(&mut self) {
         let cwd = match self.active_tab {
             Tab::Agents => self.directory_groups().get(self.agents_selected).map(|group| group.cwd.clone()),
-            Tab::Logs => self.visible_logs().get(self.logs_selected).map(|entry| entry.working_dir.clone()),
+            Tab::Logs => self
+                .visible_logs()
+                .get(self.logs_pagination.selected)
+                .map(|entry| entry.working_dir.clone()),
         };
         if let Some(cwd) = cwd {
+            self.modal_logs_pagination.reset();
             self.modal = Some(Modal::Details(cwd));
         }
     }
@@ -275,23 +386,60 @@ impl App {
         entries
     }
 
+    /// A project's activity log entries, most recent first - used by the
+    /// details modal's Logs pane. Unlike `visible_logs`, this ignores the
+    /// Logs tab's own sort/filter state, per the "Project details modal"
+    /// requirement.
+    pub fn project_logs(&self, cwd: &Path) -> Vec<&LogEntry> {
+        let mut entries: Vec<&LogEntry> = self.logs.iter().filter(|e| e.working_dir == cwd).collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms));
+        entries
+    }
+
+    /// The number of activity log entries shown in the details modal's Logs
+    /// pane for whichever project it's currently open on - 0 if no details
+    /// modal is open.
+    fn modal_logs_len(&self) -> usize {
+        match &self.modal {
+            Some(Modal::Details(cwd)) => self.project_logs(cwd).len(),
+            _ => 0,
+        }
+    }
+
     /// Moves the Logs tab's selection by `delta` lines, clamped to the
-    /// current visible (filtered) entry count.
-    pub fn move_logs_selection(&mut self, delta: isize) {
+    /// current visible (filtered) entry count. `page_size` is however many
+    /// rows the Logs tab actually rendered on the most recent frame.
+    pub fn move_logs_selection(&mut self, delta: isize, page_size: usize) {
         let len = self.visible_logs().len();
-        self.logs_selected = clamp_index(self.logs_selected, delta, len);
+        self.logs_pagination.move_by(delta, len, page_size);
     }
 
     /// Moves the Logs tab's selection by a full page in `direction` (+1 or
-    /// -1), per the "Paginated lists support keyboard navigation"
-    /// requirement.
-    pub fn page_logs(&mut self, direction: isize) {
-        self.move_logs_selection(direction * LOGS_PAGE_SIZE as isize);
+    /// -1), overlapping the previous page by exactly 1 row, per the
+    /// "Paginated lists support keyboard navigation" requirement.
+    pub fn page_logs(&mut self, direction: isize, page_size: usize) {
+        let len = self.visible_logs().len();
+        self.logs_pagination.page(direction, len, page_size);
+    }
+
+    /// Moves the details modal's Logs pane's own selection by `delta`
+    /// lines - see `move_logs_selection`, scoped to the modal's pane
+    /// instead of the Logs tab.
+    pub fn move_modal_logs_selection(&mut self, delta: isize, page_size: usize) {
+        let len = self.modal_logs_len();
+        self.modal_logs_pagination.move_by(delta, len, page_size);
+    }
+
+    /// Moves the details modal's Logs pane's own selection by a full page -
+    /// see `page_logs`, scoped to the modal's pane instead of the Logs tab.
+    pub fn page_modal_logs(&mut self, direction: isize, page_size: usize) {
+        let len = self.modal_logs_len();
+        self.modal_logs_pagination.page(direction, len, page_size);
     }
 
     fn clamp_logs_selected(&mut self) {
         let len = self.visible_logs().len();
-        self.logs_selected = clamp_index(self.logs_selected, 0, len);
+        self.logs_pagination.clamp_selected(len);
     }
 
     pub fn cycle_logs_sort(&mut self) {
@@ -300,7 +448,7 @@ impl App {
             LogSort::Project => LogSort::Status,
             LogSort::Status => LogSort::Recency,
         };
-        self.logs_selected = 0;
+        self.logs_pagination.reset();
     }
 
     /// Cycles the Project filter through every distinct project present in
@@ -658,7 +806,7 @@ mod tests {
         let mut app = App::new();
         app.set_tab(Tab::Logs);
         app.apply_log_snapshot(vec![log_in("/tmp/a", "done", 1), log_in("/tmp/b", "started", 2)]);
-        app.move_logs_selection(1); // select "/tmp/a", the older (second) entry once sorted by recency
+        app.move_logs_selection(1, 10); // select "/tmp/a", the older (second) entry once sorted by recency
 
         app.open_details_modal();
 
@@ -823,51 +971,132 @@ mod tests {
     }
 
     #[test]
+    fn paginator_move_by_moves_one_line_at_a_time_clamped() {
+        let mut p = Paginator::default();
+
+        p.move_by(1, 2, 10);
+        assert_eq!(p.selected, 1);
+        p.move_by(1, 2, 10);
+        assert_eq!(p.selected, 1, "must clamp at the last entry");
+        p.move_by(-1, 2, 10);
+        assert_eq!(p.selected, 0);
+        p.move_by(-1, 2, 10);
+        assert_eq!(p.selected, 0, "must clamp at the first entry");
+    }
+
+    #[test]
+    fn paginator_page_moves_by_a_full_page_with_a_1_row_overlap() {
+        let mut p = Paginator::default();
+        let (len, page_size) = (30, 10);
+
+        p.page(1, len, page_size);
+        assert_eq!(p.top, 9, "advances by page_size - 1, overlapping the previous page by 1 row");
+        assert_eq!(p.selected, 9, "selection snaps to the new page's top row");
+
+        p.page(1, len, page_size);
+        assert_eq!(p.top, 18);
+        assert_eq!(p.selected, 18);
+
+        p.page(-1, len, page_size);
+        assert_eq!(p.top, 9);
+        assert_eq!(p.selected, 9);
+    }
+
+    #[test]
+    fn paginator_page_clamps_at_the_first_and_last_page_instead_of_overshooting() {
+        let mut p = Paginator::default();
+        let (len, page_size) = (15, 10);
+
+        p.page(-1, len, page_size);
+        assert_eq!((p.top, p.selected), (0, 0), "already on the first page");
+
+        p.page(1, len, page_size);
+        assert_eq!((p.top, p.selected), (5, 5), "last page still shows a full page's worth of rows");
+        p.page(1, len, page_size);
+        assert_eq!((p.top, p.selected), (5, 5), "must not overshoot past the last page");
+    }
+
+    #[test]
     fn move_logs_selection_moves_one_line_at_a_time_clamped() {
         let mut app = App::new();
         app.apply_log_snapshot(vec![log_in("/tmp/a", "done", 1), log_in("/tmp/b", "done", 2)]);
 
-        app.move_logs_selection(1);
-        assert_eq!(app.logs_selected, 1);
-        app.move_logs_selection(1);
-        assert_eq!(app.logs_selected, 1, "must clamp at the last entry");
-        app.move_logs_selection(-1);
-        assert_eq!(app.logs_selected, 0);
-        app.move_logs_selection(-1);
-        assert_eq!(app.logs_selected, 0, "must clamp at the first entry");
+        app.move_logs_selection(1, 10);
+        assert_eq!(app.logs_pagination.selected, 1);
+        app.move_logs_selection(1, 10);
+        assert_eq!(app.logs_pagination.selected, 1, "must clamp at the last entry");
+        app.move_logs_selection(-1, 10);
+        assert_eq!(app.logs_pagination.selected, 0);
+        app.move_logs_selection(-1, 10);
+        assert_eq!(app.logs_pagination.selected, 0, "must clamp at the first entry");
     }
 
     #[test]
-    fn page_logs_moves_by_a_full_page_clamped() {
+    fn page_logs_moves_by_a_full_page_with_a_1_row_overlap_clamped() {
         let mut app = App::new();
-        let entries: Vec<LogEntry> = (0..(LOGS_PAGE_SIZE * 3) as u64)
+        let page_size = 10;
+        let entries: Vec<LogEntry> = (0..(page_size * 3) as u64)
             .map(|i| log_in("/tmp/a", "done", i))
             .collect();
         app.apply_log_snapshot(entries);
 
-        app.page_logs(1);
-        assert_eq!(app.logs_selected, LOGS_PAGE_SIZE);
-        app.page_logs(1);
-        assert_eq!(app.logs_selected, LOGS_PAGE_SIZE * 2);
-        app.page_logs(1);
+        app.page_logs(1, page_size);
+        assert_eq!(app.logs_pagination.selected, page_size - 1);
+        app.page_logs(1, page_size);
+        assert_eq!(app.logs_pagination.selected, (page_size - 1) * 2);
+        app.page_logs(1, page_size);
         assert_eq!(
-            app.logs_selected,
-            LOGS_PAGE_SIZE * 3 - 1,
-            "must clamp at the last entry rather than overshoot"
+            app.logs_pagination.selected,
+            page_size * 2, // max_top = len - page_size = 30 - 10 = 20
+            "must clamp at the last page rather than overshoot"
         );
-        app.page_logs(-1);
-        assert_eq!(app.logs_selected, LOGS_PAGE_SIZE * 2 - 1);
+        app.page_logs(-1, page_size);
+        assert_eq!(app.logs_pagination.selected, page_size * 2 - (page_size - 1));
     }
 
     #[test]
     fn logs_selection_is_clamped_when_a_filter_shrinks_the_visible_list() {
         let mut app = App::new();
         app.apply_log_snapshot(vec![log_in("/tmp/a", "done", 1), log_in("/tmp/b", "done", 2)]);
-        app.move_logs_selection(1);
-        assert_eq!(app.logs_selected, 1);
+        app.move_logs_selection(1, 10);
+        assert_eq!(app.logs_pagination.selected, 1);
 
         app.cycle_logs_project_filter();
 
-        assert_eq!(app.logs_selected, 0, "selection must clamp once the filtered list shrinks");
+        assert_eq!(app.logs_pagination.selected, 0, "selection must clamp once the filtered list shrinks");
+    }
+
+    #[test]
+    fn opening_the_details_modal_resets_its_logs_panes_pagination() {
+        let mut app = App::new();
+        // Distinct last_updated_ms values give directory_groups() a
+        // deterministic order (most recent first) to select against.
+        app.apply_snapshot(
+            vec![
+                AgentInfo {
+                    last_updated_ms: 2_000,
+                    ..agent_in("/tmp/a", "a", AgentStatus::Running)
+                },
+                AgentInfo {
+                    last_updated_ms: 1_000,
+                    ..agent_in("/tmp/b", "b", AgentStatus::Running)
+                },
+            ],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![log_in("/tmp/a", "done", 1), log_in("/tmp/a", "started", 2)]);
+        app.open_details_modal(); // opens on "/tmp/a", the more recently updated project
+        app.move_modal_logs_selection(1, 10);
+        assert_eq!(app.modal_logs_pagination.selected, 1);
+        app.close_modal();
+
+        app.move_agents_selection(1); // select "/tmp/b"
+        app.open_details_modal();
+
+        assert_eq!(
+            app.modal_logs_pagination.selected, 0,
+            "reopening the modal must reset its Logs pane's pagination"
+        );
+        assert_eq!(app.modal_logs_pagination.top, 0);
     }
 }

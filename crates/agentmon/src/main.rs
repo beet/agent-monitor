@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use agentmon::app::App;
+use agentmon::app::{App, PageSizes};
 use agentmon::client::{spawn_client, ClientEvent};
 use agentmon::init_rspec::{formatter_path, write_rspec_local};
 use agentmon::input::{handle_key, InputAction};
@@ -90,8 +90,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     });
 
     let mut app = App::new();
+    // How many rows each paginated list actually rendered on the most
+    // recent frame - always up to date for the next key press, since every
+    // iteration draws (reflecting the current `app` state) before blocking
+    // on the next event. See `render`/`PageSizes` and design.md's
+    // "`page_size` is a parameter" decision.
+    let mut page_sizes = PageSizes::default();
     loop {
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| page_sizes = render(frame, &app))?;
 
         match rx.recv() {
             Ok(AppEvent::Client(ClientEvent::Unreachable(reason))) => app.set_unreachable(reason),
@@ -109,7 +115,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 app.remove_agent(&session_id)
             }
             Ok(AppEvent::Key(key)) => {
-                if handle_key(&mut app, key) == InputAction::Quit {
+                if handle_key(&mut app, key, page_sizes) == InputAction::Quit {
                     return Ok(());
                 }
             }

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::app::{App, Modal, Tab};
+use crate::app::{App, Modal, PageSizes, Tab};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
@@ -10,21 +10,21 @@ pub enum InputAction {
 
 /// Maps a key event to an action, applying it to `app` along the way.
 /// Terminal-independent, so it can be tested with synthetic `KeyEvent`s and
-/// without a real terminal.
+/// without a real terminal. `page_sizes` carries however many rows each
+/// paginated list actually rendered on the most recent frame - see
+/// `PageSizes`.
 ///
-/// A modal, if open, takes priority over tab-level keys: only `Esc` (close)
-/// and `q` (quit) are handled while one is showing, so modal content is
-/// never accidentally scrolled or filtered by a key meant for the tab
-/// underneath.
-pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
+/// A modal, if open, takes priority over tab-level keys: only `Esc` (close),
+/// `q` (quit), and - for `Modal::Details` - its own Logs pane's pagination
+/// keys are handled while one is showing, so the tab underneath never
+/// accidentally reacts to a key meant for the modal.
+pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputAction {
     if let KeyCode::Char('q') = key.code {
         return InputAction::Quit;
     }
 
     if app.modal.is_some() {
-        if key.code == KeyCode::Esc {
-            app.close_modal();
-        }
+        handle_modal_key(app, key.code, page_sizes.modal_logs);
         return InputAction::Continue;
     }
 
@@ -51,7 +51,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
 
     match app.active_tab {
         Tab::Agents => handle_agents_tab_key(app, key.code),
-        Tab::Logs => handle_logs_tab_key(app, key.code),
+        Tab::Logs => handle_logs_tab_key(app, key.code, page_sizes.logs_tab),
     }
 
     InputAction::Continue
@@ -66,18 +66,40 @@ fn handle_agents_tab_key(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_logs_tab_key(app: &mut App, code: KeyCode) {
+fn handle_logs_tab_key(app: &mut App, code: KeyCode, page_size: usize) {
     match code {
-        KeyCode::Char('j') | KeyCode::Down => app.move_logs_selection(1),
-        KeyCode::Char('k') | KeyCode::Up => app.move_logs_selection(-1),
-        KeyCode::Char('d') | KeyCode::PageDown => app.page_logs(1),
-        KeyCode::Char('u') | KeyCode::PageUp => app.page_logs(-1),
+        KeyCode::Char('j') | KeyCode::Down => app.move_logs_selection(1, page_size),
+        KeyCode::Char('k') | KeyCode::Up => app.move_logs_selection(-1, page_size),
+        KeyCode::Char('d') | KeyCode::PageDown => app.page_logs(1, page_size),
+        KeyCode::Char('u') | KeyCode::PageUp => app.page_logs(-1, page_size),
         KeyCode::Char('o') => app.cycle_logs_sort(),
         KeyCode::Char('p') => app.cycle_logs_project_filter(),
         KeyCode::Char('s') => app.cycle_logs_status_filter(),
         KeyCode::Char('c') => app.clear_logs_filters(),
         KeyCode::Enter => app.open_details_modal(),
         _ => {}
+    }
+}
+
+/// Handles a key while a modal is open. `Esc` closes any modal; a
+/// `Modal::Details` additionally routes its own Logs pane's `j`/`k`/`d`/`u`/
+/// page-down/page-up to that pane alone, scoped to the modal - per the
+/// "Paginated lists support keyboard navigation" requirement's precedence
+/// rule. `Modal::Help` has no list of its own, so no other key does
+/// anything while it's open.
+fn handle_modal_key(app: &mut App, code: KeyCode, modal_logs_page_size: usize) {
+    if code == KeyCode::Esc {
+        app.close_modal();
+        return;
+    }
+    if matches!(app.modal, Some(Modal::Details(_))) {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => app.move_modal_logs_selection(1, modal_logs_page_size),
+            KeyCode::Char('k') | KeyCode::Up => app.move_modal_logs_selection(-1, modal_logs_page_size),
+            KeyCode::Char('d') | KeyCode::PageDown => app.page_modal_logs(1, modal_logs_page_size),
+            KeyCode::Char('u') | KeyCode::PageUp => app.page_modal_logs(-1, modal_logs_page_size),
+            _ => {}
+        }
     }
 }
 
@@ -97,46 +119,56 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// A `PageSizes` big enough that none of the tests below that don't care
+    /// about pagination windowing get clamped unexpectedly.
+    fn page_sizes() -> PageSizes {
+        PageSizes { logs_tab: 10, modal_logs: 10 }
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> InputAction {
+        handle_key(app, key(code), page_sizes())
+    }
+
     #[test]
     fn q_quits() {
         let mut app = App::new();
-        assert_eq!(handle_key(&mut app, key(KeyCode::Char('q'))), InputAction::Quit);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), InputAction::Quit);
     }
 
     #[test]
     fn esc_quits_when_no_modal_is_open() {
         let mut app = App::new();
-        assert_eq!(handle_key(&mut app, key(KeyCode::Esc)), InputAction::Quit);
+        assert_eq!(press(&mut app, KeyCode::Esc), InputAction::Quit);
     }
 
     #[test]
     fn unrecognized_keys_are_ignored() {
         let mut app = App::new();
-        assert_eq!(handle_key(&mut app, key(KeyCode::Char('x'))), InputAction::Continue);
+        assert_eq!(press(&mut app, KeyCode::Char('x')), InputAction::Continue);
     }
 
     #[test]
     fn tab_cycles_between_agents_and_logs() {
         let mut app = App::new();
-        handle_key(&mut app, key(KeyCode::Tab));
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.active_tab, Tab::Logs);
-        handle_key(&mut app, key(KeyCode::Tab));
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.active_tab, Tab::Agents);
     }
 
     #[test]
     fn a_and_l_jump_directly_to_their_tabs() {
         let mut app = App::new();
-        handle_key(&mut app, key(KeyCode::Char('l')));
+        press(&mut app, KeyCode::Char('l'));
         assert_eq!(app.active_tab, Tab::Logs);
-        handle_key(&mut app, key(KeyCode::Char('a')));
+        press(&mut app, KeyCode::Char('a'));
         assert_eq!(app.active_tab, Tab::Agents);
     }
 
     #[test]
     fn question_mark_opens_help_modal() {
         let mut app = App::new();
-        handle_key(&mut app, key(KeyCode::Char('?')));
+        press(&mut app, KeyCode::Char('?'));
         assert!(is_help_modal_open(&app));
     }
 
@@ -145,7 +177,7 @@ mod tests {
         let mut app = App::new();
         app.open_help_modal();
 
-        let action = handle_key(&mut app, key(KeyCode::Esc));
+        let action = press(&mut app, KeyCode::Esc);
 
         assert_eq!(action, InputAction::Continue);
         assert_eq!(app.modal, None);
@@ -156,15 +188,15 @@ mod tests {
         let mut app = App::new();
         app.open_help_modal();
 
-        assert_eq!(handle_key(&mut app, key(KeyCode::Char('q'))), InputAction::Quit);
+        assert_eq!(press(&mut app, KeyCode::Char('q')), InputAction::Quit);
     }
 
     #[test]
-    fn non_esc_keys_are_ignored_while_a_modal_is_open() {
+    fn non_esc_keys_are_ignored_while_the_help_modal_is_open() {
         let mut app = App::new();
         app.open_help_modal();
 
-        handle_key(&mut app, key(KeyCode::Tab));
+        press(&mut app, KeyCode::Tab);
 
         assert_eq!(app.active_tab, Tab::Agents, "tab switching must not leak through a modal");
         assert!(is_help_modal_open(&app), "the modal must stay open");
@@ -202,9 +234,9 @@ mod tests {
             Vec::new(),
         );
 
-        handle_key(&mut app, key(KeyCode::Char('j')));
+        press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.agents_selected, 1);
-        handle_key(&mut app, key(KeyCode::Char('k')));
+        press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.agents_selected, 0);
     }
 
@@ -228,7 +260,7 @@ mod tests {
             Vec::new(),
         );
 
-        handle_key(&mut app, key(KeyCode::Enter));
+        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
     }
@@ -248,7 +280,7 @@ mod tests {
             pid: Some(1),
         }]);
 
-        handle_key(&mut app, key(KeyCode::Enter));
+        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
     }
@@ -276,23 +308,23 @@ mod tests {
         ]);
 
         // On the Agents tab, 'j' moves agent selection, not the log list.
-        handle_key(&mut app, key(KeyCode::Char('j')));
-        assert_eq!(app.logs_selected, 0);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.logs_pagination.selected, 0);
 
         app.set_tab(Tab::Logs);
-        handle_key(&mut app, key(KeyCode::Char('j')));
-        assert_eq!(app.logs_selected, 1);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.logs_pagination.selected, 1);
     }
 
     #[test]
-    fn d_and_u_page_the_logs_list() {
+    fn d_and_u_page_the_logs_list_with_a_1_row_overlap() {
         use agentmon_proto::{LogCategory, LogEntry};
-        use crate::app::LOGS_PAGE_SIZE;
 
+        let page_size = 10;
         let mut app = App::new();
         app.set_tab(Tab::Logs);
         app.apply_log_snapshot(
-            (0..(LOGS_PAGE_SIZE * 2) as u64)
+            (0..(page_size * 2) as u64)
                 .map(|i| LogEntry {
                     working_dir: "/tmp/a".into(),
                     category: LogCategory::Agent,
@@ -303,10 +335,10 @@ mod tests {
                 .collect(),
         );
 
-        handle_key(&mut app, key(KeyCode::Char('d')));
-        assert_eq!(app.logs_selected, LOGS_PAGE_SIZE);
-        handle_key(&mut app, key(KeyCode::Char('u')));
-        assert_eq!(app.logs_selected, 0);
+        handle_key(&mut app, key(KeyCode::Char('d')), page_sizes());
+        assert_eq!(app.logs_pagination.selected, page_size - 1);
+        handle_key(&mut app, key(KeyCode::Char('u')), page_sizes());
+        assert_eq!(app.logs_pagination.selected, 0);
     }
 
     #[test]
@@ -323,17 +355,75 @@ mod tests {
             pid: Some(1),
         }]);
 
-        handle_key(&mut app, key(KeyCode::Char('o')));
+        press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.logs_sort, crate::app::LogSort::Project);
 
-        handle_key(&mut app, key(KeyCode::Char('p')));
+        press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.logs_filter_project.as_deref(), Some("a"));
 
-        handle_key(&mut app, key(KeyCode::Char('s')));
+        press(&mut app, KeyCode::Char('s'));
         assert_eq!(app.logs_filter_status.as_deref(), Some("done"));
 
-        handle_key(&mut app, key(KeyCode::Char('c')));
+        press(&mut app, KeyCode::Char('c'));
         assert_eq!(app.logs_filter_project, None);
         assert_eq!(app.logs_filter_status, None);
+    }
+
+    #[test]
+    fn the_details_modals_logs_pane_keys_move_its_own_selection() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+            }],
+            Vec::new(),
+        );
+        app.open_details_modal();
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.modal_logs_pagination.selected, 0, "no log entries to move onto yet, but must not panic");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn the_details_modals_logs_pane_keys_do_not_leak_to_the_logs_tab_underneath() {
+        use agentmon_proto::{LogCategory, LogEntry};
+
+        let mut app = App::new();
+        app.set_tab(Tab::Logs);
+        app.apply_log_snapshot(
+            (0..20u64)
+                .map(|i| LogEntry {
+                    working_dir: "/tmp/a".into(),
+                    category: LogCategory::Agent,
+                    status: "done".to_string(),
+                    occurred_at_ms: i,
+                    pid: Some(1),
+                })
+                .collect(),
+        );
+        press(&mut app, KeyCode::Enter); // open the modal on the selected entry's project
+        assert!(matches!(app.modal, Some(Modal::Details(_))));
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('d'));
+
+        assert_eq!(app.modal_logs_pagination.selected, 9, "the modal's own pane moved");
+        assert_eq!(
+            app.logs_pagination.selected, 0,
+            "the Logs tab underneath must not react to keys handled by the modal"
+        );
     }
 }
