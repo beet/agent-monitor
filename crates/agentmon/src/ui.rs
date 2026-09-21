@@ -287,8 +287,16 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
 /// the "Paginated lists support keyboard navigation" requirement. `area` is
 /// the pane's full bordered rect (not its inner content area): the 1-row
 /// vertical margin keeps the scrollbar off the border's corner cells.
+///
+/// `content_length` is the number of valid scroll-window positions
+/// (`top`'s actual range is `0..=len - page_size`), not the raw entry count
+/// `len` - ratatui's thumb-position math places the thumb flush against the
+/// track's end only when `position == content_length - 1`, and `top` never
+/// reaches `len - 1` once more than one row fits per page, so passing `len`
+/// directly left the thumb stopping short of the bottom on the last page.
 fn render_pagination_scrollbar(frame: &mut Frame, area: Rect, len: usize, top: usize, page_size: usize) {
-    let mut state = ScrollbarState::new(len).position(top).viewport_content_length(page_size);
+    let content_length = len.saturating_sub(page_size) + 1;
+    let mut state = ScrollbarState::new(content_length).position(top).viewport_content_length(page_size);
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
     let scrollbar_area = area.inner(Margin { vertical: 1, horizontal: 0 });
     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
@@ -412,7 +420,7 @@ fn logs_controls_hint(app: &App, len: usize, page_size: usize) -> String {
         // truncation on realistic terminal widths - the already-long
         // sort/filter hint alone can already reach the ~80-column ballpark,
         // pushing anything appended after it off the border entirely.
-        format!("Page [d/u]  |  {base}")
+        format!("Page [d/u]  Top/Bottom [g/G]  |  {base}")
     } else {
         base
     }
@@ -557,7 +565,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
     let logs_inner = bare_logs_block.inner(logs_area);
     let logs_page_size = logs_inner.height as usize;
     let paginated = needs_pagination(project_logs.len(), logs_page_size);
-    let logs_title = if paginated { "Logs  |  Page [d/u]" } else { "Logs" };
+    let logs_title = if paginated { "Logs  |  Page [d/u]  Top/Bottom [g/G]" } else { "Logs" };
     let logs_block = bare_logs_block.title(logs_title);
 
     let logs_table = Table::new(logs_rows, logs_widths)
@@ -596,6 +604,7 @@ fn render_help_modal(frame: &mut Frame) {
         "k / up    move selection up",
         "d / PgDn  page down (Logs tab, or the details modal's Logs pane)",
         "u / PgUp  page up (Logs tab, or the details modal's Logs pane)",
+        "g / G     jump to first / last entry (Logs tab, or the details modal's Logs pane)",
         "Enter     open project details (Agents or Logs tab)",
         "o         cycle log sort (Logs tab)",
         "p         cycle project filter (Logs tab)",
@@ -1907,6 +1916,34 @@ mod tests {
     }
 
     #[test]
+    fn details_modal_logs_pane_scrollbar_thumb_reaches_the_bottom_of_its_track_on_the_last_page() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(
+            (0..20u64)
+                .map(|i| log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+        // A tiny page_size guess forces `top` past the true max before
+        // `display_top`'s final clamp brings it back down to exactly that
+        // max - i.e. the true last page - regardless of the pane's actual
+        // rendered page size.
+        app.jump_modal_logs_to_end(1);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let buffer = term.backend().buffer();
+        let (arrow_x, bottom_arrow_y) = find_text(buffer, "▼").expect("expected a scrollbar with a bottom arrow");
+        assert_eq!(
+            buffer[(arrow_x, bottom_arrow_y - 1)].symbol(),
+            "█",
+            "the thumb should be flush against the track's bottom edge on the last page, got:\n{}",
+            buffer_text(&term)
+        );
+    }
+
+    #[test]
     fn details_modal_logs_pane_title_gains_a_pagination_hint_once_entries_overflow_a_page() {
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut app = App::new();
@@ -2157,6 +2194,34 @@ mod tests {
         term.draw(|frame| { render(frame, &app); }).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains('▲'), "expected a scrollbar once entries overflow a page, got:\n{text}");
+    }
+
+    #[test]
+    fn logs_tab_scrollbar_thumb_reaches_the_bottom_of_its_track_on_the_last_page() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(
+            (0..13u64)
+                .map(|i| log_entry(&format!("/tmp/p{i}"), agentmon_proto::LogCategory::Agent, "done", i))
+                .collect(),
+        );
+        // A tiny page_size guess forces `top` past the true max before
+        // `display_top`'s final clamp brings it back down to exactly that
+        // max - i.e. the true last page - regardless of the Logs tab's
+        // actual rendered page size.
+        app.jump_logs_to_end(1);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let buffer = term.backend().buffer();
+        let (arrow_x, bottom_arrow_y) = find_text(buffer, "▼").expect("expected a scrollbar with a bottom arrow");
+        assert_eq!(
+            buffer[(arrow_x, bottom_arrow_y - 1)].symbol(),
+            "█",
+            "the thumb should be flush against the track's bottom edge on the last page, got:\n{}",
+            buffer_text(&term)
+        );
     }
 
     #[test]
@@ -2711,5 +2776,6 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("Keyboard Shortcuts"), "got:\n{text}");
         assert!(text.contains("quit"), "got:\n{text}");
+        assert!(text.contains("g / G"), "expected the jump-to-first/last shortcut to be listed, got:\n{text}");
     }
 }
