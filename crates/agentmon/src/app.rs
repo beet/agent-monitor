@@ -50,6 +50,29 @@ impl Paginator {
         self.selected = clamp_index(self.selected, 0, len);
     }
 
+    /// Jumps to the list's first entry, scrolling the page so that entry is
+    /// the top row shown - the `g` key, per the "Paginated lists support
+    /// keyboard navigation" requirement. A no-op if `len` is 0.
+    pub fn jump_to_start(&mut self, len: usize, _page_size: usize) {
+        if len == 0 {
+            return;
+        }
+        self.selected = 0;
+        self.top = 0;
+    }
+
+    /// Jumps to the list's last entry, scrolling so the last page is
+    /// showing - the `G` key. Uses the same `len.saturating_sub(page_size)`
+    /// clamp `page` uses for its `max_top`, so the window never scrolls past
+    /// the list's last entry. A no-op if `len` is 0.
+    pub fn jump_to_end(&mut self, len: usize, page_size: usize) {
+        if len == 0 {
+            return;
+        }
+        self.selected = len - 1;
+        self.top = len.saturating_sub(page_size);
+    }
+
     /// Resets to the top of the list - used when the details modal (re)opens
     /// so its Logs pane always starts unscrolled, matching today's behavior.
     pub fn reset(&mut self) {
@@ -435,6 +458,35 @@ impl App {
     pub fn page_modal_logs(&mut self, direction: isize, page_size: usize) {
         let len = self.modal_logs_len();
         self.modal_logs_pagination.page(direction, len, page_size);
+    }
+
+    /// Jumps the Logs tab's selection to the list's first entry - the `g`
+    /// key, per the "Paginated lists support keyboard navigation"
+    /// requirement.
+    pub fn jump_logs_to_start(&mut self, page_size: usize) {
+        let len = self.visible_logs().len();
+        self.logs_pagination.jump_to_start(len, page_size);
+    }
+
+    /// Jumps the Logs tab's selection to the list's last entry - the `G`
+    /// key.
+    pub fn jump_logs_to_end(&mut self, page_size: usize) {
+        let len = self.visible_logs().len();
+        self.logs_pagination.jump_to_end(len, page_size);
+    }
+
+    /// Jumps the details modal's Logs pane's own selection to the list's
+    /// first entry - see `jump_logs_to_start`, scoped to the modal's pane.
+    pub fn jump_modal_logs_to_start(&mut self, page_size: usize) {
+        let len = self.modal_logs_len();
+        self.modal_logs_pagination.jump_to_start(len, page_size);
+    }
+
+    /// Jumps the details modal's Logs pane's own selection to the list's
+    /// last entry - see `jump_logs_to_end`, scoped to the modal's pane.
+    pub fn jump_modal_logs_to_end(&mut self, page_size: usize) {
+        let len = self.modal_logs_len();
+        self.modal_logs_pagination.jump_to_end(len, page_size);
     }
 
     fn clamp_logs_selected(&mut self) {
@@ -1014,6 +1066,94 @@ mod tests {
         assert_eq!((p.top, p.selected), (5, 5), "last page still shows a full page's worth of rows");
         p.page(1, len, page_size);
         assert_eq!((p.top, p.selected), (5, 5), "must not overshoot past the last page");
+    }
+
+    #[test]
+    fn paginator_jump_to_start_and_end_are_no_ops_on_an_empty_list() {
+        let mut p = Paginator::default();
+
+        p.jump_to_end(0, 10);
+        assert_eq!((p.top, p.selected), (0, 0));
+        p.jump_to_start(0, 10);
+        assert_eq!((p.top, p.selected), (0, 0));
+    }
+
+    #[test]
+    fn paginator_jump_to_start_and_end_on_a_single_page_list() {
+        let mut p = Paginator::default();
+        let (len, page_size) = (5, 10);
+
+        p.jump_to_end(len, page_size);
+        assert_eq!((p.top, p.selected), (0, 4), "selects the last row without scrolling past a single page");
+
+        p.jump_to_start(len, page_size);
+        assert_eq!((p.top, p.selected), (0, 0));
+    }
+
+    #[test]
+    fn paginator_jump_to_start_and_end_on_a_multi_page_list() {
+        let mut p = Paginator::default();
+        let (len, page_size) = (30, 10);
+
+        p.jump_to_end(len, page_size);
+        assert_eq!((p.top, p.selected), (20, 29), "scrolls so the last page is showing, last entry selected");
+
+        p.jump_to_start(len, page_size);
+        assert_eq!((p.top, p.selected), (0, 0), "scrolls back to the first page, first entry selected");
+    }
+
+    #[test]
+    fn paginator_jump_to_end_is_idempotent() {
+        let mut p = Paginator::default();
+        let (len, page_size) = (30, 10);
+
+        p.jump_to_end(len, page_size);
+        let after_first = (p.top, p.selected);
+        p.jump_to_end(len, page_size);
+        assert_eq!((p.top, p.selected), after_first, "repeated jumps to the end must not change state further");
+    }
+
+    #[test]
+    fn paginator_jump_to_start_is_idempotent() {
+        let mut p = Paginator::default();
+        let (len, page_size) = (30, 10);
+        p.jump_to_end(len, page_size);
+
+        p.jump_to_start(len, page_size);
+        let after_first = (p.top, p.selected);
+        p.jump_to_start(len, page_size);
+        assert_eq!((p.top, p.selected), after_first, "repeated jumps to the start must not change state further");
+    }
+
+    #[test]
+    fn jump_logs_to_start_and_end_move_the_logs_tabs_selection() {
+        let mut app = App::new();
+        let page_size = 10;
+        let entries: Vec<LogEntry> = (0..(page_size * 3) as u64).map(|i| log_in("/tmp/a", "done", i)).collect();
+        app.apply_log_snapshot(entries);
+
+        app.jump_logs_to_end(page_size);
+        assert_eq!(app.logs_pagination.selected, page_size * 3 - 1);
+
+        app.jump_logs_to_start(page_size);
+        assert_eq!(app.logs_pagination.selected, 0);
+    }
+
+    #[test]
+    fn jump_modal_logs_to_start_and_end_move_the_modals_own_selection() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running)], Vec::new());
+        let page_size = 10;
+        let entries: Vec<LogEntry> = (0..(page_size * 3) as u64).map(|i| log_in("/tmp/project", "done", i)).collect();
+        app.apply_log_snapshot(entries);
+        app.open_details_modal();
+
+        app.jump_modal_logs_to_end(page_size);
+        assert_eq!(app.modal_logs_pagination.selected, page_size * 3 - 1);
+        assert_eq!(app.logs_pagination.selected, 0, "the Logs tab underneath must not react");
+
+        app.jump_modal_logs_to_start(page_size);
+        assert_eq!(app.modal_logs_pagination.selected, 0);
     }
 
     #[test]

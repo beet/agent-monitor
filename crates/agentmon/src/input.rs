@@ -16,8 +16,8 @@ pub enum InputAction {
 ///
 /// A modal, if open, takes priority over tab-level keys: only `Esc` (close),
 /// `q` (quit), and - for `Modal::Details` - its own Logs pane's pagination
-/// keys are handled while one is showing, so the tab underneath never
-/// accidentally reacts to a key meant for the modal.
+/// keys (including `g`/`G`) are handled while one is showing, so the tab
+/// underneath never accidentally reacts to a key meant for the modal.
 pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputAction {
     if let KeyCode::Char('q') = key.code {
         return InputAction::Quit;
@@ -72,6 +72,8 @@ fn handle_logs_tab_key(app: &mut App, code: KeyCode, page_size: usize) {
         KeyCode::Char('k') | KeyCode::Up => app.move_logs_selection(-1, page_size),
         KeyCode::Char('d') | KeyCode::PageDown => app.page_logs(1, page_size),
         KeyCode::Char('u') | KeyCode::PageUp => app.page_logs(-1, page_size),
+        KeyCode::Char('g') => app.jump_logs_to_start(page_size),
+        KeyCode::Char('G') => app.jump_logs_to_end(page_size),
         KeyCode::Char('o') => app.cycle_logs_sort(),
         KeyCode::Char('p') => app.cycle_logs_project_filter(),
         KeyCode::Char('s') => app.cycle_logs_status_filter(),
@@ -82,11 +84,11 @@ fn handle_logs_tab_key(app: &mut App, code: KeyCode, page_size: usize) {
 }
 
 /// Handles a key while a modal is open. `Esc` closes any modal; a
-/// `Modal::Details` additionally routes its own Logs pane's `j`/`k`/`d`/`u`/
-/// page-down/page-up to that pane alone, scoped to the modal - per the
-/// "Paginated lists support keyboard navigation" requirement's precedence
-/// rule. `Modal::Help` has no list of its own, so no other key does
-/// anything while it's open.
+/// `Modal::Details` additionally routes its own Logs pane's
+/// `j`/`k`/`d`/`u`/`g`/`G`/page-down/page-up to that pane alone, scoped to
+/// the modal - per the "Paginated lists support keyboard navigation"
+/// requirement's precedence rule. `Modal::Help` has no list of its own, so
+/// no other key does anything while it's open.
 fn handle_modal_key(app: &mut App, code: KeyCode, modal_logs_page_size: usize) {
     if code == KeyCode::Esc {
         app.close_modal();
@@ -98,6 +100,8 @@ fn handle_modal_key(app: &mut App, code: KeyCode, modal_logs_page_size: usize) {
             KeyCode::Char('k') | KeyCode::Up => app.move_modal_logs_selection(-1, modal_logs_page_size),
             KeyCode::Char('d') | KeyCode::PageDown => app.page_modal_logs(1, modal_logs_page_size),
             KeyCode::Char('u') | KeyCode::PageUp => app.page_modal_logs(-1, modal_logs_page_size),
+            KeyCode::Char('g') => app.jump_modal_logs_to_start(modal_logs_page_size),
+            KeyCode::Char('G') => app.jump_modal_logs_to_end(modal_logs_page_size),
             _ => {}
         }
     }
@@ -342,6 +346,31 @@ mod tests {
     }
 
     #[test]
+    fn g_and_shift_g_jump_the_logs_list_to_its_first_and_last_entry() {
+        use agentmon_proto::{LogCategory, LogEntry};
+
+        let page_size = 10;
+        let mut app = App::new();
+        app.set_tab(Tab::Logs);
+        app.apply_log_snapshot(
+            (0..(page_size * 3) as u64)
+                .map(|i| LogEntry {
+                    working_dir: "/tmp/a".into(),
+                    category: LogCategory::Agent,
+                    status: "done".to_string(),
+                    occurred_at_ms: i,
+                    pid: Some(1),
+                })
+                .collect(),
+        );
+
+        handle_key(&mut app, key(KeyCode::Char('G')), page_sizes());
+        assert_eq!(app.logs_pagination.selected, page_size * 3 - 1);
+        handle_key(&mut app, key(KeyCode::Char('g')), page_sizes());
+        assert_eq!(app.logs_pagination.selected, 0);
+    }
+
+    #[test]
     fn o_cycles_sort_p_cycles_project_filter_s_cycles_status_filter_c_clears() {
         use agentmon_proto::{LogCategory, LogEntry};
 
@@ -425,5 +454,36 @@ mod tests {
             app.logs_pagination.selected, 0,
             "the Logs tab underneath must not react to keys handled by the modal"
         );
+    }
+
+    #[test]
+    fn g_and_shift_g_move_the_modals_own_logs_pane_without_leaking_to_the_logs_tab() {
+        use agentmon_proto::{LogCategory, LogEntry};
+
+        let mut app = App::new();
+        app.set_tab(Tab::Logs);
+        app.apply_log_snapshot(
+            (0..20u64)
+                .map(|i| LogEntry {
+                    working_dir: "/tmp/a".into(),
+                    category: LogCategory::Agent,
+                    status: "done".to_string(),
+                    occurred_at_ms: i,
+                    pid: Some(1),
+                })
+                .collect(),
+        );
+        press(&mut app, KeyCode::Enter); // open the modal on the selected entry's project
+        assert!(matches!(app.modal, Some(Modal::Details(_))));
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.modal_logs_pagination.selected, 19, "the modal's own pane jumped to its last entry");
+        assert_eq!(
+            app.logs_pagination.selected, 0,
+            "the Logs tab underneath must not react to keys handled by the modal"
+        );
+
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.modal_logs_pagination.selected, 0);
     }
 }
