@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmon_proto::{
-    AgentEvent, AgentInfo, AgentStatus, LogCategory, LogEntry, SessionId, TestRunInfo, TestRunStatus,
+    AgentEvent, AgentInfo, AgentStatus, LogCategory, LogEntry, ReminderId, ReminderInfo, SessionId,
+    TestRunInfo, TestRunStatus,
 };
 
 use crate::activity_log::ActivityLog;
 use crate::notify::Notifier;
 use crate::registry::Registry;
+use crate::reminders::ReminderRegistry;
 
 /// Invoked with every entry as it's recorded, so a caller (e.g. the server's
 /// socket broadcaster) can react without `Ingestor` needing to know about
@@ -24,6 +26,7 @@ pub struct Ingestor {
     notifier: Arc<dyn Notifier>,
     activity_log: ActivityLog,
     log_listener: Arc<Mutex<Option<LogListener>>>,
+    reminders: ReminderRegistry,
 }
 
 impl Ingestor {
@@ -33,6 +36,7 @@ impl Ingestor {
             notifier,
             activity_log: ActivityLog::new(),
             log_listener: Arc::new(Mutex::new(None)),
+            reminders: ReminderRegistry::new(),
         }
     }
 
@@ -84,6 +88,7 @@ impl Ingestor {
                 status: "started".to_string(),
                 occurred_at_ms: outcome.agent.run_started_ms,
                 pid: Some(outcome.agent.pid),
+                reminder_name: None,
             });
         }
         if should_notify(outcome.previous_status, outcome.agent.status) {
@@ -94,6 +99,7 @@ impl Ingestor {
                 status: agent_log_status(outcome.agent.status).to_string(),
                 occurred_at_ms: now_ms(),
                 pid: Some(outcome.agent.pid),
+                reminder_name: None,
             });
         }
         (outcome.agent, outcome.retired_session_ids)
@@ -113,8 +119,87 @@ impl Ingestor {
             status: test_run_log_status(status).to_string(),
             occurred_at_ms: now_ms(),
             pid: Some(test_run.pid),
+            reminder_name: None,
         });
         test_run
+    }
+
+    /// Creates a reminder for `cwd`, per the reminders spec. Returns `None`
+    /// without side effects if `cwd` is already at the per-project cap.
+    /// Creation is not itself a logged event.
+    pub fn ingest_create_reminder(
+        &self,
+        cwd: PathBuf,
+        name: String,
+        duration_minutes: u32,
+    ) -> Option<ReminderInfo> {
+        self.reminders.create(cwd, name, duration_minutes)
+    }
+
+    /// Edits a reminder's name/duration. Not itself a logged event, per the
+    /// activity-log spec's "Editing a reminder does not log an entry".
+    pub fn ingest_update_reminder(
+        &self,
+        id: &ReminderId,
+        name: String,
+        duration_minutes: u32,
+    ) -> Option<ReminderInfo> {
+        self.reminders.update(id, name, duration_minutes)
+    }
+
+    /// Deletes a reminder regardless of status. Past log entries for it are
+    /// unaffected.
+    pub fn ingest_delete_reminder(&self, id: &ReminderId) -> bool {
+        self.reminders.delete(id)
+    }
+
+    /// Starts a reminder (fresh, or a re-run) and logs a "started" entry
+    /// carrying its current name.
+    pub fn ingest_start_reminder(&self, id: &ReminderId) -> Option<ReminderInfo> {
+        let reminder = self.reminders.start(id)?;
+        self.record_log(LogEntry {
+            working_dir: reminder.cwd.clone(),
+            category: LogCategory::Reminder,
+            status: "started".to_string(),
+            occurred_at_ms: reminder.run_started_ms.unwrap_or_else(now_ms),
+            pid: None,
+            reminder_name: Some(reminder.name.clone()),
+        });
+        Some(reminder)
+    }
+
+    /// Stops a running reminder and logs a "stopped" entry carrying its
+    /// current name. Sends no notification, per the reminders spec.
+    pub fn ingest_stop_reminder(&self, id: &ReminderId) -> Option<ReminderInfo> {
+        let reminder = self.reminders.stop(id)?;
+        self.record_log(LogEntry {
+            working_dir: reminder.cwd.clone(),
+            category: LogCategory::Reminder,
+            status: "stopped".to_string(),
+            occurred_at_ms: reminder.last_updated_ms,
+            pid: None,
+            reminder_name: Some(reminder.name.clone()),
+        });
+        Some(reminder)
+    }
+
+    /// Applies a reminder's natural completion (the sweep found its duration
+    /// elapsed): sends its completion notification and logs a "finished"
+    /// entry carrying its current name.
+    pub fn ingest_reminder_completed(&self, reminder: &ReminderInfo) {
+        self.notifier.notify_reminder(&reminder.cwd, &reminder.name);
+        self.record_log(LogEntry {
+            working_dir: reminder.cwd.clone(),
+            category: LogCategory::Reminder,
+            status: "finished".to_string(),
+            occurred_at_ms: reminder.last_updated_ms,
+            pid: None,
+            reminder_name: Some(reminder.name.clone()),
+        });
+    }
+
+    pub fn reminders(&self) -> &ReminderRegistry {
+        &self.reminders
     }
 
     fn record_log(&self, entry: LogEntry) {
@@ -187,6 +272,7 @@ mod tests {
     struct RecordingNotifier {
         calls: Mutex<Vec<AgentInfo>>,
         test_run_calls: Mutex<Vec<(PathBuf, TestRunStatus)>>,
+        reminder_calls: Mutex<Vec<(PathBuf, String)>>,
     }
 
     impl Notifier for RecordingNotifier {
@@ -199,6 +285,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((cwd.to_path_buf(), status));
+        }
+
+        fn notify_reminder(&self, cwd: &std::path::Path, name: &str) {
+            self.reminder_calls
+                .lock()
+                .unwrap()
+                .push((cwd.to_path_buf(), name.to_string()));
         }
     }
 
@@ -744,5 +837,113 @@ mod tests {
         ingestor.ingest_test_run(PathBuf::from("/tmp/project"), 1, TestRunStatus::Running);
 
         assert_eq!(received.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ingest_level_create_start_stop_round_trips_through_the_reminder_registry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        let created = ingestor
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10)
+            .unwrap();
+        let started = ingestor.ingest_start_reminder(&created.id).unwrap();
+        assert_eq!(started.status, agentmon_proto::ReminderStatus::Running);
+
+        let stopped = ingestor.ingest_stop_reminder(&created.id).unwrap();
+        assert_eq!(stopped.status, agentmon_proto::ReminderStatus::Done);
+        assert_eq!(ingestor.reminders().snapshot().len(), 1);
+    }
+
+    #[test]
+    fn starting_a_reminder_logs_a_started_entry_with_its_name() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        let created = ingestor
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10)
+            .unwrap();
+
+        ingestor.ingest_start_reminder(&created.id);
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].category, LogCategory::Reminder);
+        assert_eq!(logs[0].status, "started");
+        assert_eq!(logs[0].reminder_name.as_deref(), Some("Check the build"));
+        assert_eq!(logs[0].pid, None);
+    }
+
+    #[test]
+    fn stopping_a_reminder_logs_a_stopped_entry_and_sends_no_notification() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+        let created = ingestor
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10)
+            .unwrap();
+        ingestor.ingest_start_reminder(&created.id);
+
+        ingestor.ingest_stop_reminder(&created.id);
+
+        let logs = ingestor.activity_log().snapshot();
+        let stopped_entry = logs.iter().find(|e| e.status == "stopped").unwrap();
+        assert_eq!(stopped_entry.category, LogCategory::Reminder);
+        assert_eq!(stopped_entry.reminder_name.as_deref(), Some("Check the build"));
+        assert!(
+            notifier.reminder_calls.lock().unwrap().is_empty(),
+            "stopping a reminder must not send a notification"
+        );
+    }
+
+    #[test]
+    fn completing_a_reminder_notifies_and_logs_a_finished_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+        let created = ingestor
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 0)
+            .unwrap();
+        ingestor.ingest_start_reminder(&created.id);
+        let completed = ingestor.reminders().sweep_completed();
+        assert_eq!(completed.len(), 1);
+
+        ingestor.ingest_reminder_completed(&completed[0]);
+
+        assert_eq!(notifier.reminder_calls.lock().unwrap().len(), 1);
+        let logs = ingestor.activity_log().snapshot();
+        let finished_entry = logs.iter().find(|e| e.status == "finished").unwrap();
+        assert_eq!(finished_entry.category, LogCategory::Reminder);
+        assert_eq!(finished_entry.reminder_name.as_deref(), Some("Check the build"));
+    }
+
+    #[test]
+    fn editing_a_reminder_does_not_append_a_log_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        let created = ingestor
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10)
+            .unwrap();
+
+        ingestor.ingest_update_reminder(&created.id, "Check the deploy".to_string(), 20);
+
+        assert!(
+            ingestor.activity_log().snapshot().is_empty(),
+            "editing a reminder must not append a log entry"
+        );
+    }
+
+    #[test]
+    fn deleting_a_reminder_leaves_its_past_log_entries_intact() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        let created = ingestor
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10)
+            .unwrap();
+        ingestor.ingest_start_reminder(&created.id);
+
+        ingestor.ingest_delete_reminder(&created.id);
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].reminder_name.as_deref(), Some("Check the build"));
+        assert!(ingestor.reminders().get(&created.id).is_none());
     }
 }

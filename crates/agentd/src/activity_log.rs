@@ -51,6 +51,7 @@ mod tests {
             status: "done".to_string(),
             occurred_at_ms,
             pid: None,
+            reminder_name: None,
         }
     }
 

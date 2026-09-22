@@ -5,11 +5,11 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEventKind};
 
 use agentmon::app::{App, PageSizes};
-use agentmon::client::{spawn_client, ClientEvent};
+use agentmon::client::{send_reminder_command, spawn_client, ClientEvent};
 use agentmon::init_rspec::{formatter_path, write_rspec_local};
 use agentmon::input::{handle_key, InputAction};
 use agentmon::ui::render;
-use agentmon_proto::default_socket_path;
+use agentmon_proto::{default_socket_path, ClientMessage};
 
 /// Everything the main loop reacts to, merged onto one channel so a single
 /// blocking recv drives both daemon updates and keyboard input.
@@ -52,10 +52,11 @@ fn run_init_rspec() -> std::io::Result<()> {
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+    let socket_path = default_socket_path();
     let (tx, rx) = mpsc::channel();
 
     let (client_tx, client_rx) = mpsc::channel();
-    spawn_client(default_socket_path(), client_tx);
+    spawn_client(socket_path.clone(), client_tx);
     let forward_tx = tx.clone();
     thread::spawn(move || {
         for event in client_rx {
@@ -102,9 +103,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         match rx.recv() {
             Ok(AppEvent::Client(ClientEvent::Unreachable(reason))) => app.set_unreachable(reason),
             Ok(AppEvent::Client(ClientEvent::Reconnecting)) => app.set_reconnecting(),
-            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs, logs))) => {
+            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs, logs, reminders))) => {
                 app.apply_snapshot(agents, test_runs);
                 app.apply_log_snapshot(logs);
+                app.apply_reminder_snapshot(reminders);
             }
             Ok(AppEvent::Client(ClientEvent::Update(agent))) => app.apply_update(agent),
             Ok(AppEvent::Client(ClientEvent::TestRunUpdate(test_run))) => {
@@ -114,11 +116,21 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             Ok(AppEvent::Client(ClientEvent::AgentRemoved(session_id))) => {
                 app.remove_agent(&session_id)
             }
-            Ok(AppEvent::Key(key)) => {
-                if handle_key(&mut app, key, page_sizes) == InputAction::Quit {
-                    return Ok(());
+            Ok(AppEvent::Client(ClientEvent::ReminderUpdate(reminder))) => {
+                // If this confirms a reminder just created via the form,
+                // start it immediately - see `App::apply_reminder_update`.
+                if let Some(id) = app.apply_reminder_update(reminder) {
+                    let _ = send_reminder_command(&socket_path, ClientMessage::StartReminder { id });
                 }
             }
+            Ok(AppEvent::Client(ClientEvent::ReminderRemoved(id))) => app.remove_reminder(&id),
+            Ok(AppEvent::Key(key)) => match handle_key(&mut app, key, page_sizes) {
+                InputAction::Quit => return Ok(()),
+                InputAction::SendReminderCommand(message) => {
+                    let _ = send_reminder_command(&socket_path, message);
+                }
+                InputAction::Continue => {}
+            },
             Ok(AppEvent::Tick) => {}
             Err(_) => return Ok(()),
         }

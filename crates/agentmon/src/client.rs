@@ -6,8 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use agentmon_proto::{
-    read_message, write_message, AgentInfo, ClientMessage, LogEntry, ServerMessage, SessionId,
-    TestRunInfo,
+    read_message, write_message, AgentInfo, ClientMessage, LogEntry, ReminderId, ReminderInfo,
+    ServerMessage, SessionId, TestRunInfo,
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -21,13 +21,18 @@ pub enum ClientEvent {
     /// A previously-established connection dropped and a reconnect attempt
     /// is under way.
     Reconnecting,
-    Snapshot(Vec<AgentInfo>, Vec<TestRunInfo>, Vec<LogEntry>),
+    Snapshot(Vec<AgentInfo>, Vec<TestRunInfo>, Vec<LogEntry>, Vec<ReminderInfo>),
     Update(AgentInfo),
     TestRunUpdate(TestRunInfo),
     LogAppended(LogEntry),
     /// A tracked agent's session id was retired (e.g. a same-pid `/clear`)
     /// and should be dropped from the UI's local agent list.
     AgentRemoved(SessionId),
+    /// A reminder was created, edited, started, stopped, or completed.
+    ReminderUpdate(ReminderInfo),
+    /// A reminder was deleted and should be dropped from the UI's local
+    /// reminder list.
+    ReminderRemoved(ReminderId),
 }
 
 /// Connects to the daemon at `socket_path`, subscribes, and forwards every
@@ -38,6 +43,17 @@ pub enum ClientEvent {
 /// socket I/O.
 pub fn spawn_client(socket_path: PathBuf, events: Sender<ClientEvent>) -> JoinHandle<()> {
     thread::spawn(move || run_client(&socket_path, &events))
+}
+
+/// Sends a single reminder command (create/edit/delete/start/stop) to the
+/// daemon over its own short-lived connection, mirroring how a hook event or
+/// test-run report is sent. Fire-and-forget: the daemon applies the change
+/// and broadcasts the result to every subscriber (including this client's own
+/// long-lived `Subscribe` connection) rather than replying here - see
+/// design.md's "Mutation commands are fire-and-forget" decision.
+pub fn send_reminder_command(socket_path: &Path, message: ClientMessage) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    write_message(&mut stream, &message)
 }
 
 enum StreamOutcome {
@@ -97,9 +113,9 @@ fn connect_and_stream(socket_path: &Path, events: &Sender<ClientEvent>) -> Strea
     let mut reader = BufReader::new(stream);
     loop {
         match read_message::<_, ServerMessage>(&mut reader) {
-            Ok(Some(ServerMessage::Snapshot { agents, test_runs, logs })) => {
+            Ok(Some(ServerMessage::Snapshot { agents, test_runs, logs, reminders })) => {
                 if events
-                    .send(ClientEvent::Snapshot(agents, test_runs, logs))
+                    .send(ClientEvent::Snapshot(agents, test_runs, logs, reminders))
                     .is_err()
                 {
                     return StreamOutcome::ReceiverGone;
@@ -122,6 +138,16 @@ fn connect_and_stream(socket_path: &Path, events: &Sender<ClientEvent>) -> Strea
             }
             Ok(Some(ServerMessage::AgentRemoved { session_id })) => {
                 if events.send(ClientEvent::AgentRemoved(session_id)).is_err() {
+                    return StreamOutcome::ReceiverGone;
+                }
+            }
+            Ok(Some(ServerMessage::ReminderUpdate { reminder })) => {
+                if events.send(ClientEvent::ReminderUpdate(reminder)).is_err() {
+                    return StreamOutcome::ReceiverGone;
+                }
+            }
+            Ok(Some(ServerMessage::ReminderRemoved { id })) => {
+                if events.send(ClientEvent::ReminderRemoved(id)).is_err() {
                     return StreamOutcome::ReceiverGone;
                 }
             }
@@ -197,6 +223,7 @@ mod tests {
                     agents: vec![sample_agent(AgentStatus::Running)],
                     test_runs: Vec::new(),
                     logs: Vec::new(),
+                    reminders: Vec::new(),
                 },
             )
             .unwrap();
@@ -222,7 +249,12 @@ mod tests {
         let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
         assert_eq!(
             snapshot,
-            ClientEvent::Snapshot(vec![sample_agent(AgentStatus::Running)], Vec::new(), Vec::new())
+            ClientEvent::Snapshot(
+                vec![sample_agent(AgentStatus::Running)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new()
+            )
         );
 
         let update = rx.recv_timeout(Duration::from_secs(2)).expect("update event");
@@ -255,6 +287,7 @@ mod tests {
                     agents: Vec::new(),
                     test_runs: Vec::new(),
                     logs: Vec::new(),
+                    reminders: Vec::new(),
                 },
             )
             .unwrap();
@@ -306,6 +339,7 @@ mod tests {
                         agents: vec![sample_agent(AgentStatus::Running)],
                         test_runs: Vec::new(),
                         logs: Vec::new(),
+                        reminders: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -335,6 +369,7 @@ mod tests {
                     agents: vec![sample_agent(AgentStatus::Done)],
                     test_runs: Vec::new(),
                     logs: Vec::new(),
+                    reminders: Vec::new(),
                 },
             )
             .unwrap();
@@ -344,7 +379,7 @@ mod tests {
         spawn_client(path, tx);
 
         match rx.recv_timeout(Duration::from_secs(2)).expect("initial snapshot") {
-            ClientEvent::Snapshot(agents, _, _) => {
+            ClientEvent::Snapshot(agents, _, _, _) => {
                 assert_eq!(agents, vec![sample_agent(AgentStatus::Running)])
             }
             other => panic!("expected initial Snapshot, got {other:?}"),
@@ -356,7 +391,7 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(3)) {
                 Ok(ClientEvent::Reconnecting) => saw_reconnecting = true,
                 Ok(ClientEvent::Unreachable(_)) => {}
-                Ok(ClientEvent::Snapshot(agents, _, _)) => {
+                Ok(ClientEvent::Snapshot(agents, _, _, _)) => {
                     final_snapshot = Some(agents);
                     break;
                 }
@@ -409,6 +444,7 @@ mod tests {
                     agents: Vec::new(),
                     test_runs: vec![sample_test_run(agentmon_proto::TestRunStatus::Running)],
                     logs: Vec::new(),
+                    reminders: Vec::new(),
                 },
             )
             .unwrap();
@@ -430,6 +466,7 @@ mod tests {
             ClientEvent::Snapshot(
                 Vec::new(),
                 vec![sample_test_run(agentmon_proto::TestRunStatus::Running)],
+                Vec::new(),
                 Vec::new()
             )
         );
@@ -450,6 +487,20 @@ mod tests {
             status: "done".to_string(),
             occurred_at_ms: 0,
             pid: Some(42),
+            reminder_name: None,
+        }
+    }
+
+    fn sample_reminder(status: agentmon_proto::ReminderStatus) -> ReminderInfo {
+        ReminderInfo {
+            id: ReminderId("reminder-1".to_string()),
+            cwd: PathBuf::from("/tmp/project"),
+            name: "Check the build".to_string(),
+            duration_minutes: 10,
+            status,
+            created_at_ms: 0,
+            run_started_ms: Some(0),
+            last_updated_ms: 0,
         }
     }
 
@@ -474,6 +525,7 @@ mod tests {
                     agents: Vec::new(),
                     test_runs: Vec::new(),
                     logs: vec![sample_log_entry()],
+                    reminders: Vec::new(),
                 },
             )
             .unwrap();
@@ -492,12 +544,117 @@ mod tests {
         let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
         assert_eq!(
             snapshot,
-            ClientEvent::Snapshot(Vec::new(), Vec::new(), vec![sample_log_entry()])
+            ClientEvent::Snapshot(Vec::new(), Vec::new(), vec![sample_log_entry()], Vec::new())
         );
 
         let appended = rx.recv_timeout(Duration::from_secs(2)).expect("log appended event");
         assert_eq!(appended, ClientEvent::LogAppended(sample_log_entry()));
 
         server.join().expect("mock daemon thread should not panic");
+    }
+
+    #[test]
+    fn forwards_a_snapshot_with_reminders_then_a_reminder_update_and_removal() {
+        let path = unique_socket_path("reminders");
+        let listener = UnixListener::bind(&path).expect("bind mock daemon listener");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client connection");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            let subscribe: ClientMessage = read_message(&mut reader)
+                .expect("read subscribe")
+                .expect("connection should not close before subscribing");
+            assert_eq!(subscribe, ClientMessage::Subscribe);
+
+            write_message(
+                &mut writer,
+                &ServerMessage::Snapshot {
+                    agents: Vec::new(),
+                    test_runs: Vec::new(),
+                    logs: Vec::new(),
+                    reminders: vec![sample_reminder(agentmon_proto::ReminderStatus::Running)],
+                },
+            )
+            .unwrap();
+            write_message(
+                &mut writer,
+                &ServerMessage::ReminderUpdate {
+                    reminder: sample_reminder(agentmon_proto::ReminderStatus::Done),
+                },
+            )
+            .unwrap();
+            write_message(
+                &mut writer,
+                &ServerMessage::ReminderRemoved {
+                    id: ReminderId("reminder-1".to_string()),
+                },
+            )
+            .unwrap();
+        });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_client(path, tx);
+
+        let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
+        assert_eq!(
+            snapshot,
+            ClientEvent::Snapshot(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![sample_reminder(agentmon_proto::ReminderStatus::Running)]
+            )
+        );
+
+        let update = rx.recv_timeout(Duration::from_secs(2)).expect("reminder update event");
+        assert_eq!(
+            update,
+            ClientEvent::ReminderUpdate(sample_reminder(agentmon_proto::ReminderStatus::Done))
+        );
+
+        let removed = rx.recv_timeout(Duration::from_secs(2)).expect("reminder removed event");
+        assert_eq!(
+            removed,
+            ClientEvent::ReminderRemoved(ReminderId("reminder-1".to_string()))
+        );
+
+        server.join().expect("mock daemon thread should not panic");
+    }
+
+    #[test]
+    fn send_reminder_command_reaches_a_mock_daemon() {
+        let path = unique_socket_path("send-reminder-command");
+        let listener = UnixListener::bind(&path).expect("bind mock daemon listener");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut reader = BufReader::new(stream);
+            let message: ClientMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            message
+        });
+
+        send_reminder_command(
+            &path,
+            ClientMessage::CreateReminder {
+                cwd: PathBuf::from("/tmp/project"),
+                name: "Check the build".to_string(),
+                duration_minutes: 10,
+            },
+        )
+        .expect("send reminder command");
+
+        let received = server.join().expect("mock daemon thread should not panic");
+        assert_eq!(
+            received,
+            ClientMessage::CreateReminder {
+                cwd: PathBuf::from("/tmp/project"),
+                name: "Check the build".to_string(),
+                duration_minutes: 10,
+            }
+        );
     }
 }

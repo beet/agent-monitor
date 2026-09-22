@@ -91,7 +91,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
 
     let mut app = App::new();
     match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(ClientEvent::Snapshot(agents, test_runs, _logs)) => app.apply_snapshot(agents, test_runs),
+        Ok(ClientEvent::Snapshot(agents, test_runs, _logs, _reminders)) => app.apply_snapshot(agents, test_runs),
         other => panic!("expected an initial snapshot, got {other:?}"),
     }
 

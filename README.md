@@ -92,7 +92,7 @@ Tracked agents and test runs are grouped by exact working directory. A test run 
 
 ## Data model
 
-`agentmon-proto` defines the wire types shared by `agentd` and its clients (`agentmon`, `agentmon-report`). `AgentEvent` is what a hook reports in; `AgentInfo` and `TestRunInfo` are what the daemon tracks and sends back out; `LogEntry` is what lands in the [activity log](#activity-log). `ClientMessage` and `ServerMessage` are the envelopes each side actually sends over the socket.
+`agentmon-proto` defines the wire types shared by `agentd` and its clients (`agentmon`, `agentmon-report`). `AgentEvent` is what a hook reports in; `AgentInfo`, `TestRunInfo`, and `ReminderInfo` are what the daemon tracks and sends back out; `LogEntry` is what lands in the [activity log](#activity-log). `ClientMessage` and `ServerMessage` are the envelopes each side actually sends over the socket.
 
 ```mermaid
 classDiagram
@@ -120,12 +120,23 @@ classDiagram
         +u64 last_updated_ms
         +u64 run_started_ms
     }
+    class ReminderInfo {
+        +ReminderId id
+        +PathBuf cwd
+        +String name
+        +u32 duration_minutes
+        +ReminderStatus status
+        +u64 created_at_ms
+        +Option~u64~ run_started_ms
+        +u64 last_updated_ms
+    }
     class LogEntry {
         +PathBuf working_dir
         +LogCategory category
         +String status
         +u64 occurred_at_ms
         +Option~u32~ pid
+        +Option~String~ reminder_name
     }
     class AgentStatus {
         <<enumeration>>
@@ -142,6 +153,12 @@ classDiagram
         Passed
         Failed
     }
+    class ReminderStatus {
+        <<enumeration>>
+        NotYetStarted
+        Running
+        Done
+    }
     class HostContext {
         <<enumeration>>
         Nvim
@@ -152,12 +169,18 @@ classDiagram
         <<enumeration>>
         Agent
         TestRun
+        Reminder
     }
     class ClientMessage {
         <<enumeration>>
         ReportEvent
         ReportTestRun
         Subscribe
+        CreateReminder
+        UpdateReminder
+        DeleteReminder
+        StartReminder
+        StopReminder
     }
     class ServerMessage {
         <<enumeration>>
@@ -166,6 +189,8 @@ classDiagram
         TestRunUpdate
         LogAppended
         AgentRemoved
+        ReminderUpdate
+        ReminderRemoved
     }
 
     AgentEvent --> AgentStatus : status
@@ -173,17 +198,34 @@ classDiagram
     AgentInfo --> AgentStatus : status
     AgentInfo --> HostContext : host_context
     TestRunInfo --> TestRunStatus : status
+    ReminderInfo --> ReminderStatus : status
     LogEntry --> LogCategory : category
     ClientMessage --> AgentEvent : ReportEvent(event)
     ClientMessage --> TestRunStatus : ReportTestRun(status)
+    ClientMessage --> ReminderId : DeleteReminder(id) / StartReminder(id) / StopReminder(id)
     ServerMessage --> AgentInfo : Snapshot(agents) / AgentUpdate(agent)
     ServerMessage --> TestRunInfo : Snapshot(test_runs) / TestRunUpdate(test_run)
     ServerMessage --> LogEntry : Snapshot(logs) / LogAppended(entry)
+    ServerMessage --> ReminderInfo : Snapshot(reminders) / ReminderUpdate(reminder)
+    ServerMessage --> ReminderId : ReminderRemoved(id)
 ```
 
 ## Activity log
 
 `agentd` keeps a bounded, global history of the last 500 notification-worthy events - an agent going "done" or "needs input", and a test run starting, passing, or failing - so you can see what happened while you weren't watching, not just live state. The TUI's **Logs** tab (`Tab` or `L` to switch) lists that history across every project, most recent first, sortable and filterable by project or status. Pressing `Enter` on a project row (in either tab) opens a details modal with that project's tracked agents, its last test run, and its own activity log.
+
+## Reminders
+
+A per-project, duration-based timer, independent of any agent or test-run activity - handy for things like "check back on CI in 10 minutes" without needing a tracked agent session. `agentd` owns each reminder's lifecycle (including firing its completion notification), so it still fires even if the `agentmon` TUI isn't open to watch it.
+
+Like agents and test runs, reminders are in-memory only and don't survive a daemon restart.
+
+- `Tab` or `R`/`r` — switch to the **Reminders** tab, listing every project's reminders together
+- `R` — create a new reminder (from the Reminders tab or a project's details modal)
+- `Enter`/`s` — start/stop the highlighted reminder
+- `e` — edit the highlighted reminder's name or duration
+- `Del`/`Backspace` — delete the highlighted reminder (with confirmation)
+- `f` — filter by status
 
 ## Supported hosts
 

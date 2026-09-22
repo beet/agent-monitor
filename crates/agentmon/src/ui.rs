@@ -11,9 +11,12 @@ use ratatui::Frame;
 
 use std::path::Path;
 
-use agentmon_proto::{AgentInfo, AgentStatus, LogEntry, TestRunInfo, TestRunStatus};
+use agentmon_proto::{AgentInfo, AgentStatus, LogEntry, ReminderInfo, ReminderStatus, TestRunInfo, TestRunStatus};
 
-use crate::app::{needs_pagination, App, ConnectionStatus, DirectoryGroup, LogSort, Modal, PageSizes, Tab};
+use crate::app::{
+    needs_pagination, App, ConnectionStatus, DirectoryGroup, LogSort, Modal, ModalFocus, PageSizes,
+    ReminderFormField, ReminderFormMode, ReminderSort, Tab,
+};
 
 /// Background fill for the selected row in a table. A named ANSI color (not
 /// `Rgb`/`Indexed`) so it - like the status colors elsewhere in this file -
@@ -76,20 +79,20 @@ fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) -> PageSizes 
 
     render_tab_bar(frame, app, chunks[0]);
 
-    let logs_tab = match app.active_tab {
-        Tab::Agents => {
-            render_agent_table(frame, app, chunks[1], banner);
-            0
-        }
-        Tab::Logs => render_logs_tab(frame, app, chunks[1], banner),
-    };
+    let mut logs_tab = 0;
+    let mut reminders_tab = 0;
+    match app.active_tab {
+        Tab::Agents => render_agent_table(frame, app, chunks[1], banner),
+        Tab::Logs => logs_tab = render_logs_tab(frame, app, chunks[1], banner),
+        Tab::Reminders => reminders_tab = render_reminders_tab(frame, app, chunks[1], banner),
+    }
 
-    let modal_logs = match &app.modal {
+    let (modal_logs, modal_reminders) = match &app.modal {
         Some(modal) => render_modal(frame, app, modal),
-        None => 0,
+        None => (0, 0),
     };
 
-    PageSizes { logs_tab, modal_logs }
+    PageSizes { logs_tab, modal_logs, reminders_tab, modal_reminders }
 }
 
 /// Renders an explicit tab bar so the Agents/Logs split - and that `Tab`
@@ -118,6 +121,8 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("Agents [a]", tab_style(Tab::Agents)),
         Span::raw(" | "),
         Span::styled("Logs [l]", tab_style(Tab::Logs)),
+        Span::raw(" | "),
+        Span::styled("Reminders [r]", tab_style(Tab::Reminders)),
         Span::styled("  (tab)", Style::new().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(tabs_line), columns[0]);
@@ -137,30 +142,7 @@ fn render_message(frame: &mut Frame, message: &str) {
 }
 
 fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
-    let header = Row::new(["PROJECT", "AGENTS", "TESTS", "UPDATED"]).style(Style::new().bold());
-
-    let now = now_ms();
-    let groups = app.directory_groups();
-    let rows = groups.iter().map(|group| {
-        let project = project_name(&group.cwd);
-        Row::new([
-            Cell::from(project),
-            Cell::from(agents_status_line(group, now, true)),
-            Cell::from(tests_status_line(group, now, true)),
-            Cell::from(format_last_updated(group.most_recent_update_ms())),
-        ])
-    });
-
-    // Agents gets a bit more than Tests (it can hold several joined status
-    // segments where Tests holds at most one), and together they still
-    // receive the majority of space beyond PROJECT/UPDATED (5 fill units
-    // vs PROJECT's 2).
-    let widths = [
-        Constraint::Fill(2),
-        Constraint::Fill(3),
-        Constraint::Fill(2),
-        Constraint::Length(19),
-    ];
+    let header = Row::new(["PROJECT", "AGENTS", "TESTS", "REMINDERS", "UPDATED"]).style(Style::new().bold());
 
     let title = match banner {
         Some(banner) => format!("Agents - {banner}"),
@@ -171,6 +153,91 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
+
+    let now = now_ms();
+    let groups = app.directory_groups();
+
+    // Builds each row's content once, up front, so PROJECT/AGENTS/TESTS/
+    // REMINDERS can each be sized to what they actually need this frame
+    // instead of a fixed weighted ratio that leaves a narrow column
+    // cramped while others sit mostly blank next to it.
+    let project_texts: Vec<String> = groups.iter().map(|g| project_name(&g.cwd)).collect();
+    let agents_lines: Vec<Line> = groups.iter().map(|g| agents_status_line(g, now, true)).collect();
+    let tests_lines: Vec<Line> = groups.iter().map(|g| tests_status_line(g, now, true)).collect();
+    let reminders_lines: Vec<Line> = groups.iter().map(|g| reminders_status_line(g, app, now)).collect();
+
+    // This table always has a selected row once `groups` is non-empty, so
+    // its `"> "` highlight symbol's 2-column width is reserved on the left,
+    // same as `Table` itself reserves it (via `HighlightSpacing::
+    // WhenSelected`, the default); `column_spacing` (default 1) reserves a
+    // further column between each of the 5 columns below.
+    let selection_width: u16 = if groups.is_empty() { 0 } else { 2 };
+    const COLUMN_SPACING: u16 = 1;
+    const UPDATED_WIDTH: u16 = 19;
+    let available_for_dynamic = inner
+        .width
+        .saturating_sub(selection_width)
+        .saturating_sub(COLUMN_SPACING * 4)
+        .saturating_sub(UPDATED_WIDTH);
+
+    // Each dynamic column's actual need this frame - the widest content
+    // among the current rows, floored at its header's own width so a
+    // column with blank content still shows its header in full, and capped
+    // at half the total dynamic space so one row's unusually long content
+    // (e.g. a long reminder name) can't dominate the row and squeeze every
+    // other column down to nothing; `truncate_line` below takes over for
+    // whatever a capped column can't fully show.
+    let cap = (available_for_dynamic / 2).max(1);
+    let project_need = content_need(project_texts.iter().map(String::as_str).map(str_width), "PROJECT").min(cap);
+    let agents_need = content_need(agents_lines.iter().map(line_width), "AGENTS").min(cap);
+    let tests_need = content_need(tests_lines.iter().map(line_width), "TESTS").min(cap);
+    let reminders_need = content_need(reminders_lines.iter().map(line_width), "REMINDERS").min(cap);
+
+    // Any space left over once every column has what it needs is split
+    // 2:3:2 between PROJECT/AGENTS/TESTS - the same relative weights this
+    // table used before Reminders was added - so Agents and Tests
+    // continue to receive the majority of it, per the "Project name
+    // column scales with terminal width" requirement. REMINDERS gets
+    // exactly what its content needs and no bonus growth, since an
+    // undersized Reminders column - not an oversized one - is the problem
+    // this dynamic sizing solves.
+    let leftover = available_for_dynamic.saturating_sub(project_need + agents_need + tests_need + reminders_need);
+    let leftover_project = leftover * 2 / 7;
+    let leftover_agents = leftover * 3 / 7;
+    let leftover_tests = leftover - leftover_project - leftover_agents;
+
+    let widths = [
+        Constraint::Length(project_need + leftover_project),
+        Constraint::Length(agents_need + leftover_agents),
+        Constraint::Length(tests_need + leftover_tests),
+        Constraint::Length(reminders_need),
+        Constraint::Length(UPDATED_WIDTH),
+    ];
+
+    // Resolves the exact column widths `Table` will actually render (only
+    // ever narrower than what's requested above if the terminal is too
+    // narrow to fit them all, in which case `Length` constraints shrink
+    // together proportionally), so the ellipsis truncation below happens
+    // at each column's real width - per the "Overflowing content is
+    // truncated with an ellipsis" requirement.
+    let columns_area = Rect {
+        x: inner.x + selection_width,
+        width: inner.width.saturating_sub(selection_width),
+        ..inner
+    };
+    let columns = Layout::horizontal(widths).spacing(COLUMN_SPACING).split(columns_area);
+    let agents_width = columns[1].width as usize;
+    let reminders_width = columns[3].width as usize;
+
+    let rows = groups.iter().enumerate().map(|(i, group)| {
+        Row::new([
+            Cell::from(project_texts[i].clone()),
+            Cell::from(truncate_line(agents_lines[i].clone(), agents_width)),
+            Cell::from(tests_lines[i].clone()),
+            Cell::from(truncate_line(reminders_lines[i].clone(), reminders_width)),
+            Cell::from(format_last_updated(group.most_recent_update_ms())),
+        ])
+    });
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -314,16 +381,18 @@ fn log_category_label(category: agentmon_proto::LogCategory) -> &'static str {
     match category {
         agentmon_proto::LogCategory::Agent => "agent",
         agentmon_proto::LogCategory::TestRun => "test-run",
+        agentmon_proto::LogCategory::Reminder => "reminder",
     }
 }
 
 /// The details modal's Logs pane visually nests test-run entries beneath the
 /// agent activity that ran them by prefixing them with a tree branch marker;
-/// agent entries render unprefixed, forming the trunk of the list. Purely
-/// visual - it does not affect entry ordering or the top-level Logs tab.
+/// agent and reminder entries render unprefixed, forming the trunk of the
+/// list. Purely visual - it does not affect entry ordering or the top-level
+/// Logs tab.
 fn log_entry_tree_prefix(category: agentmon_proto::LogCategory) -> &'static str {
     match category {
-        agentmon_proto::LogCategory::Agent => "",
+        agentmon_proto::LogCategory::Agent | agentmon_proto::LogCategory::Reminder => "",
         agentmon_proto::LogCategory::TestRun => "├─ ",
     }
 }
@@ -349,6 +418,22 @@ fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status:
             "failed" => test_run_status_cell_text_and_style(TestRunStatus::Failed, true),
             other => (other.to_string(), Style::new()),
         },
+        // A reminder log entry always shows the fixed ⏰ marker regardless of
+        // its status (started/stopped/finished) - unlike agent and test-run
+        // entries, which use a different emoji per status - per the "Status
+        // is visually distinguishable" requirement. The color still varies
+        // by status, though: "finished" (a natural completion) matches the
+        // Green used for "done"/"passed" elsewhere; "stopped" (a manual
+        // interruption, distinct from either a start or a completion) gets
+        // its own Yellow rather than sharing "started"'s Blue.
+        agentmon_proto::LogCategory::Reminder => {
+            let color = match status {
+                "finished" => Color::Green,
+                "stopped" => Color::Yellow,
+                _ => Color::Blue,
+            };
+            (format!("⏰ reminder {status}"), Style::new().fg(color))
+        }
     }
 }
 
@@ -364,6 +449,8 @@ fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option
         (agentmon_proto::LogCategory::TestRun, "passed")
             | (agentmon_proto::LogCategory::TestRun, "failed")
             | (agentmon_proto::LogCategory::Agent, "done")
+            | (agentmon_proto::LogCategory::Reminder, "finished")
+            | (agentmon_proto::LogCategory::Reminder, "stopped")
     );
     if !is_completion {
         return None;
@@ -373,19 +460,38 @@ fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option
         .filter(|e| e.category == entry.category)
         .filter(|e| e.working_dir == entry.working_dir)
         .filter(|e| e.status == "started")
+        // A project can have several reminders interleaved in the log, so a
+        // reminder completion is only paired with a "started" entry for the
+        // same reminder name - unlike agent/test-run entries, which have no
+        // such identity to match on and rely on working_dir alone.
+        .filter(|e| entry.category != agentmon_proto::LogCategory::Reminder || e.reminder_name == entry.reminder_name)
         .filter(|e| e.occurred_at_ms <= entry.occurred_at_ms)
         .max_by_key(|e| e.occurred_at_ms)
         .map(|started| entry.occurred_at_ms.saturating_sub(started.occurred_at_ms))
 }
 
-/// Builds a log entry's styled status text, appending an elapsed duration
-/// for a completed run/task so its total time is visible the same way it
-/// already is on the Agents tab - see `log_completion_duration_ms`.
+/// Builds a log entry's styled status text, appending the reminder's name
+/// (for reminder-category entries) and an elapsed duration for a completed
+/// run/task, so its total time is visible the same way it already is on the
+/// Agents tab - see `log_completion_duration_ms`. The name comes before the
+/// duration (e.g. "reminder finished: Check the build 10m"), reading as a
+/// single "what, how long" phrase.
 fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
     let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
+    // Carries the reminder's name as of this event, so a later-deleted
+    // reminder's past entries keep showing it - per the "A deleted
+    // reminder's log entries keep its name" scenario.
+    if let Some(name) = &entry.reminder_name {
+        text.push_str(&format!(": {name}"));
+    }
     if let Some(duration_ms) = log_completion_duration_ms(all_logs, entry) {
         text.push(' ');
-        text.push_str(&format_running_duration(0, duration_ms));
+        let formatted = if entry.category == agentmon_proto::LogCategory::Reminder {
+            format_reminder_duration_ms(duration_ms)
+        } else {
+            format_running_duration(0, duration_ms)
+        };
+        text.push_str(&formatted);
     }
     (text, style)
 }
@@ -435,15 +541,27 @@ fn logs_filter_state(app: &App) -> String {
     }
 }
 
-/// Draws `modal` centered on top of whatever tab is currently shown.
-fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) -> usize {
-    match modal {
+/// Draws `modal` centered on top of whatever tab is currently shown. Returns
+/// `(modal_logs_page_size, modal_reminders_page_size)`.
+fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) -> (usize, usize) {
+    let page_sizes = match modal {
         Modal::Help => {
             render_help_modal(frame);
-            0
+            (0, 0)
         }
         Modal::Details(cwd) => render_details_modal(frame, app, cwd),
+    };
+
+    // The reminder form and delete confirmation are their own layers on top
+    // of the details modal - see "Reminder creation and editing form" and
+    // "Reminder deletion confirmation".
+    if let Some(form) = &app.reminder_form {
+        render_reminder_form(frame, form);
+    } else if let Some(id) = &app.confirm_delete_reminder {
+        render_delete_reminder_confirm(frame, app, id);
     }
+
+    page_sizes
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -465,11 +583,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-/// Renders the selected project's details modal: three panes covering its
-/// registered agents, its last test run (if any), and its recent activity
-/// log entries - see the "Project details modal" requirement. Returns the
-/// Logs pane's `page_size` (see `render` / `PageSizes`).
-fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
+/// Renders the selected project's details modal: four panes covering its
+/// registered agents, its last test run (if any), its reminders, and its
+/// recent activity log entries - see the "Project details modal"
+/// requirement. Returns `(logs_page_size, reminders_page_size)` (see
+/// `render` / `PageSizes`).
+fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usize) {
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, area);
 
@@ -480,17 +599,18 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Agents and Tests share the top third, side by side; Logs - typically
-    // the longest-running list - gets the remaining two-thirds beneath them.
+    // Agents, Tests, and Reminders share the top third, side by side; Logs -
+    // typically the longest-running list - gets the remaining two-thirds
+    // beneath them.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
         .split(inner);
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(1, 3), Constraint::Ratio(1, 3)])
         .split(rows[0]);
-    let (agents_area, tests_area, logs_area) = (top[0], top[1], rows[1]);
+    let (agents_area, tests_area, reminders_area, logs_area) = (top[0], top[1], top[2], rows[1]);
 
     let group = app.directory_groups().into_iter().find(|g| g.cwd == cwd);
     let now = now_ms();
@@ -537,6 +657,8 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
         tests_area,
     );
 
+    let reminders_page_size = render_reminders_pane(frame, app, cwd, reminders_area);
+
     let project_logs = app.project_logs(cwd);
     let logs_rows: Vec<Row> = if project_logs.is_empty() {
         vec![Row::new([Cell::from("No activity"), Cell::from("")])]
@@ -574,8 +696,10 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
 
     // The highlight, like the scrollbar and heading hint, only appears once
     // pagination is actually needed - a project whose activity fits on one
-    // page renders exactly as it did before this pane could scroll.
-    let selected = if paginated {
+    // page renders exactly as it did before this pane could scroll. The
+    // highlight additionally requires this pane to hold focus, now that the
+    // Reminders pane can hold it instead.
+    let selected = if paginated && matches!(app.modal_focus, ModalFocus::Logs) {
         Some(app.modal_logs_pagination.display_selected(project_logs.len()))
     } else {
         None
@@ -588,30 +712,103 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> usize {
         render_pagination_scrollbar(frame, logs_area, project_logs.len(), logs_top, logs_page_size);
     }
 
-    logs_page_size
+    (logs_page_size, reminders_page_size)
+}
+
+/// Renders the details modal's Reminders pane: that project's reminders,
+/// most recently updated first, paginated once they overflow the pane - see
+/// the "Project details modal" requirement. Unlike the Logs pane, its title
+/// never shows a pagination hint, always showing the `New [R]` create hint
+/// instead; and it always shows a highlighted selection (when it holds
+/// entries and focus) regardless of whether it's paginated, since it's
+/// interactive even with just one reminder. Returns its `page_size`.
+fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -> usize {
+    let now = now_ms();
+    let reminders = app.project_reminders(cwd);
+
+    let widths = [Constraint::Fill(2), Constraint::Length(9), Constraint::Fill(2)];
+
+    let bare_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let inner = bare_block.inner(area);
+    let page_size = inner.height as usize;
+
+    // This pane is only a third of the modal's top third, so its Status
+    // column has little room - a running reminder's "⏳ Running Xm, ETA:
+    // HH:MM" easily overflows it. Resolves the exact column widths the
+    // `Table` below will use (including its default 1-column spacing
+    // between columns, which a bare `Layout::split` doesn't apply on its
+    // own) and truncates to fit - the same technique used for the Agents
+    // tab's narrow columns (see `truncate_line`). No `Cell::highlight_symbol`
+    // is set on this table, so unlike ratatui's own column-width resolution
+    // there's no selection-width reservation to account for here.
+    let columns = Layout::horizontal(widths).spacing(1).split(inner);
+    let status_width = columns[2].width as usize;
+
+    let rows: Vec<Row> = if reminders.is_empty() {
+        vec![Row::new([Cell::from("No reminders"), Cell::from(""), Cell::from("")])]
+    } else {
+        reminders
+            .iter()
+            .map(|reminder| {
+                let (status_text, style) = reminder_status_cell_text_and_style(reminder, now, false);
+                let status_line = truncate_line(Line::from(Span::styled(status_text, style)), status_width);
+                Row::new([
+                    Cell::from(reminder.name.clone()),
+                    Cell::from(format!("{}m", reminder.duration_minutes)),
+                    Cell::from(status_line),
+                ])
+            })
+            .collect()
+    };
+
+    let block = bare_block.title("Reminders  |  New [R]");
+
+    let table = Table::new(rows, widths)
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
+        .block(block);
+
+    let focused = matches!(app.modal_focus, ModalFocus::Reminders);
+    let selected = if focused && !reminders.is_empty() {
+        Some(app.modal_reminders_pagination.display_selected(reminders.len()))
+    } else {
+        None
+    };
+    let top = app.modal_reminders_pagination.display_top(reminders.len(), page_size);
+    let mut state = TableState::default().with_selected(selected).with_offset(top);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if needs_pagination(reminders.len(), page_size) {
+        render_pagination_scrollbar(frame, area, reminders.len(), top, page_size);
+    }
+
+    page_size
 }
 
 /// Renders the keyboard-shortcuts help overlay - see the "Keyboard shortcuts
 /// help modal" requirement.
 fn render_help_modal(frame: &mut Frame) {
-    let area = centered_rect(60, 60, frame.area());
+    let area = centered_rect(70, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let text = [
-        "Tab       switch tabs",
-        "A / L     jump to Agents / Logs tab",
+        "Tab       switch tabs / modal pane focus",
+        "A / L / R jump to Agents / Logs / Reminders tab",
         "j / down  move selection down",
         "k / up    move selection up",
-        "d / PgDn  page down (Logs tab, or the details modal's Logs pane)",
-        "u / PgUp  page up (Logs tab, or the details modal's Logs pane)",
-        "g / G     jump to first / last entry (Logs tab, or the details modal's Logs pane)",
-        "Enter     open project details (Agents or Logs tab)",
-        "o         cycle log sort (Logs tab)",
-        "p         cycle project filter (Logs tab)",
-        "s         cycle status filter (Logs tab)",
-        "c         clear log filters (Logs tab)",
+        "d / PgDn  page down",
+        "u / PgUp  page up",
+        "g / G     jump to first / last entry",
+        "Enter     open details / start-stop a reminder",
+        "o         cycle sort",
+        "p         cycle project filter",
+        "s         cycle status filter / start-stop a reminder",
+        "f         cycle reminder status filter",
+        "c         clear filters",
+        "R         create a reminder (modal)",
+        "e         edit a reminder (modal)",
+        "Del/Bksp  delete a reminder (modal)",
         "?         toggle this help",
-        "Esc       close modal",
+        "Esc       close modal / form / dialog",
         "q         quit",
     ]
     .join("\n");
@@ -836,6 +1033,408 @@ fn test_run_status_cell_text_and_style(status: TestRunStatus, with_category_pref
     (text, style)
 }
 
+/// Renders the Reminders tab: every project's reminders, aggregated across
+/// all projects, filtered/sorted per `App`'s current state - see the
+/// "Reminders tab shows an aggregated, paginated reminder list" and
+/// "Reminders tab supports sorting and filtering" requirements.
+fn render_reminders_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) -> usize {
+    let header = Row::new(["PROJECT", "NAME", "DURATION", "STATUS", "UPDATED"]).style(Style::new().bold());
+
+    let now = now_ms();
+    let entries = app.visible_reminders();
+    let rows = entries.iter().map(|reminder| {
+        let (status_text, status_style) = reminder_status_cell_text_and_style(reminder, now, false);
+        Row::new([
+            Cell::from(project_name(&reminder.cwd)),
+            Cell::from(reminder.name.clone()),
+            Cell::from(format!("{}m", reminder.duration_minutes)),
+            Cell::from(Span::styled(status_text, status_style)),
+            Cell::from(format_last_updated(reminder.last_updated_ms)),
+        ])
+    });
+
+    let widths = [
+        Constraint::Fill(2),
+        Constraint::Fill(2),
+        Constraint::Length(9),
+        Constraint::Fill(2),
+        Constraint::Length(19),
+    ];
+
+    let bare_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let inner = bare_block.inner(area);
+    let page_size = inner.height.saturating_sub(1) as usize;
+
+    let controls = reminders_controls_hint(app, entries.len(), page_size);
+    let title = match banner {
+        Some(banner) => format!("Reminders - {banner}  |  {controls}"),
+        None => format!("Reminders - {controls}"),
+    };
+    let block = bare_block.title(title);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
+        .highlight_symbol("> ")
+        .block(block);
+
+    let selected = if entries.is_empty() {
+        None
+    } else {
+        Some(app.reminders_pagination.display_selected(entries.len()))
+    };
+    let top = app.reminders_pagination.display_top(entries.len(), page_size);
+    let mut state = TableState::default().with_selected(selected).with_offset(top);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if needs_pagination(entries.len(), page_size) {
+        render_pagination_scrollbar(frame, area, entries.len(), top, page_size);
+    }
+
+    if app.reminders.is_empty() || entries.is_empty() {
+        let message = if app.reminders.is_empty() {
+            "No reminders yet"
+        } else {
+            "No reminders match the current filter"
+        };
+        let message_area = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::new().fg(Color::DarkGray)),
+            message_area,
+        );
+    }
+
+    page_size
+}
+
+fn reminder_sort_label(sort: ReminderSort) -> &'static str {
+    match sort {
+        ReminderSort::Recency => "recency",
+        ReminderSort::Project => "project",
+        ReminderSort::Status => "status",
+    }
+}
+
+fn reminders_filter_state(app: &App) -> String {
+    match (&app.reminders_filter_project, &app.reminders_filter_status) {
+        (None, None) => "none".to_string(),
+        (Some(project), None) => format!("project={project}"),
+        (None, Some(status)) => format!("status={status}"),
+        (Some(project), Some(status)) => format!("project={project}, status={status}"),
+    }
+}
+
+/// The Reminders tab's always-visible sort/filter control hint - mirrors
+/// `logs_controls_hint`, except the status filter cycles on `f` rather than
+/// `s`, since `s` starts/stops the highlighted reminder here.
+fn reminders_controls_hint(app: &App, len: usize, page_size: usize) -> String {
+    let base = format!(
+        "Sort [o]: {}  |  Filter: {}.  Project [p]  Status [f]  Clear [c]  |  Start/Stop [s]",
+        reminder_sort_label(app.reminders_sort),
+        reminders_filter_state(app),
+    );
+    if needs_pagination(len, page_size) {
+        format!("Page [d/u]  Top/Bottom [g/G]  |  {base}")
+    } else {
+        base
+    }
+}
+
+/// Formats an elapsed duration for a reminder: like `format_running_duration`
+/// at or above a minute, except a duration landing exactly on a whole minute
+/// (no leftover seconds - always true for a natural completion, since it
+/// fires exactly at its duration) omits the trailing `00s` (e.g. `10m`
+/// rather than `10m00s`), matching the "Done 10m" / "Finished 10m" examples.
+fn format_reminder_duration_ms(elapsed_ms: u64) -> String {
+    let elapsed_secs = elapsed_ms / 1000;
+    let hours = elapsed_secs / 3600;
+    let minutes = (elapsed_secs % 3600) / 60;
+    let seconds = elapsed_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 && seconds == 0 {
+        format!("{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// A running reminder's estimated completion time, in the system's local
+/// timezone, formatted `HH:MM` (e.g. `12:34`) - the "ETA" shown alongside its
+/// live elapsed duration.
+fn format_reminder_eta(run_started_ms: u64, duration_minutes: u32) -> String {
+    let due_at_ms = run_started_ms + duration_minutes as u64 * 60_000;
+    let datetime = chrono::DateTime::from_timestamp_millis(due_at_ms as i64)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
+    datetime.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
+/// The Reminders tab/pane's STATUS cell: blank while not-yet-started,
+/// `⏳ Running <dur>, ETA: HH:MM` while running, `✅ Done <dur>` once done -
+/// see the "Reminders tab shows an aggregated, paginated reminder list"
+/// requirement. `with_category_prefix` adds "reminder" after the emoji, for
+/// cross-category views (the Agents tab's Reminders column); the top-level
+/// Reminders tab and the modal's Reminders pane both pass `false`, since each
+/// already dedicates its view to reminders.
+fn reminder_status_cell_text_and_style(reminder: &ReminderInfo, now_ms: u64, with_category_prefix: bool) -> (String, Style) {
+    let prefix = |emoji: &str| {
+        if with_category_prefix {
+            format!("{emoji} reminder")
+        } else {
+            emoji.to_string()
+        }
+    };
+    match reminder.status {
+        ReminderStatus::NotYetStarted => (String::new(), Style::new()),
+        ReminderStatus::Running => {
+            let started = reminder.run_started_ms.unwrap_or(now_ms);
+            let elapsed = format_reminder_duration_ms(now_ms.saturating_sub(started));
+            let eta = format_reminder_eta(started, reminder.duration_minutes);
+            (
+                format!("{} Running {elapsed}, ETA: {eta}", prefix("⏳")),
+                Style::new().fg(Color::Blue),
+            )
+        }
+        ReminderStatus::Done => {
+            let started = reminder.run_started_ms.unwrap_or(reminder.last_updated_ms);
+            let elapsed = format_reminder_duration_ms(reminder.last_updated_ms.saturating_sub(started));
+            (format!("{} Done {elapsed}", prefix("✅")), Style::new().fg(Color::Green))
+        }
+    }
+}
+
+/// Whether a now-`Done` reminder's most recent transition was a manual stop
+/// or a natural finish, reconstructed from the activity log the same way
+/// `log_completion_duration_ms` reconstructs a completion's duration - a
+/// `ReminderInfo` alone can't distinguish the two, since both set status to
+/// `Done`. Defaults to "completed" if no matching log entry is found.
+fn reminder_outcome_word(app: &App, reminder: &ReminderInfo) -> &'static str {
+    let matched = app
+        .logs
+        .iter()
+        .filter(|e| e.category == agentmon_proto::LogCategory::Reminder)
+        .filter(|e| e.working_dir == reminder.cwd)
+        .filter(|e| e.reminder_name.as_deref() == Some(reminder.name.as_str()))
+        .filter(|e| matches!(e.status.as_str(), "finished" | "stopped"))
+        .filter(|e| e.occurred_at_ms <= reminder.last_updated_ms)
+        .max_by_key(|e| e.occurred_at_ms);
+    match matched.map(|e| e.status.as_str()) {
+        Some("stopped") => "stopped",
+        _ => "completed",
+    }
+}
+
+/// Builds one reminder's segment for the Agents tab's REMINDERS column: a
+/// status emoji, its name in bold, and its duration/ETA or outcome - see the
+/// "Agents tab shows a Reminders column" requirement. No category-word
+/// prefix here (unlike the Agents/Tests columns): the column is narrow and
+/// already labeled REMINDERS, and the name itself is the primary content.
+fn reminder_agents_column_segment(reminder: &ReminderInfo, app: &App, now_ms: u64) -> Vec<Span<'static>> {
+    match reminder.status {
+        ReminderStatus::NotYetStarted => Vec::new(),
+        ReminderStatus::Running => {
+            let started = reminder.run_started_ms.unwrap_or(now_ms);
+            let elapsed = format_reminder_duration_ms(now_ms.saturating_sub(started));
+            let eta = format_reminder_eta(started, reminder.duration_minutes);
+            vec![
+                Span::styled("⏳ ", Style::new().fg(Color::Blue)),
+                Span::styled(reminder.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!(" {elapsed}, ETA {eta}")),
+            ]
+        }
+        ReminderStatus::Done => {
+            let started = reminder.run_started_ms.unwrap_or(reminder.last_updated_ms);
+            let elapsed = format_reminder_duration_ms(reminder.last_updated_ms.saturating_sub(started));
+            let outcome = reminder_outcome_word(app, reminder);
+            vec![
+                Span::styled("✅ ", Style::new().fg(Color::Green)),
+                Span::styled(reminder.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!(" {outcome}, {elapsed}")),
+            ]
+        }
+    }
+}
+
+/// Builds a project's REMINDERS cell: one segment per reminder with activity
+/// to show (not-yet-started reminders contribute nothing), most recently
+/// updated first (per `DirectoryGroup`'s own ordering), joined by " · " like
+/// the AGENTS cell.
+fn reminders_status_line(group: &DirectoryGroup, app: &App, now_ms: u64) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for reminder in &group.reminders {
+        let segment = reminder_agents_column_segment(reminder, app, now_ms);
+        if segment.is_empty() {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::raw(" · "));
+        }
+        spans.extend(segment);
+    }
+    Line::from(spans)
+}
+
+/// A `Line`'s combined display width, in terminal columns.
+fn line_width(line: &Line) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    line.spans.iter().map(|s| s.content.width()).sum()
+}
+
+/// A plain string's display width, in terminal columns.
+fn str_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// A dynamically-sized column's width for this frame: the widest content
+/// among `widths` (already-measured display widths for each row), floored
+/// at `header`'s own display width so a column with blank/short content
+/// still shows its header in full - see `render_agent_table`.
+fn content_need(widths: impl Iterator<Item = usize>, header: &str) -> u16 {
+    widths.max().unwrap_or(0).max(str_width(header)) as u16
+}
+
+/// Truncates `line`'s combined text to at most `max_width` terminal columns,
+/// appending a trailing `...` when it had to cut anything short - per the
+/// "Overflowing content is truncated with an ellipsis" requirement, applied
+/// to the Agents tab's AGENTS and REMINDERS columns and the details modal's
+/// Reminders pane. Measured in display width (via `unicode-width`), not
+/// `char` count: several status lines start with a double-width emoji, and
+/// budgeting by raw character count under-counts those by one column each,
+/// letting the truncated-plus-ellipsis text still overflow by that much once
+/// ratatui renders it. A `max_width` of `0` (not yet known, e.g. before the
+/// first render) is treated as "no limit" rather than truncating everything
+/// away.
+fn truncate_line(line: Line<'static>, max_width: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let total_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
+    if max_width == 0 || total_width <= max_width {
+        return line;
+    }
+    let budget = max_width.saturating_sub(3);
+    let mut remaining = budget;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if remaining == 0 {
+            break;
+        }
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w > remaining {
+                break;
+            }
+            text.push(c);
+            remaining -= w;
+        }
+        spans.push(Span::styled(text, span.style));
+    }
+    spans.push(Span::raw("..."));
+    Line::from(spans)
+}
+
+/// Renders the reminder creation/editing form overlay on top of the details
+/// modal - see "Reminder creation and editing form".
+/// Width of the field labels ("Name:     " / "Duration: "), so the cursor
+/// position below lines up with where each field's text actually starts.
+const REMINDER_FORM_LABEL_WIDTH: u16 = 10;
+
+fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
+    let area = centered_rect(50, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let title = match &form.mode {
+        ReminderFormMode::Create => "New Reminder",
+        ReminderFormMode::Edit(_) => "Edit Reminder",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+
+    let field_style = |field: ReminderFormField| {
+        if form.field == field {
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        }
+    };
+    let text = vec![
+        Line::from(vec![
+            Span::styled("Name:     ", field_style(ReminderFormField::Name)),
+            Span::raw(form.name.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Duration: ", field_style(ReminderFormField::Duration)),
+            Span::raw(format!("{}m", form.duration_minutes)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tab: switch field   Enter: save   Esc: cancel",
+            Style::new().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(text).block(block), area);
+
+    // Shows the terminal's own cursor at the end of the active field's
+    // typed text, right where the next keystroke will land.
+    let (row, field_len) = match form.field {
+        ReminderFormField::Name => (0, form.name.chars().count()),
+        ReminderFormField::Duration => (1, form.duration_minutes.chars().count()),
+    };
+    frame.set_cursor_position((inner.x + REMINDER_FORM_LABEL_WIDTH + field_len as u16, inner.y + row));
+}
+
+/// Renders the bold, red delete-confirmation dialog on top of the details
+/// modal - see "Reminder deletion confirmation".
+fn render_delete_reminder_confirm(frame: &mut Frame, app: &App, id: &agentmon_proto::ReminderId) {
+    let area = centered_rect(50, 20, frame.area());
+    frame.render_widget(Clear, area);
+
+    let name = app
+        .reminders
+        .iter()
+        .find(|r| &r.id == id)
+        .map(|r| r.name.as_str())
+        .unwrap_or("this reminder");
+
+    let text = vec![
+        Line::from(Span::styled(
+            format!("Delete \"{name}\"?"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter: delete   Esc: cancel",
+            Style::new().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .title(Span::styled(
+                    "Delete Reminder",
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,7 +1444,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn terminal() -> Terminal<TestBackend> {
-        Terminal::new(TestBackend::new(100, 10)).unwrap()
+        // Widened from 100 (pre-Reminders-column default) so the AGENTS and
+        // TESTS columns keep enough real width for their pre-existing test
+        // content now that a fifth REMINDERS column shares the row.
+        Terminal::new(TestBackend::new(120, 10)).unwrap()
     }
 
     fn agent_in(cwd: &str, id: &str, status: AgentStatus, host: HostContext, pid: u32, last_updated_ms: u64) -> AgentInfo {
@@ -1663,6 +2265,7 @@ mod tests {
             status: status.to_string(),
             occurred_at_ms,
             pid: Some(1),
+            reminder_name: None,
         }
     }
 
@@ -2436,7 +3039,12 @@ mod tests {
 
     #[test]
     fn details_modal_agents_pane_shows_each_agents_pid() {
-        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // Wider than the default 100: the Agents pane now shares the
+        // modal's top third with Tests and Reminders (a three-way split
+        // instead of the previous 50/50), so it needs more absolute width
+        // to fit this row's long duration text (`status_since_ms: 0` makes
+        // for a many-digit hour count) alongside the pid.
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 777_777, 0)], Vec::new());
         app.open_details_modal();
@@ -2462,6 +3070,7 @@ mod tests {
                 status: "done".to_string(),
                 occurred_at_ms: 1_000,
                 pid: Some(555_555),
+                reminder_name: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -2469,6 +3078,7 @@ mod tests {
                 status: "failed".to_string(),
                 occurred_at_ms: 2_000,
                 pid: Some(666_666),
+                reminder_name: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -2567,6 +3177,7 @@ mod tests {
                 status: "done".to_string(),
                 occurred_at_ms: 1_000,
                 pid: Some(555_555),
+                reminder_name: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -2574,6 +3185,7 @@ mod tests {
                 status: "failed".to_string(),
                 occurred_at_ms: 2_000,
                 pid: Some(666_666),
+                reminder_name: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -2610,6 +3222,7 @@ mod tests {
             status: "failed".to_string(),
             occurred_at_ms: 0,
             pid: Some(1),
+            reminder_name: None,
         };
         let long_entry = LogEntry {
             working_dir: PathBuf::from("/Users/beet/project"),
@@ -2617,6 +3230,7 @@ mod tests {
             status: "started".to_string(),
             occurred_at_ms: 5_000_000_000,
             pid: Some(555_555),
+            reminder_name: None,
         };
         app.apply_log_snapshot(vec![short_entry.clone(), long_entry.clone()]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -2777,5 +3391,584 @@ mod tests {
         assert!(text.contains("Keyboard Shortcuts"), "got:\n{text}");
         assert!(text.contains("quit"), "got:\n{text}");
         assert!(text.contains("g / G"), "expected the jump-to-first/last shortcut to be listed, got:\n{text}");
+    }
+
+    fn reminder_in(
+        cwd: &str,
+        id: &str,
+        name: &str,
+        status: agentmon_proto::ReminderStatus,
+        duration_minutes: u32,
+        run_started_ms: Option<u64>,
+        last_updated_ms: u64,
+    ) -> agentmon_proto::ReminderInfo {
+        agentmon_proto::ReminderInfo {
+            id: agentmon_proto::ReminderId(id.to_string()),
+            cwd: PathBuf::from(cwd),
+            name: name.to_string(),
+            duration_minutes,
+            status,
+            created_at_ms: 0,
+            run_started_ms,
+            last_updated_ms,
+        }
+    }
+
+    #[test]
+    fn reminders_tab_lists_reminders_across_projects() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new()); // marks the connection Connected
+        app.set_tab(Tab::Reminders);
+        app.apply_reminder_snapshot(vec![reminder_in(
+            "/tmp/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::NotYetStarted,
+            10,
+            None,
+            0,
+        )]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Check the build"), "got:\n{text}");
+        assert!(text.contains("10m"), "expected the duration column, got:\n{text}");
+    }
+
+    #[test]
+    fn reminders_tab_shows_a_blank_status_for_a_never_started_reminder() {
+        let entries = [reminder_in(
+            "/tmp/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::NotYetStarted,
+            10,
+            None,
+            0,
+        )];
+        let (text, _style) = reminder_status_cell_text_and_style(&entries[0], now_ms(), false);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn reminders_tab_shows_a_running_reminders_live_duration_and_eta() {
+        let now = 1_700_000_000_000u64;
+        let reminder = reminder_in(
+            "/tmp/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now - 83_000),
+            now - 83_000,
+        );
+
+        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now, false);
+
+        assert!(text.contains("Running"), "got: {text}");
+        assert!(text.contains("1m23s"), "got: {text}");
+        assert!(text.contains("ETA:"), "got: {text}");
+    }
+
+    #[test]
+    fn reminders_tab_shows_a_done_reminders_total_duration_without_seconds() {
+        let reminder = reminder_in(
+            "/tmp/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::Done,
+            10,
+            Some(0),
+            600_000, // exactly 10 minutes elapsed
+        );
+
+        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now_ms(), false);
+
+        assert_eq!(text, "✅ Done 10m");
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_shows_a_running_reminder() {
+        let mut term = terminal();
+        let mut app = App::new();
+        let now = now_ms();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, now)], Vec::new());
+        // A short name: the REMINDERS column is intentionally narrow (see
+        // "Overflowing content is truncated with an ellipsis"), and that
+        // truncation behavior has its own dedicated test below - this one
+        // just checks the reminder's name appears at all.
+        app.apply_reminder_snapshot(vec![reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "Build",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now),
+            now,
+        )]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Build"), "got:\n{text}");
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_truncates_with_an_ellipsis_on_a_narrow_terminal() {
+        // Even though REMINDERS is now sized dynamically to its content (see
+        // `content_need`), a single row's unusually long content is still
+        // capped at half the table's dynamic space so it can't dominate the
+        // row and starve every other column - this exercises that cap.
+        let mut term = terminal();
+        let mut app = App::new();
+        let now = now_ms();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, now)], Vec::new());
+        app.apply_reminder_snapshot(vec![reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "A very long reminder name that will not fit in the column",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now),
+            now,
+        )]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("A very long reminder name that will not fit in the column"),
+            "expected the long name to be truncated, got:\n{text}"
+        );
+        assert!(text.contains("..."), "expected a trailing ellipsis, got:\n{text}");
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_sizes_to_content_instead_of_a_fixed_ratio() {
+        // Regression test: previously REMINDERS was a fixed, narrow Fill(1)
+        // slice regardless of how little space Agents/Tests actually used,
+        // so a moderately long (but reasonable) reminder name got clipped
+        // even with plenty of unused whitespace elsewhere in the row. With
+        // dynamic sizing, a short Agents/Tests row frees that space up for
+        // Reminders to use instead.
+        let mut term = terminal();
+        let mut app = App::new();
+        let now = now_ms();
+        // A short agent status ("idle") leaves the AGENTS column with very
+        // little real content, unlike the wide multi-segment rows other
+        // tests use.
+        app.apply_snapshot(vec![agent("a", AgentStatus::Idle, HostContext::Terminal, 1, now)], Vec::new());
+        let reminder_name = "Check the nightly build";
+        app.apply_reminder_snapshot(vec![reminder_in(
+            "/Users/beet/project",
+            "r1",
+            reminder_name,
+            agentmon_proto::ReminderStatus::Done,
+            10,
+            Some(now - 600_000),
+            now,
+        )]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains(reminder_name),
+            "expected the full reminder name to fit once Agents/Tests freed up their unused space, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_is_empty_for_a_project_with_no_reminders() {
+        let group = DirectoryGroup {
+            cwd: PathBuf::from("/tmp/project"),
+            agents: vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)],
+            test_runs: Vec::new(),
+            reminders: Vec::new(),
+        };
+        let app = App::new();
+
+        let line = reminders_status_line(&group, &app, now_ms());
+
+        assert!(line.spans.is_empty());
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_shows_multiple_reminders_bullet_separated() {
+        let group = DirectoryGroup {
+            cwd: PathBuf::from("/tmp/project"),
+            agents: Vec::new(),
+            test_runs: Vec::new(),
+            reminders: vec![
+                reminder_in(
+                    "/tmp/project",
+                    "r1",
+                    "First",
+                    agentmon_proto::ReminderStatus::Running,
+                    10,
+                    Some(0),
+                    0,
+                ),
+                reminder_in(
+                    "/tmp/project",
+                    "r2",
+                    "Second",
+                    agentmon_proto::ReminderStatus::Done,
+                    10,
+                    Some(0),
+                    600_000,
+                ),
+            ],
+        };
+        let app = App::new();
+
+        let line = reminders_status_line(&group, &app, 1_000);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(text.contains("First"), "got: {text}");
+        assert!(text.contains("Second"), "got: {text}");
+        assert!(text.contains(" · "), "expected a bullet separator between reminders, got: {text}");
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_distinguishes_completed_from_stopped() {
+        let app_with_log = |status: &str| {
+            let mut app = App::new();
+            app.apply_log_snapshot(vec![LogEntry {
+                working_dir: PathBuf::from("/tmp/project"),
+                category: agentmon_proto::LogCategory::Reminder,
+                status: status.to_string(),
+                occurred_at_ms: 500,
+                pid: None,
+                reminder_name: Some("Check the build".to_string()),
+            }]);
+            app
+        };
+        let reminder = reminder_in(
+            "/tmp/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::Done,
+            10,
+            Some(0),
+            500,
+        );
+
+        assert_eq!(reminder_outcome_word(&app_with_log("finished"), &reminder), "completed");
+        assert_eq!(reminder_outcome_word(&app_with_log("stopped"), &reminder), "stopped");
+    }
+
+    #[test]
+    fn truncate_line_appends_an_ellipsis_when_content_overflows() {
+        let line = Line::from(vec![Span::raw("hello world")]);
+
+        let truncated = truncate_line(line.clone(), 8);
+
+        let text: String = truncated.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with("..."), "got: {text}");
+        assert!(text.chars().count() <= 8, "got: {text}");
+    }
+
+    #[test]
+    fn truncate_line_leaves_content_that_already_fits_unchanged() {
+        let line = Line::from(vec![Span::raw("short")]);
+
+        let truncated = truncate_line(line.clone(), 20);
+
+        let text: String = truncated.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "short");
+    }
+
+    #[test]
+    fn details_modal_shows_the_reminders_pane_with_the_create_hint() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("New [R]"), "got:\n{text}");
+        assert!(text.contains("No reminders"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_reminders_pane_lists_the_projects_reminders() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.apply_reminder_update(reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::NotYetStarted,
+            10,
+            None,
+            0,
+        ));
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Check the build"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_reminders_pane_shows_the_duration_after_the_name() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.apply_reminder_update(reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::NotYetStarted,
+            10,
+            None,
+            0,
+        ));
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (name_x, name_y) = find_text(buffer, "Check the build").expect("expected the reminder's name");
+        let (duration_x, duration_y) = find_text_from(buffer, "10m", name_y).expect("expected the duration");
+        assert_eq!(duration_y, name_y, "the duration should be on the same row as the name");
+        assert!(duration_x > name_x, "the duration should come after the name");
+    }
+
+    #[test]
+    fn details_modal_reminders_pane_truncates_a_running_reminders_status_instead_of_overflowing() {
+        // Regression test: the Reminders pane is only a third of the
+        // modal's top third, so a running reminder's "Running Xm, ETA:
+        // HH:MM" status must be truncated to fit rather than spilling past
+        // the pane's right border.
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        let now = now_ms();
+        app.apply_reminder_update(reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now - 83_000),
+            now - 83_000,
+        ));
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("Running 1m23s, ETA:"),
+            "the full status text should be truncated rather than rendered in full, got:\n{text}"
+        );
+        assert!(text.contains("..."), "expected a trailing ellipsis on the truncated status, got:\n{text}");
+
+        // No row extends past the modal's own right border: every "│"
+        // border character in the modal's row band should still be the
+        // rightmost non-blank glyph on its row.
+        let buffer = term.backend().buffer();
+        let (modal_right_border_x, top_y) =
+            find_text(buffer, "╮").expect("expected the modal's top-right corner");
+        for y in top_y..(top_y + 10) {
+            let cell = &buffer[(modal_right_border_x, y)];
+            assert!(
+                cell.symbol() == "│" || cell.symbol() == "╮" || cell.symbol() == "╯",
+                "expected the modal's right border at ({modal_right_border_x}, {y}), got {:?}",
+                cell.symbol()
+            );
+        }
+    }
+
+    #[test]
+    fn reminder_log_entry_shows_the_clock_marker_and_the_reminder_name() {
+        let entry = LogEntry {
+            working_dir: PathBuf::from("/tmp/project"),
+            category: agentmon_proto::LogCategory::Reminder,
+            status: "finished".to_string(),
+            occurred_at_ms: 1,
+            pid: None,
+            reminder_name: Some("Check the build".to_string()),
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(text.contains('⏰'), "got: {text}");
+        assert!(text.contains("Check the build"), "got: {text}");
+    }
+
+    fn reminder_log(status: &str, name: &str, occurred_at_ms: u64) -> LogEntry {
+        LogEntry {
+            working_dir: PathBuf::from("/tmp/project"),
+            category: agentmon_proto::LogCategory::Reminder,
+            status: status.to_string(),
+            occurred_at_ms,
+            pid: None,
+            reminder_name: Some(name.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_finished_reminder_shows_its_elapsed_duration() {
+        let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("finished", "Check the build", 600_000)];
+
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1]);
+
+        assert!(text.contains("10m"), "expected the elapsed duration, got: {text}");
+        assert!(!text.contains("10m00s"), "reminder durations should drop trailing 00s, got: {text}");
+    }
+
+    #[test]
+    fn a_stopped_reminder_shows_its_elapsed_duration() {
+        let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("stopped", "Check the build", 83_000)];
+
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1]);
+
+        assert!(text.contains("1m23s"), "expected the elapsed duration, got: {text}");
+    }
+
+    #[test]
+    fn a_started_reminder_shows_no_duration() {
+        let all_logs = vec![reminder_log("started", "Check the build", 0)];
+
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[0]);
+
+        assert_eq!(
+            text, "⏰ reminder started: Check the build",
+            "a started entry should show no duration"
+        );
+    }
+
+    #[test]
+    fn interleaved_reminders_in_the_same_project_do_not_cross_match_durations() {
+        // Two different reminders in the same project, started/finished out
+        // of order - the "finished" duration must be measured from its own
+        // reminder's "started" entry, not the other one's.
+        let all_logs = vec![
+            reminder_log("started", "First", 0),
+            reminder_log("started", "Second", 10_000),
+            reminder_log("finished", "Second", 70_000),
+            reminder_log("finished", "First", 600_000),
+        ];
+
+        let (first_text, _) = log_entry_status_line(&all_logs, &all_logs[3]);
+        let (second_text, _) = log_entry_status_line(&all_logs, &all_logs[2]);
+
+        assert!(first_text.contains("10m"), "First ran for 10m (600_000ms from t=0), got: {first_text}");
+        assert!(second_text.contains("1m"), "Second ran for 1m (60_000ms from t=10_000), got: {second_text}");
+    }
+
+    #[test]
+    fn reminder_log_entry_uses_the_clock_marker_regardless_of_status() {
+        for status in ["started", "stopped", "finished"] {
+            let (text, _style) = log_status_cell_text_and_style(agentmon_proto::LogCategory::Reminder, status);
+            assert!(text.starts_with('⏰'), "status {status} got: {text}");
+        }
+    }
+
+    #[test]
+    fn reminder_log_entry_colors_differ_by_status() {
+        let (_, started_style) = log_status_cell_text_and_style(agentmon_proto::LogCategory::Reminder, "started");
+        let (_, stopped_style) = log_status_cell_text_and_style(agentmon_proto::LogCategory::Reminder, "stopped");
+        let (_, finished_style) = log_status_cell_text_and_style(agentmon_proto::LogCategory::Reminder, "finished");
+
+        assert_eq!(finished_style.fg, Some(Color::Green), "a natural completion should be green");
+        assert_eq!(stopped_style.fg, Some(Color::Yellow), "a manual stop should be yellow");
+        assert_eq!(started_style.fg, Some(Color::Blue));
+        assert_ne!(stopped_style.fg, started_style.fg, "stopped must be visually distinct from started");
+        assert_ne!(stopped_style.fg, finished_style.fg, "stopped must be visually distinct from finished");
+    }
+
+    #[test]
+    fn reminder_delete_confirmation_dialog_names_the_reminder_in_red_bold() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.apply_reminder_update(reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::NotYetStarted,
+            10,
+            None,
+            0,
+        ));
+        app.open_details_modal();
+        app.open_delete_reminder_confirm();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Delete \"Check the build\"?"), "got:\n{text}");
+        // Searches for the dialog's own full line (rather than just "Check
+        // the build", which also appears - unstyled - in the modal's
+        // Reminders pane behind the dialog) so the style check lands on the
+        // dialog's own red text, not the background pane's.
+        let (x, y) = find_text(term.backend().buffer(), "Delete \"Check the build\"?")
+            .expect("expected the dialog's own line");
+        let cell = term.backend().buffer().cell((x, y)).unwrap();
+        assert!(cell.style().fg == Some(Color::Red), "the dialog text should be red");
+    }
+
+    #[test]
+    fn reminder_form_renders_its_fields_and_hint() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('X');
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("New Reminder"), "got:\n{text}");
+        assert!(text.contains("Name:"), "got:\n{text}");
+        assert!(text.contains("Duration:"), "got:\n{text}");
+        assert!(text.contains("Enter: save"), "got:\n{text}");
+    }
+
+    #[test]
+    fn reminder_form_shows_the_cursor_at_the_end_of_the_active_fields_text() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('X');
+        app.reminder_form_input_char('Y');
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let (name_x, name_y) =
+            find_text(term.backend().buffer(), "Name:").expect("expected the Name label");
+        let cursor = term.get_cursor_position().expect("cursor position should be set");
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position { x: name_x + REMINDER_FORM_LABEL_WIDTH + 2, y: name_y },
+            "cursor should sit right after the two typed characters on the Name line"
+        );
+
+        app.toggle_reminder_form_field();
+        app.reminder_form_input_char('5');
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let (duration_x, duration_y) =
+            find_text(term.backend().buffer(), "Duration:").expect("expected the Duration label");
+        let cursor = term.get_cursor_position().expect("cursor position should be set");
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position { x: duration_x + REMINDER_FORM_LABEL_WIDTH + 1, y: duration_y },
+            "cursor should sit right after the typed digit, before the trailing 'm'"
+        );
     }
 }

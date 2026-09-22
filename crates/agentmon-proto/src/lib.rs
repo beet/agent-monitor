@@ -123,6 +123,7 @@ pub struct AgentInfo {
 pub enum LogCategory {
     Agent,
     TestRun,
+    Reminder,
 }
 
 /// One notification-worthy event recorded in the daemon's bounded activity
@@ -138,8 +139,48 @@ pub struct LogEntry {
     /// Unix epoch milliseconds of when this event occurred.
     pub occurred_at_ms: u64,
     /// The reporting process id, when known. Populated for agent-category
-    /// entries; test-run entries may leave this `None`.
+    /// entries; test-run and reminder entries leave this `None`.
     pub pid: Option<u32>,
+    /// The reminder's name as of this event. Populated only for
+    /// reminder-category entries, so a later-deleted reminder's past entries
+    /// keep showing the name it had when each was recorded.
+    pub reminder_name: Option<String>,
+}
+
+/// Identifies a reminder across client commands and daemon updates.
+/// Daemon-generated - unlike `SessionId`, nothing gives a client a natural
+/// identity for a reminder before the daemon creates it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReminderId(pub String);
+
+/// Lifecycle status of a tracked reminder, per the reminders spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderStatus {
+    NotYetStarted,
+    Running,
+    Done,
+}
+
+/// The daemon's view of a tracked reminder, as sent to clients. Mirrors
+/// `TestRunInfo`'s `run_started_ms`/`last_updated_ms` pair so elapsed/duration
+/// math is identical: running elapsed = now - `run_started_ms`; done elapsed
+/// = `last_updated_ms` - `run_started_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReminderInfo {
+    pub id: ReminderId,
+    pub cwd: PathBuf,
+    pub name: String,
+    pub duration_minutes: u32,
+    pub status: ReminderStatus,
+    /// Unix epoch milliseconds of when this reminder was created.
+    pub created_at_ms: u64,
+    /// Unix epoch milliseconds of this reminder's most recent start. `None`
+    /// until it has been started at least once.
+    pub run_started_ms: Option<u64>,
+    /// Unix epoch milliseconds of the last started/stopped/finished event,
+    /// or `created_at_ms` if it has never been started.
+    pub last_updated_ms: u64,
 }
 
 /// The first message a connection sends, telling the daemon whether it is a
@@ -157,6 +198,29 @@ pub enum ClientMessage {
         status: TestRunStatus,
     },
     Subscribe,
+    /// Creates a new reminder for `cwd`. The daemon assigns its `ReminderId`
+    /// and broadcasts the result as a `ReminderUpdate` - there is no
+    /// synchronous reply, matching `ReportEvent`/`ReportTestRun`'s
+    /// fire-and-forget shape.
+    CreateReminder {
+        cwd: PathBuf,
+        name: String,
+        duration_minutes: u32,
+    },
+    /// Changes an existing reminder's name and/or duration, regardless of its
+    /// current status.
+    UpdateReminder {
+        id: ReminderId,
+        name: String,
+        duration_minutes: u32,
+    },
+    /// Removes a reminder regardless of its current status. Does not affect
+    /// any activity log entry already recorded for it.
+    DeleteReminder { id: ReminderId },
+    /// Starts a reminder - fresh, or as a re-run of one already done.
+    StartReminder { id: ReminderId },
+    /// Stops a running reminder. Does not send a notification.
+    StopReminder { id: ReminderId },
 }
 
 /// A message sent from the daemon to a connected client (e.g. the TUI).
@@ -169,6 +233,8 @@ pub enum ServerMessage {
         test_runs: Vec<TestRunInfo>,
         /// The activity log's current entries, in the order they occurred.
         logs: Vec<LogEntry>,
+        /// Every currently tracked reminder, across all projects.
+        reminders: Vec<ReminderInfo>,
     },
     /// An incremental update to a single agent's state.
     AgentUpdate { agent: AgentInfo },
@@ -180,6 +246,12 @@ pub enum ServerMessage {
     /// took over its pid (`/clear`) - and should be dropped from a client's
     /// local state rather than lingering as a frozen duplicate.
     AgentRemoved { session_id: SessionId },
+    /// An incremental update to a single reminder's state - created, edited,
+    /// started, stopped, or completed.
+    ReminderUpdate { reminder: ReminderInfo },
+    /// A reminder has been deleted and should be dropped from a client's
+    /// local state.
+    ReminderRemoved { id: ReminderId },
 }
 
 #[cfg(test)]
@@ -264,6 +336,20 @@ mod tests {
             status: "done".to_string(),
             occurred_at_ms: 1_700_000_000_000,
             pid: Some(4242),
+            reminder_name: None,
+        }
+    }
+
+    fn sample_reminder() -> ReminderInfo {
+        ReminderInfo {
+            id: ReminderId("reminder-1".to_string()),
+            cwd: PathBuf::from("/Users/beet/Documents/Projects/enclaudinate"),
+            name: "Check the build".to_string(),
+            duration_minutes: 10,
+            status: ReminderStatus::Running,
+            created_at_ms: 1_700_000_000_000,
+            run_started_ms: Some(1_700_000_000_000),
+            last_updated_ms: 1_700_000_000_000,
         }
     }
 
@@ -273,6 +359,129 @@ mod tests {
             agents: vec![sample_agent()],
             test_runs: vec![sample_test_run()],
             logs: vec![sample_log_entry()],
+            reminders: vec![sample_reminder()],
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn reminder_info_round_trips_through_json() {
+        let info = sample_reminder();
+
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: ReminderInfo = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(info, decoded);
+    }
+
+    #[test]
+    fn reminder_status_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ReminderStatus::NotYetStarted).unwrap(),
+            "\"not_yet_started\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReminderStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReminderStatus::Done).unwrap(),
+            "\"done\""
+        );
+    }
+
+    #[test]
+    fn log_category_reminder_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LogCategory::Reminder).unwrap(),
+            "\"reminder\""
+        );
+    }
+
+    #[test]
+    fn reminder_log_entry_round_trips_with_its_name() {
+        let entry = LogEntry {
+            category: LogCategory::Reminder,
+            status: "finished".to_string(),
+            pid: None,
+            reminder_name: Some("Check the build".to_string()),
+            ..sample_log_entry()
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, decoded);
+        assert_eq!(decoded.reminder_name.as_deref(), Some("Check the build"));
+    }
+
+    #[test]
+    fn client_message_create_reminder_round_trips_through_json() {
+        let message = ClientMessage::CreateReminder {
+            cwd: PathBuf::from("/tmp/project"),
+            name: "Check the build".to_string(),
+            duration_minutes: 10,
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn client_message_update_reminder_round_trips_through_json() {
+        let message = ClientMessage::UpdateReminder {
+            id: ReminderId("reminder-1".to_string()),
+            name: "Check the deploy".to_string(),
+            duration_minutes: 15,
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn client_message_delete_start_stop_reminder_round_trip_through_json() {
+        for message in [
+            ClientMessage::DeleteReminder {
+                id: ReminderId("reminder-1".to_string()),
+            },
+            ClientMessage::StartReminder {
+                id: ReminderId("reminder-1".to_string()),
+            },
+            ClientMessage::StopReminder {
+                id: ReminderId("reminder-1".to_string()),
+            },
+        ] {
+            let json = serde_json::to_string(&message).unwrap();
+            let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(message, decoded);
+        }
+    }
+
+    #[test]
+    fn server_message_reminder_update_round_trips_through_json() {
+        let message = ServerMessage::ReminderUpdate {
+            reminder: sample_reminder(),
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn server_message_reminder_removed_round_trips_through_json() {
+        let message = ServerMessage::ReminderRemoved {
+            id: ReminderId("reminder-1".to_string()),
         };
 
         let json = serde_json::to_string(&message).unwrap();

@@ -14,6 +14,11 @@ pub trait Notifier: Send + Sync {
     /// existing implementors (e.g. test doubles that don't care about test
     /// runs) don't need to change.
     fn notify_test_run(&self, _cwd: &Path, _status: TestRunStatus) {}
+
+    /// Notifies that a reminder completed on its own (its elapsed time
+    /// reached its duration) - never sent for a manual stop. Defaults to a
+    /// no-op, matching `notify_test_run`.
+    fn notify_reminder(&self, _cwd: &Path, _name: &str) {}
 }
 
 /// Sends a macOS notification banner via `osascript`.
@@ -36,6 +41,30 @@ impl Notifier for OsaScriptNotifier {
             eprintln!("agentd: failed to send test-run notification: {err}");
         }
     }
+
+    fn notify_reminder(&self, cwd: &Path, name: &str) {
+        let script = reminder_notification_script(cwd, name);
+        if let Err(err) = Command::new("osascript").arg("-e").arg(script).status() {
+            eprintln!("agentd: failed to send reminder notification: {err}");
+        }
+    }
+}
+
+/// Builds the `osascript` AppleScript for a reminder's natural completion.
+/// `Blow` is distinct from `Glass`/`Ping` (agent) and `Pop`/`Tink`/`Basso`
+/// (test-run), so a reminder notification is never confused with either by
+/// ear.
+fn reminder_notification_script(cwd: &Path, name: &str) -> String {
+    let project = cwd
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.display().to_string());
+    format!(
+        "display notification {} with title {} sound name {}",
+        applescript_literal(&format!("{project}: {name}")),
+        applescript_literal("agentmon"),
+        applescript_literal("Blow")
+    )
 }
 
 /// Builds the `osascript` AppleScript for a test-run event. `Pop` (started),
@@ -186,6 +215,25 @@ mod tests {
         assert!(
             script.contains("project"),
             "script did not mention the project directory: {script}"
+        );
+    }
+
+    #[test]
+    fn reminder_notification_script_uses_blow_sound() {
+        let script = reminder_notification_script(&PathBuf::from("/tmp/project"), "Check the build");
+        assert!(
+            script.ends_with("sound name \"Blow\""),
+            "script did not end with the Blow sound clause: {script}"
+        );
+    }
+
+    #[test]
+    fn reminder_notification_script_identifies_the_project_and_name() {
+        let script = reminder_notification_script(&PathBuf::from("/tmp/project"), "Check the build");
+        assert!(script.contains("project"), "script did not mention the project: {script}");
+        assert!(
+            script.contains("Check the build"),
+            "script did not mention the reminder name: {script}"
         );
     }
 

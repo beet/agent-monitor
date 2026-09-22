@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use agentmon_proto::{AgentInfo, LogEntry, SessionId, TestRunInfo};
+use agentmon_proto::{
+    AgentInfo, ClientMessage, LogEntry, ReminderId, ReminderInfo, ReminderStatus, SessionId, TestRunInfo,
+};
 
 /// A paginated list's selection and scroll-window state - shared by the Logs
 /// tab and the details modal's Logs pane so their `j`/`k`/`d`/`u` behavior
@@ -132,6 +134,8 @@ pub fn needs_pagination(len: usize, page_size: usize) -> bool {
 pub struct PageSizes {
     pub logs_tab: usize,
     pub modal_logs: usize,
+    pub reminders_tab: usize,
+    pub modal_reminders: usize,
 }
 
 /// Which tab is currently shown - see the "Tab navigation between Agents and
@@ -140,6 +144,7 @@ pub struct PageSizes {
 pub enum Tab {
     Agents,
     Logs,
+    Reminders,
 }
 
 /// How the Logs tab orders its entries - see "Logs tab supports sorting and
@@ -151,12 +156,60 @@ pub enum LogSort {
     Status,
 }
 
+/// How the Reminders tab orders its entries - see "Reminders tab supports
+/// sorting and filtering". `Recency` uses each reminder's last *completed*
+/// run (stop or finish), unlike the Updated column which also counts a bare
+/// start - see `reminder_recency_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderSort {
+    Recency,
+    Project,
+    Status,
+}
+
 /// A modal overlay drawn on top of the active tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     /// The working directory of the project whose details are shown.
     Details(PathBuf),
     Help,
+}
+
+/// Which of the details modal's two interactive panes (Logs, Reminders)
+/// currently holds keyboard focus - see the "Project details modal"
+/// requirement's `Tab`-toggled focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalFocus {
+    Logs,
+    Reminders,
+}
+
+/// Whether the open reminder form is creating a new reminder or editing an
+/// existing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReminderFormMode {
+    Create,
+    Edit(ReminderId),
+}
+
+/// Which field of the reminder form currently has input focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderFormField {
+    Name,
+    Duration,
+}
+
+/// The reminder creation/editing form's in-progress state - see "Reminder
+/// creation and editing form". Only meaningful while the details modal is
+/// open; `cwd` is the project the reminder belongs (or will belong) to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderForm {
+    pub mode: ReminderFormMode,
+    pub cwd: PathBuf,
+    pub name: String,
+    /// Raw digit-only text buffer; parsed to `u32` on submit.
+    pub duration_minutes: String,
+    pub field: ReminderFormField,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,16 +230,30 @@ pub struct DirectoryGroup {
     pub cwd: PathBuf,
     pub agents: Vec<AgentInfo>,
     pub test_runs: Vec<TestRunInfo>,
+    /// This project's reminders, most recently updated first. Only attached
+    /// to a group that already exists because of tracked agents or test
+    /// runs - a project with reminders but neither does not get an Agents
+    /// tab row of its own.
+    pub reminders: Vec<ReminderInfo>,
 }
 
 impl DirectoryGroup {
     /// The most recent `last_updated_ms` among this group's members, used to
     /// order groups relative to one another and, in the TUI, as the
-    /// project's rendered UPDATED time.
+    /// project's rendered UPDATED time. Reminders count too: a reminder's
+    /// `last_updated_ms` already reflects its most recent started/stopped/
+    /// finished event (or creation time if it has none), the same "last
+    /// activity" meaning `last_updated_ms` carries for agents and test runs.
     pub fn most_recent_update_ms(&self) -> u64 {
         let agents_max = self.agents.iter().map(|a| a.last_updated_ms).max();
         let test_runs_max = self.test_runs.iter().map(|t| t.last_updated_ms).max();
-        agents_max.into_iter().chain(test_runs_max).max().unwrap_or(0)
+        let reminders_max = self.reminders.iter().map(|r| r.last_updated_ms).max();
+        agents_max
+            .into_iter()
+            .chain(test_runs_max)
+            .chain(reminders_max)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -208,6 +275,30 @@ pub struct App {
     /// The details modal's Logs pane's own selection/scroll state, separate
     /// from the Logs tab's - reset whenever `open_details_modal` runs.
     pub modal_logs_pagination: Paginator,
+    pub reminders: Vec<ReminderInfo>,
+    pub reminders_pagination: Paginator,
+    pub reminders_sort: ReminderSort,
+    pub reminders_filter_project: Option<String>,
+    pub reminders_filter_status: Option<String>,
+    /// Which of the details modal's Logs/Reminders panes currently holds
+    /// keyboard focus.
+    pub modal_focus: ModalFocus,
+    /// The details modal's Reminders pane's own selection/scroll state,
+    /// separate from the Reminders tab's - reset whenever
+    /// `open_details_modal` runs.
+    pub modal_reminders_pagination: Paginator,
+    /// The reminder creation/editing form, when open.
+    pub reminder_form: Option<ReminderForm>,
+    /// The reminder the delete-confirmation dialog is asking about, when
+    /// open.
+    pub confirm_delete_reminder: Option<ReminderId>,
+    /// Set when a `CreateReminder` command has been sent but the daemon
+    /// hasn't yet confirmed it with a matching `ReminderUpdate` - the
+    /// daemon assigns the id, so this is how `apply_reminder_update`
+    /// recognizes "this is the one I just created" to highlight and
+    /// auto-start it. Cleared once matched, or overwritten by a later
+    /// create before this one is confirmed.
+    pending_new_reminder: Option<(PathBuf, String)>,
 }
 
 impl App {
@@ -225,6 +316,16 @@ impl App {
             logs_filter_status: None,
             modal: None,
             modal_logs_pagination: Paginator::default(),
+            reminders: Vec::new(),
+            reminders_pagination: Paginator::default(),
+            reminders_sort: ReminderSort::Recency,
+            reminders_filter_project: None,
+            reminders_filter_status: None,
+            modal_focus: ModalFocus::Logs,
+            modal_reminders_pagination: Paginator::default(),
+            reminder_form: None,
+            confirm_delete_reminder: None,
+            pending_new_reminder: None,
         }
     }
 
@@ -308,6 +409,7 @@ impl App {
                     cwd: agent.cwd.clone(),
                     agents: Vec::new(),
                     test_runs: Vec::new(),
+                    reminders: Vec::new(),
                 })
                 .agents
                 .push(agent.clone());
@@ -320,25 +422,38 @@ impl App {
                     cwd: test_run.cwd.clone(),
                     agents: Vec::new(),
                     test_runs: Vec::new(),
+                    reminders: Vec::new(),
                 })
                 .test_runs
                 .push(test_run.clone());
+        }
+
+        // Attaches to an already-existing group only - a project with
+        // reminders but no tracked agent or test run does not get an Agents
+        // tab row of its own, per the "Agents tab shows a Reminders column"
+        // requirement.
+        for reminder in &self.reminders {
+            if let Some(group) = groups.get_mut(&reminder.cwd) {
+                group.reminders.push(reminder.clone());
+            }
         }
 
         let mut groups: Vec<DirectoryGroup> = groups.into_values().collect();
         for group in &mut groups {
             group.agents.sort_by_key(|a| std::cmp::Reverse(a.last_updated_ms));
             group.test_runs.sort_by_key(|t| std::cmp::Reverse(t.last_updated_ms));
+            group.reminders.sort_by_key(|r| std::cmp::Reverse(r.last_updated_ms));
         }
         groups.sort_by_key(|g| std::cmp::Reverse(g.most_recent_update_ms()));
         groups
     }
 
-    /// Cycles between the Agents and Logs tabs.
+    /// Cycles through the Agents, Logs, and Reminders tabs in order.
     pub fn cycle_tab(&mut self) {
         self.active_tab = match self.active_tab {
             Tab::Agents => Tab::Logs,
-            Tab::Logs => Tab::Agents,
+            Tab::Logs => Tab::Reminders,
+            Tab::Reminders => Tab::Agents,
         };
     }
 
@@ -370,11 +485,35 @@ impl App {
                 .visible_logs()
                 .get(self.logs_pagination.selected)
                 .map(|entry| entry.working_dir.clone()),
+            Tab::Reminders => self
+                .visible_reminders()
+                .get(self.reminders_pagination.selected)
+                .map(|r| r.cwd.clone()),
         };
-        if let Some(cwd) = cwd {
-            self.modal_logs_pagination.reset();
-            self.modal = Some(Modal::Details(cwd));
+        let Some(cwd) = cwd else { return };
+
+        self.modal_logs_pagination.reset();
+        self.modal_reminders_pagination.reset();
+
+        if self.active_tab == Tab::Reminders {
+            self.modal_focus = ModalFocus::Reminders;
+            // Highlights the reminder that was selected in the Reminders
+            // tab within the modal's own Reminders pane, per "Opening a
+            // project's details from the Reminders tab".
+            if let Some(selected_id) = self
+                .visible_reminders()
+                .get(self.reminders_pagination.selected)
+                .map(|r| r.id.clone())
+            {
+                if let Some(index) = self.project_reminders(&cwd).iter().position(|r| r.id == selected_id) {
+                    self.modal_reminders_pagination.selected = index;
+                }
+            }
+        } else {
+            self.modal_focus = ModalFocus::Logs;
         }
+
+        self.modal = Some(Modal::Details(cwd));
     }
 
     pub fn open_help_modal(&mut self) {
@@ -383,6 +522,17 @@ impl App {
 
     pub fn close_modal(&mut self) {
         self.modal = None;
+        self.reminder_form = None;
+        self.confirm_delete_reminder = None;
+    }
+
+    /// Toggles which of the details modal's Logs/Reminders panes currently
+    /// holds keyboard focus - the `Tab` key while the modal is open.
+    pub fn toggle_modal_focus(&mut self) {
+        self.modal_focus = match self.modal_focus {
+            ModalFocus::Logs => ModalFocus::Reminders,
+            ModalFocus::Reminders => ModalFocus::Logs,
+        };
     }
 
     /// The activity log's entries after applying the current filter and
@@ -528,6 +678,371 @@ impl App {
         self.logs_filter_project = None;
         self.logs_filter_status = None;
         self.clamp_logs_selected();
+    }
+
+    /// Replaces the tracked reminders with the daemon's current snapshot.
+    pub fn apply_reminder_snapshot(&mut self, reminders: Vec<ReminderInfo>) {
+        self.reminders = reminders;
+        self.clamp_reminders_selected();
+    }
+
+    /// Inserts a newly-created reminder, or updates one already shown -
+    /// covers edits, starts, stops, and completions. Returns the reminder's
+    /// id if this update is the daemon's confirmation of a reminder just
+    /// created via the form (see `pending_new_reminder`) - the caller
+    /// (main.rs) then sends a `StartReminder` for it, so creating a
+    /// reminder highlights and starts it in one motion rather than
+    /// requiring a separate `s` afterward.
+    pub fn apply_reminder_update(&mut self, reminder: ReminderInfo) -> Option<ReminderId> {
+        let is_new = !self.reminders.iter().any(|r| r.id == reminder.id);
+        let just_created = is_new
+            && self.pending_new_reminder.as_ref() == Some(&(reminder.cwd.clone(), reminder.name.clone()));
+
+        match self.reminders.iter_mut().find(|r| r.id == reminder.id) {
+            Some(existing) => *existing = reminder.clone(),
+            None => self.reminders.push(reminder.clone()),
+        }
+        self.clamp_reminders_selected();
+
+        if !just_created {
+            return None;
+        }
+        self.pending_new_reminder = None;
+        if let Some(Modal::Details(cwd)) = &self.modal {
+            if cwd == &reminder.cwd {
+                if let Some(index) = self.project_reminders(cwd).iter().position(|r| r.id == reminder.id) {
+                    self.modal_reminders_pagination.selected = index;
+                    self.modal_focus = ModalFocus::Reminders;
+                }
+            }
+        }
+        Some(reminder.id)
+    }
+
+    /// Drops a deleted reminder from the tracked list. A no-op if it isn't
+    /// currently tracked.
+    pub fn remove_reminder(&mut self, id: &ReminderId) {
+        self.reminders.retain(|r| &r.id != id);
+        self.clamp_reminders_selected();
+    }
+
+    /// The Reminders tab's entries after applying the current filter and
+    /// sort, recomputed on demand - see `visible_logs`.
+    pub fn visible_reminders(&self) -> Vec<&ReminderInfo> {
+        let mut entries: Vec<&ReminderInfo> = self
+            .reminders
+            .iter()
+            .filter(|r| {
+                self.reminders_filter_project
+                    .as_deref()
+                    .is_none_or(|p| project_name(&r.cwd) == p)
+            })
+            .filter(|r| {
+                self.reminders_filter_status
+                    .as_deref()
+                    .is_none_or(|s| reminder_status_word(r.status) == s)
+            })
+            .collect();
+
+        match self.reminders_sort {
+            ReminderSort::Recency => entries.sort_by_key(|r| std::cmp::Reverse(reminder_recency_key(r))),
+            ReminderSort::Project => entries.sort_by_key(|r| project_name(&r.cwd)),
+            ReminderSort::Status => entries.sort_by_key(|r| reminder_status_word(r.status).to_string()),
+        }
+
+        entries
+    }
+
+    /// A project's reminders, most recently updated first - used by the
+    /// details modal's Reminders pane. Unlike `visible_reminders`, this
+    /// ignores the Reminders tab's own sort/filter state.
+    pub fn project_reminders(&self, cwd: &Path) -> Vec<&ReminderInfo> {
+        let mut entries: Vec<&ReminderInfo> = self.reminders.iter().filter(|r| r.cwd == cwd).collect();
+        entries.sort_by_key(|r| std::cmp::Reverse(r.last_updated_ms));
+        entries
+    }
+
+    /// The number of reminders shown in the details modal's Reminders pane
+    /// for whichever project it's currently open on - 0 if no details modal
+    /// is open.
+    fn modal_reminders_len(&self) -> usize {
+        match &self.modal {
+            Some(Modal::Details(cwd)) => self.project_reminders(cwd).len(),
+            _ => 0,
+        }
+    }
+
+    fn clamp_reminders_selected(&mut self) {
+        let len = self.visible_reminders().len();
+        self.reminders_pagination.clamp_selected(len);
+    }
+
+    /// Moves the Reminders tab's selection by `delta` lines, clamped to the
+    /// current visible (filtered) entry count.
+    pub fn move_reminders_selection(&mut self, delta: isize, page_size: usize) {
+        let len = self.visible_reminders().len();
+        self.reminders_pagination.move_by(delta, len, page_size);
+    }
+
+    /// Moves the Reminders tab's selection by a full page - see `page_logs`.
+    pub fn page_reminders(&mut self, direction: isize, page_size: usize) {
+        let len = self.visible_reminders().len();
+        self.reminders_pagination.page(direction, len, page_size);
+    }
+
+    /// Jumps the Reminders tab's selection to the list's first entry.
+    pub fn jump_reminders_to_start(&mut self, page_size: usize) {
+        let len = self.visible_reminders().len();
+        self.reminders_pagination.jump_to_start(len, page_size);
+    }
+
+    /// Jumps the Reminders tab's selection to the list's last entry.
+    pub fn jump_reminders_to_end(&mut self, page_size: usize) {
+        let len = self.visible_reminders().len();
+        self.reminders_pagination.jump_to_end(len, page_size);
+    }
+
+    /// Moves the details modal's Reminders pane's own selection by `delta`
+    /// lines - see `move_modal_logs_selection`, scoped to the Reminders pane.
+    pub fn move_modal_reminders_selection(&mut self, delta: isize, page_size: usize) {
+        let len = self.modal_reminders_len();
+        self.modal_reminders_pagination.move_by(delta, len, page_size);
+    }
+
+    /// Moves the details modal's Reminders pane's own selection by a full
+    /// page - see `page_modal_logs`.
+    pub fn page_modal_reminders(&mut self, direction: isize, page_size: usize) {
+        let len = self.modal_reminders_len();
+        self.modal_reminders_pagination.page(direction, len, page_size);
+    }
+
+    /// Jumps the details modal's Reminders pane's own selection to its first
+    /// entry.
+    pub fn jump_modal_reminders_to_start(&mut self, page_size: usize) {
+        let len = self.modal_reminders_len();
+        self.modal_reminders_pagination.jump_to_start(len, page_size);
+    }
+
+    /// Jumps the details modal's Reminders pane's own selection to its last
+    /// entry.
+    pub fn jump_modal_reminders_to_end(&mut self, page_size: usize) {
+        let len = self.modal_reminders_len();
+        self.modal_reminders_pagination.jump_to_end(len, page_size);
+    }
+
+    pub fn cycle_reminders_sort(&mut self) {
+        self.reminders_sort = match self.reminders_sort {
+            ReminderSort::Recency => ReminderSort::Project,
+            ReminderSort::Project => ReminderSort::Status,
+            ReminderSort::Status => ReminderSort::Recency,
+        };
+        self.reminders_pagination.reset();
+    }
+
+    /// Cycles the Project filter through every distinct project present
+    /// among tracked reminders, alphabetically, then back to no filter.
+    pub fn cycle_reminders_project_filter(&mut self) {
+        let mut projects: Vec<String> = self.reminders.iter().map(|r| project_name(&r.cwd)).collect();
+        projects.sort();
+        projects.dedup();
+        self.reminders_filter_project = next_in_cycle(self.reminders_filter_project.as_deref(), &projects);
+        self.clamp_reminders_selected();
+    }
+
+    /// Cycles the Status filter through every distinct status present among
+    /// tracked reminders, then back to no filter. Bound to `f` rather than
+    /// `s` on the Reminders tab, since `s` starts/stops the highlighted
+    /// reminder there.
+    pub fn cycle_reminders_status_filter(&mut self) {
+        let mut statuses: Vec<String> = self.reminders.iter().map(|r| reminder_status_word(r.status).to_string()).collect();
+        statuses.sort();
+        statuses.dedup();
+        self.reminders_filter_status = next_in_cycle(self.reminders_filter_status.as_deref(), &statuses);
+        self.clamp_reminders_selected();
+    }
+
+    pub fn clear_reminders_filters(&mut self) {
+        self.reminders_filter_project = None;
+        self.reminders_filter_status = None;
+        self.clamp_reminders_selected();
+    }
+
+    /// The `ReminderId` currently highlighted in the Reminders tab, if any.
+    pub fn selected_reminder_in_tab(&self) -> Option<ReminderId> {
+        self.visible_reminders()
+            .get(self.reminders_pagination.selected)
+            .map(|r| r.id.clone())
+    }
+
+    /// The `ReminderId` currently highlighted in the details modal's
+    /// Reminders pane, if the modal is open and it holds any reminders.
+    pub fn selected_reminder_in_modal(&self) -> Option<ReminderId> {
+        let Some(Modal::Details(cwd)) = &self.modal else { return None };
+        self.project_reminders(cwd)
+            .get(self.modal_reminders_pagination.selected)
+            .map(|r| r.id.clone())
+    }
+
+    /// The `ClientMessage` to send to start `id` if it isn't running, or
+    /// stop it if it is - the toggle both the Reminders tab and the modal's
+    /// Reminders pane use for `Enter`/`s`. `None` if `id` isn't tracked.
+    pub fn toggle_reminder_command(&self, id: &ReminderId) -> Option<ClientMessage> {
+        let reminder = self.reminders.iter().find(|r| &r.id == id)?;
+        Some(if reminder.status == ReminderStatus::Running {
+            ClientMessage::StopReminder { id: id.clone() }
+        } else {
+            ClientMessage::StartReminder { id: id.clone() }
+        })
+    }
+
+    /// Opens the reminder form empty, for creating a new reminder scoped to
+    /// the details modal's current project. A no-op if the details modal
+    /// isn't open.
+    pub fn open_reminder_create_form(&mut self) {
+        let Some(Modal::Details(cwd)) = &self.modal else { return };
+        self.reminder_form = Some(ReminderForm {
+            mode: ReminderFormMode::Create,
+            cwd: cwd.clone(),
+            name: String::new(),
+            duration_minutes: String::new(),
+            field: ReminderFormField::Name,
+        });
+    }
+
+    /// Opens the reminder form pre-populated with the details modal's
+    /// currently highlighted reminder. A no-op if the modal isn't open or
+    /// holds no reminders.
+    pub fn open_reminder_edit_form(&mut self) {
+        let Some(Modal::Details(cwd)) = &self.modal else { return };
+        let cwd = cwd.clone();
+        let Some(reminder) = self
+            .project_reminders(&cwd)
+            .get(self.modal_reminders_pagination.selected)
+            .map(|r| (*r).clone())
+        else {
+            return;
+        };
+        self.reminder_form = Some(ReminderForm {
+            mode: ReminderFormMode::Edit(reminder.id),
+            cwd,
+            name: reminder.name,
+            duration_minutes: reminder.duration_minutes.to_string(),
+            field: ReminderFormField::Name,
+        });
+    }
+
+    pub fn close_reminder_form(&mut self) {
+        self.reminder_form = None;
+    }
+
+    /// Moves input focus between the form's Name and Duration fields - the
+    /// `Tab` key while the form is open.
+    pub fn toggle_reminder_form_field(&mut self) {
+        if let Some(form) = &mut self.reminder_form {
+            form.field = match form.field {
+                ReminderFormField::Name => ReminderFormField::Duration,
+                ReminderFormField::Duration => ReminderFormField::Name,
+            };
+        }
+    }
+
+    /// Appends a typed character to whichever field currently has focus.
+    /// The Duration field only accepts digits.
+    pub fn reminder_form_input_char(&mut self, c: char) {
+        if let Some(form) = &mut self.reminder_form {
+            match form.field {
+                ReminderFormField::Name => form.name.push(c),
+                ReminderFormField::Duration => {
+                    if c.is_ascii_digit() {
+                        form.duration_minutes.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes the last character from whichever field currently has focus.
+    pub fn reminder_form_backspace(&mut self) {
+        if let Some(form) = &mut self.reminder_form {
+            match form.field {
+                ReminderFormField::Name => {
+                    form.name.pop();
+                }
+                ReminderFormField::Duration => {
+                    form.duration_minutes.pop();
+                }
+            }
+        }
+    }
+
+    /// Closes the open reminder form and returns the `ClientMessage` to send
+    /// (create or edit) - the `Enter` key while the form is open. `None` if
+    /// no form is open. A new reminder is remembered as `pending_new_reminder`
+    /// so `apply_reminder_update` can recognize the daemon's confirmation of
+    /// it and highlight/auto-start it - see that method's doc comment.
+    pub fn submit_reminder_form(&mut self) -> Option<ClientMessage> {
+        let form = self.reminder_form.take()?;
+        let duration_minutes: u32 = form.duration_minutes.parse().unwrap_or(0);
+        Some(match form.mode {
+            ReminderFormMode::Create => {
+                self.pending_new_reminder = Some((form.cwd.clone(), form.name.clone()));
+                ClientMessage::CreateReminder {
+                    cwd: form.cwd,
+                    name: form.name,
+                    duration_minutes,
+                }
+            }
+            ReminderFormMode::Edit(id) => ClientMessage::UpdateReminder {
+                id,
+                name: form.name,
+                duration_minutes,
+            },
+        })
+    }
+
+    /// Opens the delete-confirmation dialog for the details modal's
+    /// currently highlighted reminder. A no-op if the modal isn't open or
+    /// holds no reminders.
+    pub fn open_delete_reminder_confirm(&mut self) {
+        let Some(Modal::Details(cwd)) = &self.modal else { return };
+        let cwd = cwd.clone();
+        if let Some(reminder) = self.project_reminders(&cwd).get(self.modal_reminders_pagination.selected) {
+            self.confirm_delete_reminder = Some(reminder.id.clone());
+        }
+    }
+
+    pub fn close_delete_reminder_confirm(&mut self) {
+        self.confirm_delete_reminder = None;
+    }
+
+    /// Closes the delete-confirmation dialog and returns the `ClientMessage`
+    /// to send - the `Enter` key while it is open. `None` if no dialog is
+    /// open.
+    pub fn confirm_delete_reminder_command(&mut self) -> Option<ClientMessage> {
+        let id = self.confirm_delete_reminder.take()?;
+        Some(ClientMessage::DeleteReminder { id })
+    }
+}
+
+/// The status word a reminder's status maps to for filtering/sorting -
+/// matches the wire's snake_case spelling (see `ReminderStatus`).
+fn reminder_status_word(status: ReminderStatus) -> &'static str {
+    match status {
+        ReminderStatus::NotYetStarted => "not_yet_started",
+        ReminderStatus::Running => "running",
+        ReminderStatus::Done => "done",
+    }
+}
+
+/// The Reminders tab's default sort key: a reminder's last *completed* run
+/// (stopped or finished, i.e. `Done`), falling back to its creation time when
+/// it has none yet - distinct from the Updated column, which also counts a
+/// bare start. See design.md's "Recency sort fallback" decision.
+fn reminder_recency_key(reminder: &ReminderInfo) -> u64 {
+    if reminder.status == ReminderStatus::Done {
+        reminder.last_updated_ms
+    } else {
+        reminder.created_at_ms
     }
 }
 
@@ -729,6 +1244,45 @@ mod tests {
     }
 
     #[test]
+    fn a_projects_reminder_activity_counts_toward_its_recency_ordering() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo {
+                    last_updated_ms: 1_000,
+                    ..agent_in("/tmp/recent-agent", "a", AgentStatus::Running)
+                },
+                AgentInfo {
+                    last_updated_ms: 1_000,
+                    ..agent_in("/tmp/recent-reminder", "b", AgentStatus::Running)
+                },
+            ],
+            Vec::new(),
+        );
+        // "/tmp/recent-reminder" has an older agent update (1_000) but a
+        // much more recent reminder event (5_000) - that reminder activity
+        // must be enough to sort it ahead of "/tmp/recent-agent".
+        app.apply_reminder_update(reminder_in("/tmp/recent-reminder", "r1", "Check the build", ReminderStatus::Done, 0, Some(0), 5_000));
+
+        let groups = app.directory_groups();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].cwd, PathBuf::from("/tmp/recent-reminder"), "the project with the more recent reminder activity should sort first");
+        assert_eq!(groups[1].cwd, PathBuf::from("/tmp/recent-agent"));
+    }
+
+    #[test]
+    fn a_projects_updated_column_reflects_its_reminder_activity() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/project", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_update(reminder_in("/tmp/project", "r1", "Check the build", ReminderStatus::Done, 0, Some(0), 9_999));
+
+        let groups = app.directory_groups();
+
+        assert_eq!(groups[0].most_recent_update_ms(), 9_999);
+    }
+
+    #[test]
     fn directory_groups_orders_agents_before_test_runs_within_a_group() {
         let mut app = App::new();
         app.apply_snapshot(
@@ -753,6 +1307,7 @@ mod tests {
             status: status.to_string(),
             occurred_at_ms,
             pid: Some(1),
+            reminder_name: None,
         }
     }
 
@@ -766,6 +1321,8 @@ mod tests {
         let mut app = App::new();
         app.cycle_tab();
         assert_eq!(app.active_tab, Tab::Logs);
+        app.cycle_tab();
+        assert_eq!(app.active_tab, Tab::Reminders);
         app.cycle_tab();
         assert_eq!(app.active_tab, Tab::Agents);
     }
@@ -1238,5 +1795,506 @@ mod tests {
             "reopening the modal must reset its Logs pane's pagination"
         );
         assert_eq!(app.modal_logs_pagination.top, 0);
+    }
+
+    fn reminder_in(
+        cwd: &str,
+        id: &str,
+        name: &str,
+        status: ReminderStatus,
+        created_at_ms: u64,
+        run_started_ms: Option<u64>,
+        last_updated_ms: u64,
+    ) -> ReminderInfo {
+        ReminderInfo {
+            id: ReminderId(id.to_string()),
+            cwd: PathBuf::from(cwd),
+            name: name.to_string(),
+            duration_minutes: 10,
+            status,
+            created_at_ms,
+            run_started_ms,
+            last_updated_ms,
+        }
+    }
+
+    #[test]
+    fn apply_reminder_snapshot_replaces_the_reminder_list() {
+        let mut app = App::new();
+
+        app.apply_reminder_snapshot(vec![reminder_in(
+            "/tmp/a",
+            "r1",
+            "Check the build",
+            ReminderStatus::NotYetStarted,
+            0,
+            None,
+            0,
+        )]);
+
+        assert_eq!(app.reminders.len(), 1);
+    }
+
+    #[test]
+    fn apply_reminder_update_adds_then_updates_in_place() {
+        let mut app = App::new();
+        let reminder = reminder_in("/tmp/a", "r1", "Check the build", ReminderStatus::NotYetStarted, 0, None, 0);
+        app.apply_reminder_update(reminder.clone());
+        assert_eq!(app.reminders.len(), 1);
+
+        let updated = ReminderInfo { status: ReminderStatus::Running, ..reminder };
+        app.apply_reminder_update(updated);
+
+        assert_eq!(app.reminders.len(), 1, "must update in place, not duplicate");
+        assert_eq!(app.reminders[0].status, ReminderStatus::Running);
+    }
+
+    #[test]
+    fn remove_reminder_drops_it() {
+        let mut app = App::new();
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "Check the build", ReminderStatus::NotYetStarted, 0, None, 0));
+
+        app.remove_reminder(&ReminderId("r1".to_string()));
+
+        assert!(app.reminders.is_empty());
+    }
+
+    #[test]
+    fn remove_reminder_is_a_no_op_for_an_unknown_id() {
+        let mut app = App::new();
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "Check the build", ReminderStatus::NotYetStarted, 0, None, 0));
+
+        app.remove_reminder(&ReminderId("unknown".to_string()));
+
+        assert_eq!(app.reminders.len(), 1);
+    }
+
+    #[test]
+    fn visible_reminders_default_sorted_by_last_completed_run() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/a", "older", "Older", ReminderStatus::Done, 0, Some(0), 1_000),
+            reminder_in("/tmp/b", "newer", "Newer", ReminderStatus::Done, 0, Some(0), 2_000),
+        ]);
+
+        let visible = app.visible_reminders();
+
+        assert_eq!(visible[0].id, ReminderId("newer".to_string()));
+        assert_eq!(visible[1].id, ReminderId("older".to_string()));
+    }
+
+    #[test]
+    fn visible_reminders_recency_falls_back_to_creation_time_when_never_completed() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            // Running, not yet completed - sorts by creation time, not last_updated_ms.
+            reminder_in("/tmp/a", "running", "Running", ReminderStatus::Running, 500, Some(500), 999_999),
+            reminder_in("/tmp/b", "done", "Done", ReminderStatus::Done, 0, Some(0), 1_000),
+        ]);
+
+        let visible = app.visible_reminders();
+
+        assert_eq!(
+            visible[0].id,
+            ReminderId("done".to_string()),
+            "a done reminder's completed-run time should outrank a running reminder's creation time here"
+        );
+    }
+
+    #[test]
+    fn cycle_reminders_sort_moves_through_recency_project_status() {
+        let mut app = App::new();
+        assert_eq!(app.reminders_sort, ReminderSort::Recency);
+        app.cycle_reminders_sort();
+        assert_eq!(app.reminders_sort, ReminderSort::Project);
+        app.cycle_reminders_sort();
+        assert_eq!(app.reminders_sort, ReminderSort::Status);
+        app.cycle_reminders_sort();
+        assert_eq!(app.reminders_sort, ReminderSort::Recency);
+    }
+
+    #[test]
+    fn reminders_sorting_by_project_orders_alphabetically() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/zeta", "z", "Z", ReminderStatus::NotYetStarted, 0, None, 0),
+            reminder_in("/tmp/alpha", "a", "A", ReminderStatus::NotYetStarted, 0, None, 0),
+        ]);
+        app.cycle_reminders_sort();
+
+        let visible = app.visible_reminders();
+
+        assert_eq!(visible[0].cwd, PathBuf::from("/tmp/alpha"));
+        assert_eq!(visible[1].cwd, PathBuf::from("/tmp/zeta"));
+    }
+
+    #[test]
+    fn reminders_sorting_by_status_orders_alphabetically() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/a", "a", "A", ReminderStatus::Running, 0, Some(0), 0),
+            reminder_in("/tmp/b", "b", "B", ReminderStatus::Done, 0, Some(0), 0),
+        ]);
+        app.cycle_reminders_sort();
+        app.cycle_reminders_sort();
+
+        let visible = app.visible_reminders();
+
+        assert_eq!(visible[0].status, ReminderStatus::Done);
+        assert_eq!(visible[1].status, ReminderStatus::Running);
+    }
+
+    #[test]
+    fn cycle_reminders_project_filter_cycles_through_projects_then_clears() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/a", "a", "A", ReminderStatus::NotYetStarted, 0, None, 0),
+            reminder_in("/tmp/b", "b", "B", ReminderStatus::NotYetStarted, 0, None, 0),
+        ]);
+
+        app.cycle_reminders_project_filter();
+        assert_eq!(app.reminders_filter_project.as_deref(), Some("a"));
+        assert_eq!(app.visible_reminders().len(), 1);
+
+        app.cycle_reminders_project_filter();
+        assert_eq!(app.reminders_filter_project.as_deref(), Some("b"));
+
+        app.cycle_reminders_project_filter();
+        assert_eq!(app.reminders_filter_project, None, "must cycle back to no filter");
+    }
+
+    #[test]
+    fn cycle_reminders_status_filter_cycles_through_statuses_then_clears() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/a", "a", "A", ReminderStatus::Running, 0, Some(0), 0),
+            reminder_in("/tmp/a", "b", "B", ReminderStatus::Done, 0, Some(0), 0),
+        ]);
+
+        app.cycle_reminders_status_filter();
+        assert_eq!(app.reminders_filter_status.as_deref(), Some("done"));
+        assert_eq!(app.visible_reminders().len(), 1);
+
+        app.cycle_reminders_status_filter();
+        assert_eq!(app.reminders_filter_status.as_deref(), Some("running"));
+
+        app.cycle_reminders_status_filter();
+        assert_eq!(app.reminders_filter_status, None);
+    }
+
+    #[test]
+    fn clear_reminders_filters_resets_both() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![reminder_in(
+            "/tmp/a",
+            "a",
+            "A",
+            ReminderStatus::NotYetStarted,
+            0,
+            None,
+            0,
+        )]);
+        app.cycle_reminders_project_filter();
+        app.cycle_reminders_status_filter();
+
+        app.clear_reminders_filters();
+
+        assert_eq!(app.reminders_filter_project, None);
+        assert_eq!(app.reminders_filter_status, None);
+    }
+
+    #[test]
+    fn directory_groups_attaches_reminders_only_to_an_existing_group() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/project", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/project", "r1", "In project", ReminderStatus::NotYetStarted, 0, None, 0),
+            reminder_in("/tmp/reminder-only", "r2", "No agent here", ReminderStatus::NotYetStarted, 0, None, 0),
+        ]);
+
+        let groups = app.directory_groups();
+
+        assert_eq!(groups.len(), 1, "a reminder-only project must not get its own Agents tab row");
+        assert_eq!(groups[0].reminders.len(), 1);
+        assert_eq!(groups[0].reminders[0].id, ReminderId("r1".to_string()));
+    }
+
+    #[test]
+    fn directory_groups_orders_a_projects_reminders_most_recently_updated_first() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/project", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/project", "older", "Older", ReminderStatus::Done, 0, Some(0), 1_000),
+            reminder_in("/tmp/project", "newer", "Newer", ReminderStatus::Done, 0, Some(0), 2_000),
+        ]);
+
+        let groups = app.directory_groups();
+
+        assert_eq!(groups[0].reminders[0].id, ReminderId("newer".to_string()));
+        assert_eq!(groups[0].reminders[1].id, ReminderId("older".to_string()));
+    }
+
+    #[test]
+    fn opening_details_modal_from_agents_tab_defaults_focus_to_logs() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+
+        app.open_details_modal();
+
+        assert_eq!(app.modal_focus, ModalFocus::Logs);
+    }
+
+    #[test]
+    fn opening_details_modal_from_reminders_tab_focuses_reminders_and_highlights_it() {
+        let mut app = App::new();
+        app.apply_reminder_snapshot(vec![
+            reminder_in("/tmp/a", "r1", "First", ReminderStatus::NotYetStarted, 0, None, 0),
+            reminder_in("/tmp/a", "r2", "Second", ReminderStatus::NotYetStarted, 1_000, None, 1_000),
+        ]);
+        app.set_tab(Tab::Reminders);
+        app.move_reminders_selection(1, 10); // select the second (older, since default sort falls back to creation time)
+
+        app.open_details_modal();
+
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+        assert_eq!(app.modal_focus, ModalFocus::Reminders);
+        let selected_id = app.selected_reminder_in_modal();
+        assert!(selected_id.is_some(), "the invoking reminder should be highlighted in the modal's pane");
+    }
+
+    #[test]
+    fn toggle_modal_focus_switches_between_logs_and_reminders() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        assert_eq!(app.modal_focus, ModalFocus::Logs);
+
+        app.toggle_modal_focus();
+        assert_eq!(app.modal_focus, ModalFocus::Reminders);
+
+        app.toggle_modal_focus();
+        assert_eq!(app.modal_focus, ModalFocus::Logs);
+    }
+
+    #[test]
+    fn close_modal_also_closes_the_reminder_form_and_delete_confirm() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        assert!(app.reminder_form.is_some());
+
+        app.close_modal();
+
+        assert!(app.reminder_form.is_none());
+        assert!(app.confirm_delete_reminder.is_none());
+    }
+
+    #[test]
+    fn open_reminder_create_form_opens_empty_scoped_to_the_modals_project() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+
+        app.open_reminder_create_form();
+
+        let form = app.reminder_form.as_ref().unwrap();
+        assert_eq!(form.mode, ReminderFormMode::Create);
+        assert_eq!(form.cwd, PathBuf::from("/tmp/a"));
+        assert_eq!(form.name, "");
+        assert_eq!(form.duration_minutes, "");
+    }
+
+    #[test]
+    fn open_reminder_edit_form_pre_populates_the_highlighted_reminder() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_update(ReminderInfo {
+            duration_minutes: 25,
+            ..reminder_in("/tmp/a", "r1", "Check the build", ReminderStatus::NotYetStarted, 0, None, 0)
+        });
+        app.open_details_modal();
+
+        app.open_reminder_edit_form();
+
+        let form = app.reminder_form.as_ref().unwrap();
+        assert_eq!(form.mode, ReminderFormMode::Edit(ReminderId("r1".to_string())));
+        assert_eq!(form.name, "Check the build");
+        assert_eq!(form.duration_minutes, "25");
+    }
+
+    #[test]
+    fn reminder_form_field_input_and_backspace_edit_the_active_field() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+
+        app.reminder_form_input_char('H');
+        app.reminder_form_input_char('i');
+        assert_eq!(app.reminder_form.as_ref().unwrap().name, "Hi");
+
+        app.toggle_reminder_form_field();
+        app.reminder_form_input_char('5');
+        app.reminder_form_input_char('x'); // non-digit, ignored on the Duration field
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes, "5");
+
+        app.reminder_form_backspace();
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes, "");
+    }
+
+    #[test]
+    fn submit_reminder_form_for_create_builds_a_create_reminder_message() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('X');
+        app.toggle_reminder_form_field();
+        app.reminder_form_input_char('1');
+        app.reminder_form_input_char('0');
+
+        let message = app.submit_reminder_form();
+
+        assert_eq!(
+            message,
+            Some(ClientMessage::CreateReminder {
+                cwd: PathBuf::from("/tmp/a"),
+                name: "X".to_string(),
+                duration_minutes: 10,
+            })
+        );
+        assert!(app.reminder_form.is_none(), "submitting must close the form");
+    }
+
+    #[test]
+    fn confirming_a_just_created_reminder_highlights_and_returns_its_id_to_start() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('X');
+        app.submit_reminder_form();
+        // A pre-existing, unrelated reminder in the same project shouldn't
+        // interfere with selecting the new one below.
+        app.apply_reminder_update(reminder_in("/tmp/a", "older", "Older", ReminderStatus::NotYetStarted, 0, None, 0));
+
+        // The daemon's confirmation, naming the id it assigned.
+        let confirmed = reminder_in("/tmp/a", "new-id", "X", ReminderStatus::NotYetStarted, 0, None, 0);
+        let started_id = app.apply_reminder_update(confirmed);
+
+        assert_eq!(started_id, Some(ReminderId("new-id".to_string())), "should signal the new reminder needs starting");
+        assert_eq!(app.modal_focus, ModalFocus::Reminders, "should focus the Reminders pane to show it");
+        let selected_id = app.selected_reminder_in_modal();
+        assert_eq!(selected_id, Some(ReminderId("new-id".to_string())), "the new reminder should be highlighted");
+    }
+
+    #[test]
+    fn a_reminder_update_unrelated_to_any_pending_create_does_not_autostart() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+
+        // No form was ever opened/submitted - this is just an ordinary
+        // incoming update (e.g. another client started a reminder).
+        let id = app.apply_reminder_update(reminder_in("/tmp/a", "r1", "Some reminder", ReminderStatus::Running, 0, Some(0), 0));
+
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn editing_a_reminder_never_triggers_autostart() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "A", ReminderStatus::NotYetStarted, 0, None, 0));
+        app.open_details_modal();
+        app.open_reminder_edit_form();
+        app.reminder_form_input_char('X'); // "AX"
+        app.submit_reminder_form();
+
+        let id = app.apply_reminder_update(reminder_in("/tmp/a", "r1", "AX", ReminderStatus::NotYetStarted, 0, None, 0));
+
+        assert_eq!(id, None, "editing an existing reminder must never be mistaken for a new one to auto-start");
+    }
+
+    #[test]
+    fn a_second_create_before_the_first_confirms_replaces_the_pending_marker() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('A');
+        app.submit_reminder_form();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('B');
+        app.submit_reminder_form();
+
+        // The (late) confirmation for "A" arrives after "B" was already
+        // submitted - it must not be mistaken for the pending create.
+        let id = app.apply_reminder_update(reminder_in("/tmp/a", "a-id", "A", ReminderStatus::NotYetStarted, 0, None, 0));
+        assert_eq!(id, None, "a stale confirmation for the superseded create must not auto-start");
+
+        let id = app.apply_reminder_update(reminder_in("/tmp/a", "b-id", "B", ReminderStatus::NotYetStarted, 0, None, 0));
+        assert_eq!(id, Some(ReminderId("b-id".to_string())), "the most recent create should still auto-start");
+    }
+
+    #[test]
+    fn close_reminder_form_discards_without_submitting() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('X');
+
+        app.close_reminder_form();
+
+        assert!(app.reminder_form.is_none());
+    }
+
+    #[test]
+    fn toggle_reminder_command_starts_a_not_running_reminder_and_stops_a_running_one() {
+        let mut app = App::new();
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "A", ReminderStatus::NotYetStarted, 0, None, 0));
+
+        assert_eq!(
+            app.toggle_reminder_command(&ReminderId("r1".to_string())),
+            Some(ClientMessage::StartReminder { id: ReminderId("r1".to_string()) })
+        );
+
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "A", ReminderStatus::Running, 0, Some(0), 0));
+
+        assert_eq!(
+            app.toggle_reminder_command(&ReminderId("r1".to_string())),
+            Some(ClientMessage::StopReminder { id: ReminderId("r1".to_string()) })
+        );
+    }
+
+    #[test]
+    fn open_delete_reminder_confirm_and_confirm_build_a_delete_message() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "A", ReminderStatus::NotYetStarted, 0, None, 0));
+        app.open_details_modal();
+
+        app.open_delete_reminder_confirm();
+        assert_eq!(app.confirm_delete_reminder, Some(ReminderId("r1".to_string())));
+
+        let message = app.confirm_delete_reminder_command();
+
+        assert_eq!(message, Some(ClientMessage::DeleteReminder { id: ReminderId("r1".to_string()) }));
+        assert!(app.confirm_delete_reminder.is_none(), "confirming must close the dialog");
+    }
+
+    #[test]
+    fn close_delete_reminder_confirm_dismisses_without_a_message() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_update(reminder_in("/tmp/a", "r1", "A", ReminderStatus::NotYetStarted, 0, None, 0));
+        app.open_details_modal();
+        app.open_delete_reminder_confirm();
+
+        app.close_delete_reminder_confirm();
+
+        assert!(app.confirm_delete_reminder.is_none());
     }
 }

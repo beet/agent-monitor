@@ -5,11 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use agentmon_proto::{AgentInfo, ClientMessage, LogEntry, ServerMessage, SessionId, TestRunInfo};
+use agentmon_proto::{
+    AgentInfo, ClientMessage, LogEntry, ReminderId, ReminderInfo, ServerMessage, SessionId, TestRunInfo,
+};
 
 use crate::ingest::Ingestor;
 use crate::liveness::spawn_liveness_sweep;
 use crate::protocol::{read_message, write_message};
+use crate::reminders::spawn_reminder_sweep;
 
 /// An incremental update fanned out to subscribers - any kind of tracked
 /// entity, merged onto one channel per connection so a single subscriber
@@ -22,6 +25,8 @@ enum Update {
     /// A session id retired by the registry's same-pid dedup - see
     /// `UpsertOutcome::retired_session_ids`.
     AgentRemoved(SessionId),
+    Reminder(ReminderInfo),
+    ReminderRemoved(ReminderId),
 }
 
 /// Fans out registry updates to every currently-subscribed client.
@@ -53,6 +58,17 @@ pub fn serve(listener: UnixListener, ingestor: Ingestor, liveness_interval: Dura
     let sweep_broadcaster = broadcaster.clone();
     spawn_liveness_sweep(sweep_registry, liveness_interval, move |agent| {
         sweep_broadcaster.publish(Update::Agent(agent));
+    });
+
+    // Reuses the same interval as the liveness sweep rather than adding a
+    // second knob - a reminder's minute-granularity duration doesn't need
+    // finer polling than agent liveness already uses (see design.md).
+    let sweep_reminders = ingestor.reminders().clone();
+    let sweep_ingestor = ingestor.clone();
+    let reminder_broadcaster = broadcaster.clone();
+    spawn_reminder_sweep(sweep_reminders, liveness_interval, move |reminder| {
+        sweep_ingestor.ingest_reminder_completed(&reminder);
+        reminder_broadcaster.publish(Update::Reminder(reminder));
     });
 
     let log_broadcaster = broadcaster.clone();
@@ -93,13 +109,42 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
             let test_run = ingestor.ingest_test_run(cwd, pid, status);
             broadcaster.publish(Update::TestRun(test_run));
         }
+        Some(ClientMessage::CreateReminder { cwd, name, duration_minutes }) => {
+            match ingestor.ingest_create_reminder(cwd, name, duration_minutes) {
+                Some(reminder) => broadcaster.publish(Update::Reminder(reminder)),
+                // Per-project cap reached - dropped, matching how a
+                // malformed payload is handled (see design.md).
+                None => eprintln!("agentd: rejecting reminder creation, per-project cap reached"),
+            }
+        }
+        Some(ClientMessage::UpdateReminder { id, name, duration_minutes }) => {
+            if let Some(reminder) = ingestor.ingest_update_reminder(&id, name, duration_minutes) {
+                broadcaster.publish(Update::Reminder(reminder));
+            }
+        }
+        Some(ClientMessage::DeleteReminder { id }) => {
+            if ingestor.ingest_delete_reminder(&id) {
+                broadcaster.publish(Update::ReminderRemoved(id));
+            }
+        }
+        Some(ClientMessage::StartReminder { id }) => {
+            if let Some(reminder) = ingestor.ingest_start_reminder(&id) {
+                broadcaster.publish(Update::Reminder(reminder));
+            }
+        }
+        Some(ClientMessage::StopReminder { id }) => {
+            if let Some(reminder) = ingestor.ingest_stop_reminder(&id) {
+                broadcaster.publish(Update::Reminder(reminder));
+            }
+        }
         Some(ClientMessage::Subscribe) => {
             let agents = ingestor.registry().snapshot();
             let test_runs = ingestor.registry().snapshot_test_runs();
             let logs = ingestor.activity_log().snapshot();
+            let reminders = ingestor.reminders().snapshot();
             let sent = write_message(
                 &mut writer,
-                &ServerMessage::Snapshot { agents, test_runs, logs },
+                &ServerMessage::Snapshot { agents, test_runs, logs, reminders },
             );
             if sent.is_err() {
                 return;
@@ -111,6 +156,8 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
                     Update::TestRun(test_run) => ServerMessage::TestRunUpdate { test_run },
                     Update::Log(entry) => ServerMessage::LogAppended { entry },
                     Update::AgentRemoved(session_id) => ServerMessage::AgentRemoved { session_id },
+                    Update::Reminder(reminder) => ServerMessage::ReminderUpdate { reminder },
+                    Update::ReminderRemoved(id) => ServerMessage::ReminderRemoved { id },
                 };
                 if write_message(&mut writer, &message).is_err() {
                     break;
@@ -137,11 +184,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingNotifier {
         calls: Mutex<Vec<AgentInfo>>,
+        reminder_calls: Mutex<Vec<(PathBuf, String)>>,
     }
 
     impl Notifier for RecordingNotifier {
         fn notify(&self, agent: &AgentInfo) {
             self.calls.lock().unwrap().push(agent.clone());
+        }
+
+        fn notify_reminder(&self, cwd: &std::path::Path, name: &str) {
+            self.reminder_calls
+                .lock()
+                .unwrap()
+                .push((cwd.to_path_buf(), name.to_string()));
         }
     }
 
@@ -162,11 +217,18 @@ mod tests {
     /// can't interfere with these tests), and returns the socket path plus
     /// the notifier so tests can assert on dispatched notifications.
     fn spawn_test_server(tag: &str) -> (PathBuf, Arc<RecordingNotifier>) {
+        spawn_test_server_with_interval(tag, NO_LIVENESS_SWEEP)
+    }
+
+    /// Like `spawn_test_server`, but with a caller-chosen sweep interval -
+    /// used by tests that need the reminder-completion sweep to actually run
+    /// promptly.
+    fn spawn_test_server_with_interval(tag: &str, interval: Duration) -> (PathBuf, Arc<RecordingNotifier>) {
         let path = unique_socket_path(tag);
         let listener = bind_socket(&path).expect("bind should succeed");
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
-        thread::spawn(move || serve(listener, ingestor, NO_LIVENESS_SWEEP));
+        thread::spawn(move || serve(listener, ingestor, interval));
         (path, notifier)
     }
 
@@ -780,5 +842,153 @@ mod tests {
         }
         let entry = found.expect("expected a LogAppended message");
         assert_eq!(entry.status, "done");
+    }
+
+    #[test]
+    fn create_start_stop_reminder_reaches_a_subscriber() {
+        let (path, _notifier) = spawn_test_server("reminder-create-start-stop");
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::CreateReminder {
+                    cwd: PathBuf::from("/tmp/project"),
+                    name: "Check the build".to_string(),
+                    duration_minutes: 10,
+                },
+            )
+            .expect("send create reminder");
+        }
+        let created = loop {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::ReminderUpdate { reminder } = message {
+                break reminder;
+            }
+        };
+        assert_eq!(created.status, agentmon_proto::ReminderStatus::NotYetStarted);
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(&mut reporter, &ClientMessage::StartReminder { id: created.id.clone() })
+                .expect("send start reminder");
+        }
+        let started = loop {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::ReminderUpdate { reminder } = message {
+                break reminder;
+            }
+        };
+        assert_eq!(started.status, agentmon_proto::ReminderStatus::Running);
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(&mut reporter, &ClientMessage::StopReminder { id: created.id.clone() })
+                .expect("send stop reminder");
+        }
+        let mut saw_stopped_log = false;
+        let mut saw_stopped_update = false;
+        for _ in 0..4 {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            match message {
+                ServerMessage::ReminderUpdate { reminder } if reminder.status == agentmon_proto::ReminderStatus::Done => {
+                    saw_stopped_update = true;
+                }
+                ServerMessage::LogAppended { entry } if entry.status == "stopped" => {
+                    assert_eq!(entry.reminder_name.as_deref(), Some("Check the build"));
+                    saw_stopped_log = true;
+                }
+                _ => {}
+            }
+            if saw_stopped_log && saw_stopped_update {
+                break;
+            }
+        }
+        assert!(saw_stopped_update, "expected a ReminderUpdate transitioning to Done");
+        assert!(saw_stopped_log, "expected a LogAppended 'stopped' entry naming the reminder");
+    }
+
+    #[test]
+    fn a_reminder_completes_on_its_own_and_notifies_without_any_client_stopping_it() {
+        // A short sweep interval so the reminder-completion sweep runs
+        // promptly, and a 0-minute duration so the reminder is already due
+        // the moment it starts.
+        let (path, notifier) =
+            spawn_test_server_with_interval("reminder-auto-complete", Duration::from_millis(20));
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::CreateReminder {
+                    cwd: PathBuf::from("/tmp/project"),
+                    name: "Check the build".to_string(),
+                    duration_minutes: 0,
+                },
+            )
+            .expect("send create reminder");
+        }
+        let created = loop {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::ReminderUpdate { reminder } = message {
+                break reminder;
+            }
+        };
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(&mut reporter, &ClientMessage::StartReminder { id: created.id.clone() })
+                .expect("send start reminder");
+        }
+
+        // No client ever sends a StopReminder - the sweep alone must
+        // transition it to Done.
+        let mut saw_done_update = false;
+        for _ in 0..40 {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::ReminderUpdate { reminder } = message {
+                if reminder.status == agentmon_proto::ReminderStatus::Done {
+                    saw_done_update = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw_done_update, "expected the sweep to push a ReminderUpdate transitioning to Done");
+
+        let mut notified = 0;
+        for _ in 0..20 {
+            notified = notifier.reminder_calls.lock().unwrap().len();
+            if notified > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(notified, 1, "a natural completion must send exactly one reminder notification");
     }
 }

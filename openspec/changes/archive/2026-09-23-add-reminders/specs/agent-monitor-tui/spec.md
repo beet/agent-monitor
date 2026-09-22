@@ -1,21 +1,4 @@
-# agent-monitor-tui Specification
-
-## Purpose
-
-Gives the user a single, live-updating terminal view of every Claude Code agent session tracked by the daemon, across nvim, standalone terminals, and the desktop app.
-
-## Requirements
-
-### Requirement: Connect to the daemon
-The TUI SHALL connect to the daemon's local socket on startup and clearly inform the user when the daemon is unreachable.
-
-#### Scenario: Daemon is running
-- **WHEN** the TUI starts and the daemon's socket is reachable
-- **THEN** the TUI connects and begins displaying tracked agents
-
-#### Scenario: Daemon is not running
-- **WHEN** the TUI starts and cannot reach the daemon's socket
-- **THEN** the TUI displays a clear message that the daemon is not running instead of showing a blank or misleading agent list
+## MODIFIED Requirements
 
 ### Requirement: Live agent list
 The TUI SHALL display tracked agents, test runs, and reminders grouped by working directory as one row per project: each distinct working directory forms exactly one row showing that project's name (derived from the working directory), its tracked agent(s)' status(es) in an Agents cell, that project's test run status (if any) in a Tests cell, and the most recent last-updated time among those members (agent, test run, or reminder) (in the system's local timezone, formatted `%Y-%m-%d %H:%M:%S`), updating as the daemon reports changes. A project row SHALL NOT display per-agent host context or process id as separate columns; the daemon continues tracking that data, it is simply not rendered in the collapsed row. Project rows SHALL be ordered by the most recent last-updated time of any member (agent, test run, or reminder) within them, most recent first. An agent whose status is "running" SHALL contribute a live, counting-up duration to the row, computed from the current time minus that agent's status-since timestamp, formatted as a compact counter (e.g. `2m14s`) and kept current by the TUI's own periodic redraw rather than only refreshing when the daemon pushes an update. An agent whose status is "done" SHALL contribute a fixed duration to the row, computed from that agent's run-started timestamp (the beginning of the run that just completed) to its status-since timestamp (the time it completed) - unlike the "running" duration, this fixed duration does not change on further redraws. An agent in any other status (idle, needs input, stale, or declined) SHALL NOT contribute a duration. A test run whose status is "running" SHALL likewise contribute a live, counting-up duration computed from its run-start timestamp. Once a test run reaches "passed" or "failed", its row SHALL continue to show a duration - the total elapsed time from its run-start timestamp to its last-updated timestamp - rather than showing no duration. When the daemon pushes a removal for a session id, the TUI SHALL drop that session id from its tracked agents, so a pid whose session id has been superseded contributes at most one entry - the current, live session's - to its project row's Agents cell and to that project's Agents pane in the details modal, never a second, frozen entry left over from the superseded session. A reminder's last-updated time (its most recent started/stopped/finished event, or its creation time if it has none) SHALL count toward its project's most-recent last-updated time the same way an agent's or test run's does, even though the reminder's own status is not rendered in this row (see "Agents tab shows a Reminders column").
@@ -100,106 +83,6 @@ The TUI SHALL display tracked agents, test runs, and reminders grouped by workin
 - **WHEN** a project's most recent activity is a reminder event rather than an agent or test-run update
 - **THEN** the row's displayed last-updated time is that reminder's last-updated time
 
-### Requirement: Project name column scales with terminal width
-The TUI's PROJECT column SHALL NOT be capped at a fixed 20-character width. Its width SHALL scale with the terminal's available width, growing on wider terminals instead of always truncating project names at the same fixed length. The Agents, Tests, and Reminders columns SHALL each be sized to the widest content actually present among the currently displayed rows (never narrower than that column's own header), rather than a fixed proportion of the row's width - so a column whose current content is short or empty does not reserve space it isn't using, and a column that needs more room (e.g. a long reminder name) can draw on that freed-up space instead of being truncated while its neighbors sit mostly blank. Any space left over once PROJECT, Agents, Tests, and Reminders all have what they need SHALL be split among PROJECT, Agents, and Tests in a 2:3:2 ratio; Agents and Tests SHALL continue to receive the majority of it between them, since status segments are typically the widest content in a row. The Reminders column SHALL NOT receive a share of this leftover space beyond what its own content needs. To keep one unusually long row from dominating and squeezing every other column down to nothing, each of PROJECT, Agents, Tests, and Reminders SHALL be capped at half of the total space available to these four columns; content that doesn't fit within a column's resulting width is truncated per the "Overflowing content is truncated with an ellipsis" requirement (PROJECT is the exception - it clips without an ellipsis, consistent with existing table-rendering behavior for very long names). The UPDATED column's width is unaffected by this requirement.
-
-#### Scenario: A wide terminal shows more of a long project name
-- **WHEN** the TUI renders in a terminal wide enough to fit a project name longer than 20 characters alongside the Agents, Tests, and UPDATED columns
-- **THEN** the PROJECT column renders more than 20 characters of that name, rather than clipping it at 20
-
-#### Scenario: A narrow terminal still clips names that don't fit
-- **WHEN** the TUI renders in a terminal too narrow to fit a project name in full alongside the other columns
-- **THEN** the PROJECT column clips the name to the space available, consistent with existing table-rendering behavior
-
-#### Scenario: A column with short content frees up space for its neighbors
-- **WHEN** the Agents and Tests columns' current content is short (e.g. a single agent idle, no test run) while the Reminders column needs more room than a fixed proportional share would give it
-- **THEN** the Agents and Tests columns shrink to what their content needs and the Reminders column uses the space that frees up, rather than staying cramped next to mostly-blank columns
-
-#### Scenario: A column with blank content still shows its header
-- **WHEN** a column (e.g. Reminders) has no content to show for any currently displayed row
-- **THEN** that column is still at least as wide as its own header text
-
-#### Scenario: One row's unusually long content does not starve the other columns
-- **WHEN** a single row's content in one column (e.g. a very long reminder name) would otherwise claim most of the table's width
-- **THEN** that column is capped at half of the four dynamic columns' total available space, and its content is truncated with an ellipsis to fit rather than shrinking every other column to fit it
-
-### Requirement: Status is visually distinguishable
-The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) and test-run statuses (running, passed, failed) from one another so the user can scan the list and immediately identify agents or test runs needing attention. Each agent status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 👻, and declined with 🚫. Each test-run status SHALL be prefixed with a distinct emoji marker: running with ⏳, passed with ✅, and failed with ❌. A reminder's status SHALL reuse these existing emoji markers rather than introducing new ones: running reuses ⏳ (the same marker as a running test run) and done reuses ✅ (the same marker as a done agent or a passed test run), so a reminder's status is instantly recognizable by an emoji the user already associates with "in progress" or "finished". In the Logs tab and the details modal's Logs pane, a reminder-category log entry SHALL instead use a single fixed marker, ⏰, regardless of whether its status is started, stopped, or finished - unlike agent and test-run entries, which use a different emoji per status - since a reminder log entry's value is in marking it as a reminder event at a glance, not in re-deriving its status from an already text-labeled entry. Its color SHALL still vary by status, though: "finished" (a natural completion) SHALL use the same Green used for a "done" agent or a "passed" test run; "stopped" (a manual interruption) SHALL use a color distinct from both "started" and "finished", since it is neither the beginning nor the successful end of a run. When a project's Agents cell reflects more than one tracked agent in different statuses, the cell SHALL show each distinct status present rather than collapsing them into a single "winning" status, so no status needing attention is hidden behind another. On the currently-selected row in the Agents tab, the Logs tab, or the Reminders tab, the TUI SHALL override every status's own foreground color with a single fixed foreground color chosen to stay legible against the row-highlight background, rather than requiring the row-highlight background to avoid every status's own color.
-
-#### Scenario: An agent needs input
-- **WHEN** an agent's status is "needs input"
-- **THEN** that status's contribution to the row displays the 🔔 marker and is visually distinguished (e.g. color) from other statuses shown, using bold colored text rather than a solid background fill
-
-#### Scenario: Each status has a distinct emoji marker
-- **WHEN** the TUI renders an agent's status within a project row
-- **THEN** that status is prefixed with the emoji for that status (🔧 running, 💤 idle, 🔔 needs input, ✅ done, 👻 stale, 🚫 declined)
-
-#### Scenario: The stale marker renders full-width
-- **WHEN** the TUI renders an agent's "stale" status
-- **THEN** it uses the 👻 marker rather than 🕸️, since 👻 renders reliably full-width across terminals and does not corrupt the row-highlight background the way 🕸️ did
-
-#### Scenario: A declined permission is visually distinguished
-- **WHEN** an agent's status is "declined"
-- **THEN** that status's contribution to the row displays the 🚫 marker and is visually distinguished (e.g. color) from other statuses shown
-
-#### Scenario: A failing test run is visually distinguished
-- **WHEN** a test run's status is "failed"
-- **THEN** that status's contribution to the row displays the ❌ marker and is visually distinguished (e.g. color) from other statuses shown
-
-#### Scenario: Each test-run status has a distinct emoji marker
-- **WHEN** the TUI renders a test run's status within a project row
-- **THEN** that status is prefixed with the emoji for that status (⏳ running, ✅ passed, ❌ failed)
-
-#### Scenario: A project with multiple agent statuses shows each one
-- **WHEN** a project has two or more tracked agents whose statuses differ from one another
-- **THEN** the row's Agents cell lists each distinct status present among those agents (for example, both running and needs input), rather than showing only one
-
-#### Scenario: An agent status and a test-run status are shown together
-- **WHEN** a project has both a tracked agent and a test run whose statuses differ
-- **THEN** the row's Agents cell shows the agent's status and the row's Tests cell shows the test run's status, each in its own column rather than sharing one
-
-#### Scenario: A running status stays legible on the selected row
-- **WHEN** a project row showing the "running" status is the currently-selected (highlighted) row in the Agents tab
-- **THEN** the status's label and emoji remain visible, rendered in the row's fixed selected-row foreground color rather than the status's own color
-
-#### Scenario: A selected row's text overrides every status's own color
-- **WHEN** any row in the Agents tab, the Logs tab, or the Reminders tab is the currently-selected (highlighted) row, regardless of which status or statuses it shows
-- **THEN** all of that row's status text renders in the same fixed selected-row foreground color, rather than in each status's own color
-
-#### Scenario: A running reminder reuses the running test-run emoji
-- **WHEN** the TUI renders a reminder whose status is running, in the Reminders tab, the Agents tab's Reminders column, or the details modal's Reminders pane
-- **THEN** that status displays the ⏳ marker, the same marker a running test run uses
-
-#### Scenario: A done reminder reuses the done/passed emoji
-- **WHEN** the TUI renders a reminder whose status is done, in the Reminders tab, the Agents tab's Reminders column, or the details modal's Reminders pane
-- **THEN** that status displays the ✅ marker, the same marker a done agent or a passed test run uses
-
-#### Scenario: A reminder log entry always shows the clock marker
-- **WHEN** the Logs tab or the details modal's Logs pane renders a log entry whose category is reminder
-- **THEN** that entry displays the ⏰ marker regardless of whether its status is started, stopped, or finished
-
-#### Scenario: A finished reminder log entry is green
-- **WHEN** the Logs tab or the details modal's Logs pane renders a reminder log entry whose status is finished
-- **THEN** that entry's text is colored the same Green used for a "done" agent or a "passed" test run
-
-#### Scenario: A stopped reminder log entry is visually distinct from started and finished
-- **WHEN** the Logs tab or the details modal's Logs pane renders a reminder log entry whose status is stopped
-- **THEN** that entry's text is colored differently from both a "started" and a "finished" reminder log entry
-
-### Requirement: Navigation and quit do not affect tracked agents
-The TUI SHALL support quitting the application via a keybinding, and quitting the TUI SHALL NOT stop the daemon or any tracked Claude Code agent.
-
-#### Scenario: User quits the TUI
-- **WHEN** the user presses the quit key
-- **THEN** the TUI process exits while the daemon keeps running and continues tracking agents
-
-### Requirement: Reconnect after daemon restart
-The TUI SHALL detect when its connection to the daemon drops and attempt to reconnect, resuming display of current agent state once reconnected.
-
-#### Scenario: Daemon restarts while the TUI is open
-- **WHEN** the daemon process restarts (e.g. after an update) while the TUI is running
-- **THEN** the TUI detects the dropped connection, retries connecting, and repopulates the agent list once the daemon is back
-
 ### Requirement: Tab navigation between Agents and Logs
 The TUI SHALL organize its display into three tabs: **Agents** (the existing project table), **Logs** (an aggregated activity log view), and **Reminders** (an aggregated, cross-project reminder list). The user SHALL be able to cycle between tabs with the `Tab` key, and jump directly to a tab with `A`/`a` (Agents), `L`/`l` (Logs), or `R`/`r` (Reminders).
 
@@ -210,17 +93,6 @@ The TUI SHALL organize its display into three tabs: **Agents** (the existing pro
 #### Scenario: Jumping directly to a tab
 - **WHEN** the user presses `A`/`a`, `L`/`l`, or `R`/`r`
 - **THEN** the TUI switches to the Agents, Logs, or Reminders tab respectively, even if that tab is already active
-
-### Requirement: Agents tab supports row selection
-The Agents tab SHALL support moving a selection cursor over its project rows using the `j`/`down` (next row) and `k`/`up` (previous row) keys, so a specific project can be chosen for its details view. The selection SHALL be visually distinguished from unselected rows.
-
-#### Scenario: Moving the selection down
-- **WHEN** the user presses `j` or the down arrow while the Agents tab is active
-- **THEN** the selection cursor moves to the next project row, if one exists
-
-#### Scenario: Moving the selection up
-- **WHEN** the user presses `k` or the up arrow while the Agents tab is active
-- **THEN** the selection cursor moves to the previous project row, if one exists
 
 ### Requirement: Project details modal
 The TUI SHALL open a details modal overlay for a project when the user presses `Enter` on a selected row in the Agents tab (a project row), the Logs tab (an activity log entry, using that entry's project), or the Reminders tab (a reminder row, using that reminder's project) - the same modal, reached from any of the three tabs. The modal SHALL show four panes: an Agents pane listing every agent registered for that project with its status and process id, a Tests pane showing that project's last test run if any, a Reminders pane listing that project's reminders with each row showing that reminder's name, its duration (in minutes) immediately after the name, and its status - truncated with a trailing `...` rather than overflowing the pane's right border if it doesn't fit, the same ellipsis-truncation behavior the Agents tab's AGENTS and REMINDERS columns use - and a Logs pane showing that project's activity log entries, most recent first, with each entry's event time rendered in a fixed-width column at the far right of the pane - aligned at the same horizontal position on every row regardless of that row's category/status text length, consistent with how the Agents tab's UPDATED column stays fixed regardless of its other cells' content - and each agent-category entry additionally showing the reporting agent's process id. In the Logs pane, each test-run-category entry SHALL be prefixed with a tree branch marker (`├─ `) immediately before its status emoji, so it reads as nested beneath the agent activity it ran under, while agent-category and reminder-category entries SHALL render with no such prefix, forming the unindented trunk of the list; this prefix is purely visual and SHALL NOT change entry ordering, the existing category-word prefix, or the fixed-width right-aligned timestamp column. The Logs pane SHALL NOT display column headers. The Agents, Tests, and Reminders panes SHALL be arranged side by side, each occupying one third of the modal's top third (by width), and the Logs pane SHALL occupy the remaining bottom two-thirds, unchanged from before the Reminders pane was added. Agent and test-run statuses in the Agents and Tests panes, reminder statuses in the Reminders pane, and log entry statuses in the Logs pane, SHALL use the same emoji markers, color styling, and duration as their counterparts in the Agents tab, Reminders tab, and Logs tab respectively, so status is visually consistent wherever it appears; the Agents, Tests, and Reminders panes SHALL omit the category-word prefix used in the Agents, Reminders, and Logs tabs, since each pane itself already establishes the category (e.g. "✅ done", "❌ failed", "✅ done, 10m"); the modal's Logs pane SHALL include the category-word prefix, consistent with the top-level Logs tab it mirrors. The user SHALL be able to close the modal with `Esc`, returning to whichever tab was active without altering the underlying agent, test-run, or reminder state. The Reminders pane SHALL be paginated per the "Paginated lists support keyboard navigation" requirement when it holds more reminders than fit on a single page, but unlike the Logs pane it SHALL NOT show a pagination keyboard-shortcut hint in its title; instead its title SHALL always show a hint for creating a new reminder (`New [R]`), regardless of whether its reminders overflow a page. Of the modal's four panes, only the Logs pane and the Reminders pane support a highlighted selection and keyboard interaction; the Agents and Tests panes remain non-interactive information displays. Exactly one of the Logs pane and Reminders pane holds keyboard focus at a time, and the `Tab` key toggles focus between them while the modal is open; opening the modal from the Agents tab or the Logs tab SHALL default focus to the Logs pane, unchanged from before the Reminders pane was added, while opening it from the Reminders tab SHALL default focus to the Reminders pane with the reminder that was selected in the Reminders tab highlighted. While the Reminders pane holds focus, pressing `Enter` or `s` on its highlighted reminder starts it (if not running) or stops it (if running); pressing `e` opens the reminder creation/editing form pre-populated with its name and duration; pressing `Delete` opens a bold, red confirmation dialog that deletes the reminder on `Enter` or dismisses it on `Escape` without deleting - since the key labeled "delete" on most Mac keyboards sends a Backspace control code rather than a true forward-delete (reaching `Delete` itself needs `Fn`+`Delete`, or a dedicated key on an external/PC keyboard), and `Backspace` has no other meaning in this pane, the TUI SHALL treat `Backspace` the same as `Delete` here. When the Reminders pane does not hold focus, these keys SHALL NOT act on it. Pressing `R` opens the same form empty, to create a new reminder for this project - unlike `Enter`/`s`/`e`/`Delete`, this SHALL work regardless of which pane currently holds focus, since creating a reminder does not depend on a highlighted selection the way those do, and its `New [R]` hint is shown in the Reminders pane's title at all times.
@@ -345,6 +217,154 @@ The TUI SHALL open a details modal overlay for a project when the user presses `
 - **WHEN** the Reminders pane holds focus and the user presses `R`
 - **THEN** the TUI opens the reminder form empty, scoped to the modal's project; `Enter` creates the reminder and `Escape` cancels without creating one
 
+### Requirement: Paginated lists support keyboard navigation
+Any paginated list in the TUI (the Logs tab's activity list, the Reminders tab's reminder list, the details modal's Logs pane, and the details modal's Reminders pane) SHALL support `j`/`down` and `k`/`up` to move the selection one line at a time, `d`/page-down and `u`/page-up to move by a full page, and `g`/`G` to jump directly to the list's first or last entry respectively. A page is however many entries currently fit in the list's rendered area at the current terminal size. Paging SHALL overlap the previous page by exactly 1 row: paging down SHALL advance the page's top row by (page size - 1) rows, and paging up SHALL move the page's top row back by (page size - 1) rows, in both cases selecting the new page's top row, clamped so the page never scrolls past the list's first or last entry. Pressing `g` SHALL select the list's first entry and scroll the page so that entry is the page's top row; pressing `G` SHALL select the list's last entry and scroll the page so the last page is showing, consistent with how `d`/page-down already clamps at the list's last page. While the details modal is open, its Logs pane and Reminders pane are each paginated lists, but only the one currently holding keyboard focus (per the "Project details modal" requirement's `Tab`-toggled focus) reacts to `j`/`k`/`d`/`u`/`g`/`G`/page-down/page-up; the other pane, and the Agents, Logs, and Reminders tabs underneath, SHALL NOT receive or react to those keys while the modal is open, consistent with the details modal taking precedence for keyboard shortcuts over whatever page is open beneath it.
+
+#### Scenario: Moving one line at a time
+- **WHEN** the user presses `j`, `down`, `k`, or `up` on a paginated list
+- **THEN** the selection moves by exactly one line in the corresponding direction, if a line is available in that direction
+
+#### Scenario: Paging
+- **WHEN** the user presses `d`, page-down, `u`, or page-up on a paginated list showing more entries than fit on one page
+- **THEN** the page moves by (page size - 1) rows in the corresponding direction and selects the new page's top row, so exactly one row of the previous page remains visible on the new page
+
+#### Scenario: Paging at the start or end of the list clamps instead of overshooting
+- **WHEN** the user presses `u`/page-up while already on the list's first page, or `d`/page-down while already on the list's last page
+- **THEN** the selection and page stay clamped at the first or last entry rather than scrolling past it
+
+#### Scenario: The details modal's Logs pane keys do not leak to the Logs tab underneath
+- **WHEN** the details modal is open and the user presses `j`, `k`, `d`, `u`, `g`, `G`, page-down, or page-up
+- **THEN** only the pane currently holding focus (the Logs pane or the Reminders pane) updates its selection and page; the other pane, and the Agents, Logs, and Reminders tabs underneath, remain unchanged
+
+#### Scenario: Jumping to the first entry
+- **WHEN** the user presses `g` on a paginated list that is not already showing its first page
+- **THEN** the selection moves to the list's first entry and the page scrolls so that entry is the top row shown
+
+#### Scenario: Jumping to the last entry
+- **WHEN** the user presses `G` on a paginated list that is not already showing its last page
+- **THEN** the selection moves to the list's last entry and the page scrolls so the list's final page is showing, with the last entry visible
+
+#### Scenario: Jumping to the first or last entry when already there is a no-op
+- **WHEN** the user presses `g` while the list's first entry is already selected, or `G` while the list's last entry is already selected
+- **THEN** the selection and page remain unchanged
+
+### Requirement: Status is visually distinguishable
+The TUI SHALL visually distinguish agent statuses (e.g. running, idle, needs input, done, stale, declined) and test-run statuses (running, passed, failed) from one another so the user can scan the list and immediately identify agents or test runs needing attention. Each agent status SHALL be prefixed with a distinct emoji marker in addition to any color/style distinction: running with 🔧, idle with 💤, needs input with 🔔, done with ✅, stale with 👻, and declined with 🚫. Each test-run status SHALL be prefixed with a distinct emoji marker: running with ⏳, passed with ✅, and failed with ❌. A reminder's status SHALL reuse these existing emoji markers rather than introducing new ones: running reuses ⏳ (the same marker as a running test run) and done reuses ✅ (the same marker as a done agent or a passed test run), so a reminder's status is instantly recognizable by an emoji the user already associates with "in progress" or "finished". In the Logs tab and the details modal's Logs pane, a reminder-category log entry SHALL instead use a single fixed marker, ⏰, regardless of whether its status is started, stopped, or finished - unlike agent and test-run entries, which use a different emoji per status - since a reminder log entry's value is in marking it as a reminder event at a glance, not in re-deriving its status from an already text-labeled entry. Its color SHALL still vary by status, though: "finished" (a natural completion) SHALL use the same Green used for a "done" agent or a "passed" test run; "stopped" (a manual interruption) SHALL use a color distinct from both "started" and "finished", since it is neither the beginning nor the successful end of a run. When a project's Agents cell reflects more than one tracked agent in different statuses, the cell SHALL show each distinct status present rather than collapsing them into a single "winning" status, so no status needing attention is hidden behind another. On the currently-selected row in the Agents tab, the Logs tab, or the Reminders tab, the TUI SHALL override every status's own foreground color with a single fixed foreground color chosen to stay legible against the row-highlight background, rather than requiring the row-highlight background to avoid every status's own color.
+
+#### Scenario: An agent needs input
+- **WHEN** an agent's status is "needs input"
+- **THEN** that status's contribution to the row displays the 🔔 marker and is visually distinguished (e.g. color) from other statuses shown, using bold colored text rather than a solid background fill
+
+#### Scenario: Each status has a distinct emoji marker
+- **WHEN** the TUI renders an agent's status within a project row
+- **THEN** that status is prefixed with the emoji for that status (🔧 running, 💤 idle, 🔔 needs input, ✅ done, 👻 stale, 🚫 declined)
+
+#### Scenario: The stale marker renders full-width
+- **WHEN** the TUI renders an agent's "stale" status
+- **THEN** it uses the 👻 marker rather than 🕸️, since 👻 renders reliably full-width across terminals and does not corrupt the row-highlight background the way 🕸️ did
+
+#### Scenario: A declined permission is visually distinguished
+- **WHEN** an agent's status is "declined"
+- **THEN** that status's contribution to the row displays the 🚫 marker and is visually distinguished (e.g. color) from other statuses shown
+
+#### Scenario: A failing test run is visually distinguished
+- **WHEN** a test run's status is "failed"
+- **THEN** that status's contribution to the row displays the ❌ marker and is visually distinguished (e.g. color) from other statuses shown
+
+#### Scenario: Each test-run status has a distinct emoji marker
+- **WHEN** the TUI renders a test run's status within a project row
+- **THEN** that status is prefixed with the emoji for that status (⏳ running, ✅ passed, ❌ failed)
+
+#### Scenario: A project with multiple agent statuses shows each one
+- **WHEN** a project has two or more tracked agents whose statuses differ from one another
+- **THEN** the row's Agents cell lists each distinct status present among those agents (for example, both running and needs input), rather than showing only one
+
+#### Scenario: An agent status and a test-run status are shown together
+- **WHEN** a project has both a tracked agent and a test run whose statuses differ
+- **THEN** the row's Agents cell shows the agent's status and the row's Tests cell shows the test run's status, each in its own column rather than sharing one
+
+#### Scenario: A running status stays legible on the selected row
+- **WHEN** a project row showing the "running" status is the currently-selected (highlighted) row in the Agents tab
+- **THEN** the status's label and emoji remain visible, rendered in the row's fixed selected-row foreground color rather than the status's own color
+
+#### Scenario: A selected row's text overrides every status's own color
+- **WHEN** any row in the Agents tab, the Logs tab, or the Reminders tab is the currently-selected (highlighted) row, regardless of which status or statuses it shows
+- **THEN** all of that row's status text renders in the same fixed selected-row foreground color, rather than in each status's own color
+
+#### Scenario: A running reminder reuses the running test-run emoji
+- **WHEN** the TUI renders a reminder whose status is running, in the Reminders tab, the Agents tab's Reminders column, or the details modal's Reminders pane
+- **THEN** that status displays the ⏳ marker, the same marker a running test run uses
+
+#### Scenario: A done reminder reuses the done/passed emoji
+- **WHEN** the TUI renders a reminder whose status is done, in the Reminders tab, the Agents tab's Reminders column, or the details modal's Reminders pane
+- **THEN** that status displays the ✅ marker, the same marker a done agent or a passed test run uses
+
+#### Scenario: A reminder log entry always shows the clock marker
+- **WHEN** the Logs tab or the details modal's Logs pane renders a log entry whose category is reminder
+- **THEN** that entry displays the ⏰ marker regardless of whether its status is started, stopped, or finished
+
+#### Scenario: A finished reminder log entry is green
+- **WHEN** the Logs tab or the details modal's Logs pane renders a reminder log entry whose status is finished
+- **THEN** that entry's text is colored the same Green used for a "done" agent or a "passed" test run
+
+#### Scenario: A stopped reminder log entry is visually distinct from started and finished
+- **WHEN** the Logs tab or the details modal's Logs pane renders a reminder log entry whose status is stopped
+- **THEN** that entry's text is colored differently from both a "started" and a "finished" reminder log entry
+
+### Requirement: Status labels are prefixed by category outside dedicated panes
+In the Agents tab and the Logs tab, each status label SHALL be prefixed with a category word - "agent" for an agent status, "tests" for a test-run status, or "reminder" for a reminder-category log entry - immediately after its emoji marker and before the status word (e.g. "✅ agent done", "⏳ tests started", "⏰ reminder finished"), so a label read in a cross-category view is unambiguous about which kind of status it names. The Agents tab's Reminders column is the one exception to this cross-category rule: it SHALL NOT include the category-word prefix, since the column's narrow width prioritizes the reminder's own name (the primary content of that cell) and the REMINDERS column header already establishes the category. In the details modal, the Agents pane, Tests pane, and Reminders pane SHALL NOT include this category-word prefix, since the pane itself already establishes the category (e.g. "✅ done", "❌ failed"); the modal's Logs pane SHALL include the category-word prefix, consistent with the top-level Logs tab it mirrors. The top-level Reminders tab's Status column SHALL likewise NOT include this category-word prefix, since the tab already dedicates its entire view to reminders, consistent with how the modal's Agents and Tests panes omit it.
+
+#### Scenario: The Agents tab prefixes an agent status with its category word
+- **WHEN** the Agents tab renders an agent's status in its Agents column
+- **THEN** the label reads the emoji, then "agent", then the status word (e.g. "✅ agent done"), rather than omitting the category word
+
+#### Scenario: The Agents tab prefixes a test-run status with its category word
+- **WHEN** the Agents tab renders a project's test-run status in its Tests column
+- **THEN** the label reads the emoji, then "tests", then the status word (e.g. "⏳ tests running"), rather than omitting the category word
+
+#### Scenario: The Agents tab's Reminders column omits the category-word prefix
+- **WHEN** the Agents tab renders a project's reminder status in its Reminders column
+- **THEN** the label omits the category word (e.g. an emoji followed directly by the reminder's bold name), unlike its Agents and Tests columns
+
+#### Scenario: The Logs tab prefixes entries with their category word
+- **WHEN** the Logs tab renders an entry
+- **THEN** the label includes the category word ("agent", "tests", or "reminder") alongside its emoji and status, consistent with the Agents tab
+
+#### Scenario: The details modal's Agents and Tests panes omit the category-word prefix
+- **WHEN** the details modal renders a status in its Agents pane, Tests pane, or Reminders pane
+- **THEN** the label omits the category word (e.g. "✅ done", not "✅ agent done")
+
+#### Scenario: The details modal's Logs pane keeps the category-word prefix
+- **WHEN** the details modal renders an entry in its Logs pane
+- **THEN** the label includes the category word, consistent with the top-level Logs tab
+
+#### Scenario: The Reminders tab omits the category-word prefix
+- **WHEN** the Reminders tab renders a reminder's status in its Status column
+- **THEN** the label omits the category word (e.g. "⏳ running"), since the tab already dedicates its view to reminders
+
+### Requirement: Project name column scales with terminal width
+The TUI's PROJECT column SHALL NOT be capped at a fixed 20-character width. Its width SHALL scale with the terminal's available width, growing on wider terminals instead of always truncating project names at the same fixed length. The Agents, Tests, and Reminders columns SHALL each be sized to the widest content actually present among the currently displayed rows (never narrower than that column's own header), rather than a fixed proportion of the row's width - so a column whose current content is short or empty does not reserve space it isn't using, and a column that needs more room (e.g. a long reminder name) can draw on that freed-up space instead of being truncated while its neighbors sit mostly blank. Any space left over once PROJECT, Agents, Tests, and Reminders all have what they need SHALL be split among PROJECT, Agents, and Tests in a 2:3:2 ratio; Agents and Tests SHALL continue to receive the majority of it between them, since status segments are typically the widest content in a row. The Reminders column SHALL NOT receive a share of this leftover space beyond what its own content needs. To keep one unusually long row from dominating and squeezing every other column down to nothing, each of PROJECT, Agents, Tests, and Reminders SHALL be capped at half of the total space available to these four columns; content that doesn't fit within a column's resulting width is truncated per the "Overflowing content is truncated with an ellipsis" requirement (PROJECT is the exception - it clips without an ellipsis, consistent with existing table-rendering behavior for very long names). The UPDATED column's width is unaffected by this requirement.
+
+#### Scenario: A wide terminal shows more of a long project name
+- **WHEN** the TUI renders in a terminal wide enough to fit a project name longer than 20 characters alongside the Agents, Tests, and UPDATED columns
+- **THEN** the PROJECT column renders more than 20 characters of that name, rather than clipping it at 20
+
+#### Scenario: A narrow terminal still clips names that don't fit
+- **WHEN** the TUI renders in a terminal too narrow to fit a project name in full alongside the other columns
+- **THEN** the PROJECT column clips the name to the space available, consistent with existing table-rendering behavior
+
+#### Scenario: A column with short content frees up space for its neighbors
+- **WHEN** the Agents and Tests columns' current content is short (e.g. a single agent idle, no test run) while the Reminders column needs more room than a fixed proportional share would give it
+- **THEN** the Agents and Tests columns shrink to what their content needs and the Reminders column uses the space that frees up, rather than staying cramped next to mostly-blank columns
+
+#### Scenario: A column with blank content still shows its header
+- **WHEN** a column (e.g. Reminders) has no content to show for any currently displayed row
+- **THEN** that column is still at least as wide as its own header text
+
+#### Scenario: One row's unusually long content does not starve the other columns
+- **WHEN** a single row's content in one column (e.g. a very long reminder name) would otherwise claim most of the table's width
+- **THEN** that column is capped at half of the four dynamic columns' total available space, and its content is truncated with an ellipsis to fit rather than shrinking every other column to fit it
+
 ### Requirement: Logs tab shows an aggregated, paginated activity list
 The Logs tab SHALL display the activity log entries received from the daemon, aggregated across all projects, as a paginated list ordered by recency (most recent first) by default. Each entry SHALL show at least its project, event category, status, and event time, with event time as the last (rightmost) column, consistent with the Agents tab's UPDATED column. Each entry's status SHALL use the same emoji marker and color styling as that status uses in the Agents tab, so status is visually distinguishable the same way it already is there. A test-run entry whose status is "passed" or "failed", an agent entry whose status is "done", or a reminder entry whose status is "finished" or "stopped", SHALL additionally show the elapsed duration of that run/task/reminder, computed from the most recent preceding "started" entry of the same category logged for the same project - for a reminder entry, additionally matched to the "started" entry recording the same reminder name, since a project can have more than one reminder interleaved in the log and an agent/test-run has no equivalent identity to disambiguate by. Whenever the list holds more entries than fit on a single page, the Logs tab SHALL display a Ratatui vertical `Scrollbar` widget along its right edge, positioned so the scrollbar's thumb reaches the very bottom of its track when the list's last page is being shown (and the very top when its first page is being shown), and its heading SHALL append a pagination keyboard-shortcut hint alongside its existing sort and filter hints; neither the scrollbar nor the pagination hint SHALL be shown when every (filtered) entry already fits on a single page.
 
@@ -412,20 +432,7 @@ The Logs tab SHALL display the activity log entries received from the daemon, ag
 - **WHEN** the Logs tab renders a "finished" or "stopped" reminder entry, and a different reminder in the same project also has "started"/"finished"/"stopped" entries interleaved with it in the log
 - **THEN** the displayed duration is computed only from that reminder's own preceding "started" entry (matched by reminder name), not another reminder's
 
-### Requirement: Logs tab supports sorting and filtering
-The Logs tab SHALL support sorting its entries by recency (the default), by Project, or by Status, and filtering the displayed entries by Project or by Status.
-
-#### Scenario: Changing sort order
-- **WHEN** the user selects Project or Status as the sort option on the Logs tab
-- **THEN** the displayed entries reorder accordingly instead of by recency
-
-#### Scenario: Filtering by project
-- **WHEN** the user applies a Project filter on the Logs tab
-- **THEN** only entries belonging to that project are displayed
-
-#### Scenario: Filtering by status
-- **WHEN** the user applies a Status filter on the Logs tab
-- **THEN** only entries matching that status are displayed
+## ADDED Requirements
 
 ### Requirement: Reminders tab shows an aggregated, paginated reminder list
 The Reminders tab SHALL display every project's reminders, aggregated across all projects, as a paginated list ordered by recency (the last time each reminder completed a run - stopped or naturally finished - most recent first) by default. Each row SHALL show the reminder's Project, Name, Duration (in minutes), Status, and Updated columns. The Status column SHALL be blank when the reminder has no started/stopped/finished log event yet (it is still not-yet-started). While a reminder is running, the Status column SHALL show its live elapsed duration and its estimated time of completion, formatted like "Running 1m23s, ETA: 12:34", prefixed with the ⏳ marker, and kept current by the TUI's own periodic redraw, consistent with a running agent's or test run's duration. Once a reminder is done (stopped or finished), the Status column SHALL show its elapsed duration formatted like "Done 10m", prefixed with the ✅ marker. The Updated column SHALL show the time of the reminder's most recent started, stopped, or finished log event, or, if it has none, the time the reminder was created. Whenever the list holds more reminders than fit on a single page, the Reminders tab SHALL display a Ratatui vertical `Scrollbar` widget along its right edge, positioned so the scrollbar's thumb reaches the very bottom of its track when the list's last page is being shown (and the very top when its first page is being shown), and its heading SHALL append a pagination keyboard-shortcut hint alongside its existing sort and filter hints; neither the scrollbar nor the pagination hint SHALL be shown when every (filtered) reminder already fits on a single page.
@@ -492,78 +499,6 @@ The Reminders tab SHALL support moving a selection cursor over its reminder rows
 - **WHEN** the user presses `s` on a highlighted reminder that is running
 - **THEN** the TUI sends a stop request for that reminder, and no notification is sent
 
-### Requirement: Paginated lists support keyboard navigation
-Any paginated list in the TUI (the Logs tab's activity list, the Reminders tab's reminder list, the details modal's Logs pane, and the details modal's Reminders pane) SHALL support `j`/`down` and `k`/`up` to move the selection one line at a time, `d`/page-down and `u`/page-up to move by a full page, and `g`/`G` to jump directly to the list's first or last entry respectively. A page is however many entries currently fit in the list's rendered area at the current terminal size. Paging SHALL overlap the previous page by exactly 1 row: paging down SHALL advance the page's top row by (page size - 1) rows, and paging up SHALL move the page's top row back by (page size - 1) rows, in both cases selecting the new page's top row, clamped so the page never scrolls past the list's first or last entry. Pressing `g` SHALL select the list's first entry and scroll the page so that entry is the page's top row; pressing `G` SHALL select the list's last entry and scroll the page so the last page is showing, consistent with how `d`/page-down already clamps at the list's last page. While the details modal is open, its Logs pane and Reminders pane are each paginated lists, but only the one currently holding keyboard focus (per the "Project details modal" requirement's `Tab`-toggled focus) reacts to `j`/`k`/`d`/`u`/`g`/`G`/page-down/page-up; the other pane, and the Agents, Logs, and Reminders tabs underneath, SHALL NOT receive or react to those keys while the modal is open, consistent with the details modal taking precedence for keyboard shortcuts over whatever page is open beneath it.
-
-#### Scenario: Moving one line at a time
-- **WHEN** the user presses `j`, `down`, `k`, or `up` on a paginated list
-- **THEN** the selection moves by exactly one line in the corresponding direction, if a line is available in that direction
-
-#### Scenario: Paging
-- **WHEN** the user presses `d`, page-down, `u`, or page-up on a paginated list showing more entries than fit on one page
-- **THEN** the page moves by (page size - 1) rows in the corresponding direction and selects the new page's top row, so exactly one row of the previous page remains visible on the new page
-
-#### Scenario: Paging at the start or end of the list clamps instead of overshooting
-- **WHEN** the user presses `u`/page-up while already on the list's first page, or `d`/page-down while already on the list's last page
-- **THEN** the selection and page stay clamped at the first or last entry rather than scrolling past it
-
-#### Scenario: The details modal's Logs pane keys do not leak to the Logs tab underneath
-- **WHEN** the details modal is open and the user presses `j`, `k`, `d`, `u`, `g`, `G`, page-down, or page-up
-- **THEN** only the pane currently holding focus (the Logs pane or the Reminders pane) updates its selection and page; the other pane, and the Agents, Logs, and Reminders tabs underneath, remain unchanged
-
-#### Scenario: Jumping to the first entry
-- **WHEN** the user presses `g` on a paginated list that is not already showing its first page
-- **THEN** the selection moves to the list's first entry and the page scrolls so that entry is the top row shown
-
-#### Scenario: Jumping to the last entry
-- **WHEN** the user presses `G` on a paginated list that is not already showing its last page
-- **THEN** the selection moves to the list's last entry and the page scrolls so the list's final page is showing, with the last entry visible
-
-#### Scenario: Jumping to the first or last entry when already there is a no-op
-- **WHEN** the user presses `g` while the list's first entry is already selected, or `G` while the list's last entry is already selected
-- **THEN** the selection and page remain unchanged
-
-### Requirement: Keyboard shortcuts help modal
-The TUI SHALL open a help modal listing all available keyboard shortcuts when the user presses `?`. The user SHALL be able to close it with `Esc`. The listed shortcuts SHALL include `g`/`G` (jump to first/last entry) alongside the other paginated-list navigation keys (`j`/`k`, `d`/`u`).
-
-#### Scenario: Opening help
-- **WHEN** the user presses `?`
-- **THEN** the TUI displays a modal overlay listing the available keyboard shortcuts
-
-#### Scenario: Closing help
-- **WHEN** the user presses `Esc` while the help modal is open
-- **THEN** the TUI closes the help modal and returns to the previously active tab
-
-#### Scenario: Help lists the jump-to-start/end shortcuts
-- **WHEN** the user opens the help modal
-- **THEN** the listed shortcuts include `g` and `G` for jumping to a paginated list's first and last entry
-
-### Requirement: Empty-state placeholders appear in the table body, not the pane title
-When the Agents tab has no tracked agents or test runs, and when the Logs tab's full (unfiltered) activity log is empty, the TUI SHALL show that empty state as gray placeholder text in the table body beneath the header, matching the existing convention used when a Logs tab filter matches nothing. The pane title SHALL NOT carry this placeholder text; the Logs tab's title SHALL continue to show its sort/filter control hints regardless of whether the log is empty.
-
-#### Scenario: No agents tracked yet
-- **WHEN** the daemon reports no tracked agents and no test runs
-- **THEN** the Agents tab's title reads "Agents" and its table body shows gray placeholder text indicating no agents are tracked yet
-
-#### Scenario: No activity logged yet
-- **WHEN** the daemon's activity log is empty
-- **THEN** the Logs tab's title shows only its sort/filter control hints (no empty-state text) and its table body shows gray placeholder text indicating no activity has been logged yet
-
-### Requirement: Agents tab splits agent and test-run status into separate columns
-The Agents tab SHALL display a project's agent status(es) and its test-run status in two separate columns, **Agents** and **Tests**, instead of one combined STATUS column. The Agents column SHALL show that project's tracked agent(s)' status(es); the Tests column SHALL show that project's test run status, if any, or remain empty if the project has no tracked test run.
-
-#### Scenario: The Agents tab header shows separate columns
-- **WHEN** the Agents tab renders its header row
-- **THEN** it shows "AGENTS" and "TESTS" as separate column headers rather than a single "STATUS" header
-
-#### Scenario: A project with only agents leaves the Tests column empty
-- **WHEN** a project has tracked agent(s) but no tracked test run
-- **THEN** its row's Agents column shows the agent status(es) and its Tests column is empty
-
-#### Scenario: A project with only a test run leaves the Agents column empty
-- **WHEN** a project has a tracked test run but no tracked agent
-- **THEN** its row's Tests column shows the test run's status and its Agents column is empty
-
 ### Requirement: Agents tab shows a Reminders column
 The Agents tab SHALL display a fourth column, **Reminders**, alongside PROJECT, Agents, Tests, and UPDATED. A project with a running reminder SHALL show a status emoji per the "Status is visually distinguishable" requirement, then that reminder's name (bold), then its live elapsed duration and ETA, formatted like "⏳ **Check the thing** 1m23s, ETA 12:34" - without the category-word prefix the Agents and Tests columns carry, per the "Status labels are prefixed by category outside dedicated panes" requirement's exception for this column. A project whose most recent reminder activity is a stop or a natural finish, with no reminder currently running, SHALL show its emoji, name, and outcome and duration, formatted like "✅ **Check the thing** completed/stopped, 10m". A project with two or more reminders with activity to show SHALL present them separated by a bullet, ordered by recency, the same convention the Agents column already uses for multiple agents. A project with no reminders SHALL leave the Reminders column empty. If either the Agents column's or the Reminders column's content exceeds its available column width, the TUI SHALL truncate it with a trailing `...` rather than wrapping or overflowing into adjacent columns.
 
@@ -586,37 +521,6 @@ The Agents tab SHALL display a fourth column, **Reminders**, alongside PROJECT, 
 #### Scenario: Overflowing content is truncated with an ellipsis
 - **WHEN** the Agents column's or the Reminders column's content would exceed its available column width
 - **THEN** the TUI truncates that cell's content with a trailing `...` instead of wrapping or overflowing
-
-### Requirement: Status labels are prefixed by category outside dedicated panes
-In the Agents tab and the Logs tab, each status label SHALL be prefixed with a category word - "agent" for an agent status, "tests" for a test-run status, or "reminder" for a reminder-category log entry - immediately after its emoji marker and before the status word (e.g. "✅ agent done", "⏳ tests started", "⏰ reminder finished"), so a label read in a cross-category view is unambiguous about which kind of status it names. The Agents tab's Reminders column is the one exception to this cross-category rule: it SHALL NOT include the category-word prefix, since the column's narrow width prioritizes the reminder's own name (the primary content of that cell) and the REMINDERS column header already establishes the category. In the details modal, the Agents pane, Tests pane, and Reminders pane SHALL NOT include this category-word prefix, since the pane itself already establishes the category (e.g. "✅ done", "❌ failed"); the modal's Logs pane SHALL include the category-word prefix, consistent with the top-level Logs tab it mirrors. The top-level Reminders tab's Status column SHALL likewise NOT include this category-word prefix, since the tab already dedicates its entire view to reminders, consistent with how the modal's Agents and Tests panes omit it.
-
-#### Scenario: The Agents tab prefixes an agent status with its category word
-- **WHEN** the Agents tab renders an agent's status in its Agents column
-- **THEN** the label reads the emoji, then "agent", then the status word (e.g. "✅ agent done"), rather than omitting the category word
-
-#### Scenario: The Agents tab prefixes a test-run status with its category word
-- **WHEN** the Agents tab renders a project's test-run status in its Tests column
-- **THEN** the label reads the emoji, then "tests", then the status word (e.g. "⏳ tests running"), rather than omitting the category word
-
-#### Scenario: The Agents tab's Reminders column omits the category-word prefix
-- **WHEN** the Agents tab renders a project's reminder status in its Reminders column
-- **THEN** the label omits the category word (e.g. an emoji followed directly by the reminder's bold name), unlike its Agents and Tests columns
-
-#### Scenario: The Logs tab prefixes entries with their category word
-- **WHEN** the Logs tab renders an entry
-- **THEN** the label includes the category word ("agent", "tests", or "reminder") alongside its emoji and status, consistent with the Agents tab
-
-#### Scenario: The details modal's Agents and Tests panes omit the category-word prefix
-- **WHEN** the details modal renders a status in its Agents pane, Tests pane, or Reminders pane
-- **THEN** the label omits the category word (e.g. "✅ done", not "✅ agent done")
-
-#### Scenario: The details modal's Logs pane keeps the category-word prefix
-- **WHEN** the details modal renders an entry in its Logs pane
-- **THEN** the label includes the category word, consistent with the top-level Logs tab
-
-#### Scenario: The Reminders tab omits the category-word prefix
-- **WHEN** the Reminders tab renders a reminder's status in its Status column
-- **THEN** the label omits the category word (e.g. "⏳ running"), since the tab already dedicates its view to reminders
 
 ### Requirement: Reminder creation and editing form
 The TUI SHALL provide a modal form, opened from the details modal's Reminders pane, for creating (`R`) or editing (`e`) a reminder, with a Name field and a Duration-in-minutes field. `Tab` SHALL move focus between the two fields. When opened for editing, both fields SHALL be pre-populated with the highlighted reminder's current name and duration. Pressing `Enter` SHALL save the form - creating a new reminder for the modal's project, or applying the edited name/duration to the reminder being edited - and close the form. Pressing `Escape` SHALL close the form without creating a reminder or applying any edit made since it was opened. While the form is open, the TUI SHALL show the terminal's own text cursor positioned immediately after the active field's current text (before the Duration field's trailing "m"), so the user can see where the next typed character will land; the cursor SHALL move as focus moves between fields and as characters are typed or removed. Once the daemon confirms a newly-created reminder (the daemon assigns its id, so this cannot happen synchronously with `Enter`), the TUI SHALL highlight it in the Reminders pane - focusing that pane if it does not already hold focus - and start it, the same as if the user had pressed `Enter`/`s` on it themselves; this SHALL NOT happen for an edited (as opposed to newly-created) reminder.
