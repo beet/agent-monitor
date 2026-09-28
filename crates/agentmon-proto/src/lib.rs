@@ -145,6 +145,11 @@ pub struct LogEntry {
     /// reminder-category entries, so a later-deleted reminder's past entries
     /// keep showing the name it had when each was recorded.
     pub reminder_name: Option<String>,
+    /// Unix epoch milliseconds of the reminder's due time as of this event.
+    /// Populated only for reminder-category "started" entries, computed from
+    /// its start time and duration at the moment it started; it does not
+    /// change if the reminder's duration is edited later.
+    pub reminder_due_at_ms: Option<u64>,
 }
 
 /// Identifies a reminder across client commands and daemon updates.
@@ -337,6 +342,7 @@ mod tests {
             occurred_at_ms: 1_700_000_000_000,
             pid: Some(4242),
             reminder_name: None,
+            reminder_due_at_ms: None,
         }
     }
 
@@ -417,6 +423,28 @@ mod tests {
 
         assert_eq!(entry, decoded);
         assert_eq!(decoded.reminder_name.as_deref(), Some("Check the build"));
+    }
+
+    #[test]
+    fn started_reminder_log_entry_round_trips_with_its_eta() {
+        let entry = LogEntry {
+            category: LogCategory::Reminder,
+            status: "started".to_string(),
+            pid: None,
+            reminder_name: Some("Check the build".to_string()),
+            reminder_due_at_ms: Some(1_700_000_600_000),
+            ..sample_log_entry()
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, decoded);
+        assert_eq!(decoded.reminder_due_at_ms, Some(1_700_000_600_000));
+        assert!(
+            json.contains("\"reminder_due_at_ms\":1700000600000"),
+            "expected reminder_due_at_ms field in JSON, got: {json}"
+        );
     }
 
     #[test]

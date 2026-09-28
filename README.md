@@ -137,6 +137,7 @@ classDiagram
         +u64 occurred_at_ms
         +Option~u32~ pid
         +Option~String~ reminder_name
+        +Option~u64~ reminder_due_at_ms
     }
     class AgentStatus {
         <<enumeration>>

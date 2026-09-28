@@ -575,6 +575,7 @@ mod tests {
             occurred_at_ms: 1,
             pid: Some(1),
             reminder_name: None,
+            reminder_due_at_ms: None,
         }]);
 
         press(&mut app, KeyCode::Enter);
@@ -595,6 +596,7 @@ mod tests {
                 occurred_at_ms: 1,
                 pid: Some(1),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             },
             LogEntry {
                 working_dir: "/tmp/b".into(),
@@ -603,6 +605,7 @@ mod tests {
                 occurred_at_ms: 2,
                 pid: Some(1),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             },
         ]);
 
@@ -631,6 +634,7 @@ mod tests {
                     occurred_at_ms: i,
                     pid: Some(1),
                     reminder_name: None,
+                    reminder_due_at_ms: None,
                 })
                 .collect(),
         );
@@ -657,6 +661,7 @@ mod tests {
                     occurred_at_ms: i,
                     pid: Some(1),
                     reminder_name: None,
+                    reminder_due_at_ms: None,
                 })
                 .collect(),
         );
@@ -680,6 +685,7 @@ mod tests {
             occurred_at_ms: 1,
             pid: Some(1),
             reminder_name: None,
+            reminder_due_at_ms: None,
         }]);
 
         press(&mut app, KeyCode::Char('o'));
@@ -739,6 +745,7 @@ mod tests {
                     occurred_at_ms: i,
                     pid: Some(1),
                     reminder_name: None,
+                    reminder_due_at_ms: None,
                 })
                 .collect(),
         );
@@ -770,6 +777,7 @@ mod tests {
                     occurred_at_ms: i,
                     pid: Some(1),
                     reminder_name: None,
+                    reminder_due_at_ms: None,
                 })
                 .collect(),
         );

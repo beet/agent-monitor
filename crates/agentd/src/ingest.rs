@@ -89,6 +89,7 @@ impl Ingestor {
                 occurred_at_ms: outcome.agent.run_started_ms,
                 pid: Some(outcome.agent.pid),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             });
         }
         if should_notify(outcome.previous_status, outcome.agent.status) {
@@ -100,6 +101,7 @@ impl Ingestor {
                 occurred_at_ms: now_ms(),
                 pid: Some(outcome.agent.pid),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             });
         }
         (outcome.agent, outcome.retired_session_ids)
@@ -120,6 +122,7 @@ impl Ingestor {
             occurred_at_ms: now_ms(),
             pid: Some(test_run.pid),
             reminder_name: None,
+            reminder_due_at_ms: None,
         });
         test_run
     }
@@ -154,16 +157,20 @@ impl Ingestor {
     }
 
     /// Starts a reminder (fresh, or a re-run) and logs a "started" entry
-    /// carrying its current name.
+    /// carrying its current name and its due time (ETA) as of this start -
+    /// a snapshot that does not follow a later edit to the reminder's
+    /// duration.
     pub fn ingest_start_reminder(&self, id: &ReminderId) -> Option<ReminderInfo> {
         let reminder = self.reminders.start(id)?;
+        let run_started_ms = reminder.run_started_ms.unwrap_or_else(now_ms);
         self.record_log(LogEntry {
             working_dir: reminder.cwd.clone(),
             category: LogCategory::Reminder,
             status: "started".to_string(),
-            occurred_at_ms: reminder.run_started_ms.unwrap_or_else(now_ms),
+            occurred_at_ms: run_started_ms,
             pid: None,
             reminder_name: Some(reminder.name.clone()),
+            reminder_due_at_ms: Some(run_started_ms + reminder.duration_minutes as u64 * 60_000),
         });
         Some(reminder)
     }
@@ -179,6 +186,7 @@ impl Ingestor {
             occurred_at_ms: reminder.last_updated_ms,
             pid: None,
             reminder_name: Some(reminder.name.clone()),
+            reminder_due_at_ms: None,
         });
         Some(reminder)
     }
@@ -195,6 +203,7 @@ impl Ingestor {
             occurred_at_ms: reminder.last_updated_ms,
             pid: None,
             reminder_name: Some(reminder.name.clone()),
+            reminder_due_at_ms: None,
         });
     }
 
@@ -863,7 +872,7 @@ mod tests {
             .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10)
             .unwrap();
 
-        ingestor.ingest_start_reminder(&created.id);
+        let started = ingestor.ingest_start_reminder(&created.id).unwrap();
 
         let logs = ingestor.activity_log().snapshot();
         assert_eq!(logs.len(), 1);
@@ -871,6 +880,11 @@ mod tests {
         assert_eq!(logs[0].status, "started");
         assert_eq!(logs[0].reminder_name.as_deref(), Some("Check the build"));
         assert_eq!(logs[0].pid, None);
+        assert_eq!(
+            logs[0].reminder_due_at_ms,
+            Some(started.run_started_ms.unwrap() + 10 * 60_000),
+            "a started reminder's log entry should record its ETA as start time + duration"
+        );
     }
 
     #[test]
@@ -888,6 +902,7 @@ mod tests {
         let stopped_entry = logs.iter().find(|e| e.status == "stopped").unwrap();
         assert_eq!(stopped_entry.category, LogCategory::Reminder);
         assert_eq!(stopped_entry.reminder_name.as_deref(), Some("Check the build"));
+        assert_eq!(stopped_entry.reminder_due_at_ms, None);
         assert!(
             notifier.reminder_calls.lock().unwrap().is_empty(),
             "stopping a reminder must not send a notification"
@@ -912,6 +927,7 @@ mod tests {
         let finished_entry = logs.iter().find(|e| e.status == "finished").unwrap();
         assert_eq!(finished_entry.category, LogCategory::Reminder);
         assert_eq!(finished_entry.reminder_name.as_deref(), Some("Check the build"));
+        assert_eq!(finished_entry.reminder_due_at_ms, None);
     }
 
     #[test]

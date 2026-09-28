@@ -1387,6 +1387,7 @@ mod tests {
             occurred_at_ms,
             pid: Some(1),
             reminder_name: None,
+            reminder_due_at_ms: None,
         }
     }
 

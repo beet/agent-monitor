@@ -52,6 +52,7 @@ mod tests {
             occurred_at_ms,
             pid: None,
             reminder_name: None,
+            reminder_due_at_ms: None,
         }
     }
 

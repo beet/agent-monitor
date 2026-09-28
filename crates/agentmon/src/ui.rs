@@ -467,11 +467,12 @@ fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option
 }
 
 /// Builds a log entry's styled status text, appending the reminder's name
-/// (for reminder-category entries) and an elapsed duration for a completed
-/// run/task, so its total time is visible the same way it already is on the
-/// Agents tab - see `log_completion_duration_ms`. The name comes before the
-/// duration (e.g. "reminder finished: Check the build 10m"), reading as a
-/// single "what, how long" phrase.
+/// (for reminder-category entries), its ETA (for a "started" reminder entry),
+/// and an elapsed duration for a completed run/task, so its total time is
+/// visible the same way it already is on the Agents tab - see
+/// `log_completion_duration_ms`. The name comes before the ETA/duration
+/// (e.g. "reminder finished: Check the build 10m", "reminder started: Check
+/// the build, ETA: 10:45"), reading as a single "what, when/how long" phrase.
 fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
     let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
     // Carries the reminder's name as of this event, so a later-deleted
@@ -479,6 +480,14 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
     // reminder's log entries keep its name" scenario.
     if let Some(name) = &entry.reminder_name {
         text.push_str(&format!(": {name}"));
+    }
+    // A "started" reminder entry has no elapsed run yet, so it shows its
+    // recorded ETA instead of a duration - a point-in-time fact captured
+    // when it started, not recomputed from the reminder's current duration.
+    if entry.category == agentmon_proto::LogCategory::Reminder && entry.status == "started" {
+        if let Some(due_at_ms) = entry.reminder_due_at_ms {
+            text.push_str(&format!(", ETA: {}", format_eta_ms(due_at_ms)));
+        }
     }
     if let Some(duration_ms) = log_completion_duration_ms(all_logs, entry) {
         text.push(' ');
@@ -1192,14 +1201,21 @@ fn format_reminder_duration_ms(elapsed_ms: u64) -> String {
     }
 }
 
+/// Formats a Unix epoch milliseconds timestamp as the system's local time,
+/// `HH:MM` (e.g. `12:34`) - the "ETA" shown wherever a reminder's due time
+/// appears, whether computed live (`format_reminder_eta`) or read from a
+/// log entry's recorded due time.
+fn format_eta_ms(due_at_ms: u64) -> String {
+    let datetime = chrono::DateTime::from_timestamp_millis(due_at_ms as i64)
+        .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
+    datetime.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
 /// A running reminder's estimated completion time, in the system's local
 /// timezone, formatted `HH:MM` (e.g. `12:34`) - the "ETA" shown alongside its
 /// live elapsed duration.
 fn format_reminder_eta(run_started_ms: u64, duration_minutes: u32) -> String {
-    let due_at_ms = run_started_ms + duration_minutes as u64 * 60_000;
-    let datetime = chrono::DateTime::from_timestamp_millis(due_at_ms as i64)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
-    datetime.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    format_eta_ms(run_started_ms + duration_minutes as u64 * 60_000)
 }
 
 /// The Reminders tab/pane's STATUS cell: blank while not-yet-started,
@@ -2371,6 +2387,7 @@ mod tests {
             occurred_at_ms,
             pid: Some(1),
             reminder_name: None,
+            reminder_due_at_ms: None,
         }
     }
 
@@ -3176,6 +3193,7 @@ mod tests {
                 occurred_at_ms: 1_000,
                 pid: Some(555_555),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -3184,6 +3202,7 @@ mod tests {
                 occurred_at_ms: 2_000,
                 pid: Some(666_666),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -3283,6 +3302,7 @@ mod tests {
                 occurred_at_ms: 1_000,
                 pid: Some(555_555),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -3291,6 +3311,7 @@ mod tests {
                 occurred_at_ms: 2_000,
                 pid: Some(666_666),
                 reminder_name: None,
+                reminder_due_at_ms: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -3328,6 +3349,7 @@ mod tests {
             occurred_at_ms: 0,
             pid: Some(1),
             reminder_name: None,
+            reminder_due_at_ms: None,
         };
         let long_entry = LogEntry {
             working_dir: PathBuf::from("/Users/beet/project"),
@@ -3336,6 +3358,7 @@ mod tests {
             occurred_at_ms: 5_000_000_000,
             pid: Some(555_555),
             reminder_name: None,
+            reminder_due_at_ms: None,
         };
         app.apply_log_snapshot(vec![short_entry.clone(), long_entry.clone()]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -3748,6 +3771,7 @@ mod tests {
                 occurred_at_ms: 500,
                 pid: None,
                 reminder_name: Some("Check the build".to_string()),
+                reminder_due_at_ms: None,
             }]);
             app
         };
@@ -3902,6 +3926,7 @@ mod tests {
             occurred_at_ms: 1,
             pid: None,
             reminder_name: Some("Check the build".to_string()),
+            reminder_due_at_ms: None,
         };
 
         let (text, _style) = log_entry_status_line(&[], &entry);
@@ -3918,6 +3943,7 @@ mod tests {
             occurred_at_ms,
             pid: None,
             reminder_name: Some(name.to_string()),
+            reminder_due_at_ms: None,
         }
     }
 
@@ -3950,6 +3976,37 @@ mod tests {
             text, "⏰ reminder started: Check the build",
             "a started entry should show no duration"
         );
+    }
+
+    #[test]
+    fn a_started_reminder_shows_its_eta() {
+        let entry = LogEntry {
+            working_dir: PathBuf::from("/tmp/project"),
+            category: agentmon_proto::LogCategory::Reminder,
+            status: "started".to_string(),
+            occurred_at_ms: 0,
+            pid: None,
+            reminder_name: Some("Check the build".to_string()),
+            reminder_due_at_ms: Some(600_000),
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert_eq!(
+            text,
+            format!("⏰ reminder started: Check the build, ETA: {}", format_eta_ms(600_000)),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_or_finished_reminder_still_shows_duration_not_an_eta() {
+        let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("stopped", "Check the build", 83_000)];
+
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1]);
+
+        assert!(text.contains("1m23s"), "expected the elapsed duration, got: {text}");
+        assert!(!text.contains("ETA"), "a stopped entry should not show an ETA, got: {text}");
     }
 
     #[test]
