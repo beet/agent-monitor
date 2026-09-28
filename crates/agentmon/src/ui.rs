@@ -144,18 +144,14 @@ fn render_message(frame: &mut Frame, message: &str) {
 fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
     let header = Row::new(["PROJECT", "AGENTS", "TESTS", "REMINDERS", "UPDATED"]).style(Style::new().bold());
 
-    let title = match banner {
-        Some(banner) => format!("Agents - {banner}"),
-        None => "Agents".to_string(),
-    };
     let block = Block::default()
-        .title(title)
+        .title(agents_tab_title(app, banner))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
 
     let now = now_ms();
-    let groups = app.directory_groups();
+    let groups = app.visible_agent_groups();
 
     // Builds each row's content once, up front, so PROJECT/AGENTS/TESTS/
     // REMINDERS can each be sized to what they actually need this frame
@@ -509,6 +505,34 @@ fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry) -> (String, 
     (text, style)
 }
 
+/// Builds the Agents tab's title, reflecting its `/`-search state - see
+/// "Agents tab title reflects search state". While the search prompt is
+/// being edited, the title becomes the prompt itself (with a visible
+/// cursor). Otherwise, the `Filter [/]` keyboard shortcut hint is always
+/// shown - mirroring the Logs/Reminders tabs' own `<Word> [<key>]`-style
+/// control hints, which stay present whether or not a filter is currently
+/// applied - with the applied filter text (if any) appended after it, bold
+/// and in a color distinct from the rest of the title.
+fn agents_tab_title(app: &App, banner: Option<&str>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = if app.agents_search_editing {
+        vec![
+            Span::raw(format!("Agents /{}", app.agents_search_buffer)),
+            Span::styled("_", Style::new().add_modifier(Modifier::REVERSED)),
+        ]
+    } else if let Some(filter) = &app.agents_search_applied {
+        vec![
+            Span::raw("Agents  Filter [/]: "),
+            Span::styled(filter.clone(), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]
+    } else {
+        vec![Span::raw("Agents  Filter [/]")]
+    };
+    if let Some(banner) = banner {
+        spans.push(Span::raw(format!(" - {banner}")));
+    }
+    Line::from(spans)
+}
+
 /// Builds the always-visible sort/filter control hint shown in the Logs
 /// tab's title, e.g. `Sort [o]: recency  |  Filter: none.  Project [p]
 /// Status [s]  Clear [c]` - the keybinding hints stay present whether or not
@@ -793,6 +817,7 @@ fn render_help_modal(frame: &mut Frame) {
     let text = [
         "Tab       switch tabs / modal pane focus",
         "A / L / R jump to Agents / Logs / Reminders tab",
+        "/         search Agents tab by project (Enter saves, Esc cancels)",
         "j / down  move selection down",
         "k / up    move selection up",
         "d / PgDn  page down",
@@ -2256,6 +2281,86 @@ mod tests {
             text.contains(&expected),
             "expected the more recent member's timestamp {expected:?}, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn agents_tab_shows_a_slash_hint_with_no_filter_applied_or_being_edited() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Agents  Filter [/]"), "got:\n{text}");
+    }
+
+    #[test]
+    fn agents_tab_title_becomes_a_live_search_prompt_while_editing() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_agents_search();
+        app.push_agents_search_char('a');
+        app.push_agents_search_char('b');
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(text.contains("Agents /ab"), "got:\n{text}");
+        let (prompt_x, prompt_y) = find_text(buffer, "Agents /ab").expect("search prompt should be rendered");
+        let cursor_cell = &buffer[(prompt_x + "Agents /ab".len() as u16, prompt_y)];
+        assert!(
+            cursor_cell.modifier.contains(Modifier::REVERSED),
+            "a cursor should be visible immediately after the typed text"
+        );
+    }
+
+    #[test]
+    fn agents_tab_title_shows_the_applied_filter_bold_and_in_a_distinct_color() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.agents_search_applied = Some("xyz".to_string());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Filter [/]"),
+            "the keyboard shortcut hint must stay visible even with a filter applied, got:\n{text}"
+        );
+        assert!(text.contains("Agents  Filter [/]: xyz"), "got:\n{text}");
+        let (filter_x, filter_y) = find_text(buffer, "xyz").expect("applied filter text should be rendered");
+        let filter_cell = &buffer[(filter_x, filter_y)];
+        assert!(filter_cell.modifier.contains(Modifier::BOLD), "the applied filter text should be bold");
+        assert_ne!(
+            filter_cell.style().fg,
+            None,
+            "the applied filter text should use a color distinct from the title's plain text"
+        );
+    }
+
+    #[test]
+    fn agents_tab_search_filter_hides_non_matching_rows_and_keeps_matching_rows_in_order() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                agent_in("/tmp/other-project", "a", AgentStatus::Running, HostContext::Terminal, 1, 1_000),
+                agent_in("/tmp/LAB-1234", "b", AgentStatus::Running, HostContext::Terminal, 2, 2_000),
+            ],
+            Vec::new(),
+        );
+        app.agents_search_applied = Some("1234".to_string());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("LAB-1234"), "the matching project must still be shown, got:\n{text}");
+        assert!(!text.contains("other-project"), "the non-matching project must be hidden, got:\n{text}");
     }
 
     fn log_entry(cwd: &str, category: agentmon_proto::LogCategory, status: &str, occurred_at_ms: u64) -> LogEntry {

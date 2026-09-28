@@ -266,6 +266,16 @@ pub struct App {
     pub test_runs: Vec<TestRunInfo>,
     pub active_tab: Tab,
     pub agents_selected: usize,
+    /// Whether the Agents tab's `/`-search prompt is currently being edited -
+    /// see "Agents tab supports incremental search by project name".
+    pub agents_search_editing: bool,
+    /// The in-progress search text while `agents_search_editing` is true.
+    /// Seeded from `agents_search_applied` when editing begins, and discarded
+    /// (without touching `agents_search_applied`) if editing is cancelled.
+    pub agents_search_buffer: String,
+    /// The committed Agents-tab search filter, applied as a case-insensitive
+    /// substring match against each row's project name.
+    pub agents_search_applied: Option<String>,
     pub logs: Vec<LogEntry>,
     pub logs_pagination: Paginator,
     pub logs_sort: LogSort,
@@ -309,6 +319,9 @@ impl App {
             test_runs: Vec::new(),
             active_tab: Tab::Agents,
             agents_selected: 0,
+            agents_search_editing: false,
+            agents_search_buffer: String::new(),
+            agents_search_applied: None,
             logs: Vec::new(),
             logs_pagination: Paginator::default(),
             logs_sort: LogSort::Recency,
@@ -461,16 +474,82 @@ impl App {
         self.active_tab = tab;
     }
 
+    /// The Agents tab's project rows after applying the current search
+    /// filter (a case-insensitive substring match against each row's project
+    /// name), preserving `directory_groups`' relative order - see "Agents tab
+    /// supports incremental search by project name". While the search prompt
+    /// is being edited, filters live against the in-progress edit buffer
+    /// rather than the last-committed filter, so every keystroke narrows the
+    /// list immediately, per that requirement's "updates immediately after
+    /// every such change" behavior.
+    pub fn visible_agent_groups(&self) -> Vec<DirectoryGroup> {
+        let groups = self.directory_groups();
+        let filter = if self.agents_search_editing {
+            Some(self.agents_search_buffer.as_str())
+        } else {
+            self.agents_search_applied.as_deref()
+        };
+        match filter {
+            None => groups,
+            Some(filter) => {
+                let filter = filter.to_lowercase();
+                groups
+                    .into_iter()
+                    .filter(|g| project_name(&g.cwd).to_lowercase().contains(&filter))
+                    .collect()
+            }
+        }
+    }
+
     /// Moves the Agents tab's row selection by `delta`, clamped to the
-    /// current number of project rows.
+    /// current number of visible (filtered) project rows.
     pub fn move_agents_selection(&mut self, delta: isize) {
-        let len = self.directory_groups().len();
+        let len = self.visible_agent_groups().len();
         self.agents_selected = clamp_index(self.agents_selected, delta, len);
     }
 
     fn clamp_agents_selected(&mut self) {
-        let len = self.directory_groups().len();
+        let len = self.visible_agent_groups().len();
         self.agents_selected = clamp_index(self.agents_selected, 0, len);
+    }
+
+    /// Enters the Agents tab's `/`-search-editing mode, seeding the edit
+    /// buffer from whatever filter is already applied so refining or
+    /// clearing it doesn't require retyping it.
+    pub fn open_agents_search(&mut self) {
+        self.agents_search_buffer = self.agents_search_applied.clone().unwrap_or_default();
+        self.agents_search_editing = true;
+    }
+
+    /// Appends a character to the in-progress search buffer - the Agents
+    /// tab's `/`-search-editing mode.
+    pub fn push_agents_search_char(&mut self, c: char) {
+        self.agents_search_buffer.push(c);
+    }
+
+    /// Removes the last character of the in-progress search buffer - the
+    /// Agents tab's `/`-search-editing mode.
+    pub fn pop_agents_search_char(&mut self) {
+        self.agents_search_buffer.pop();
+    }
+
+    /// Commits the in-progress search buffer as the Agents tab's applied
+    /// filter (or clears it, if the buffer is empty) and exits
+    /// search-editing mode.
+    pub fn commit_agents_search(&mut self) {
+        self.agents_search_applied = if self.agents_search_buffer.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.agents_search_buffer))
+        };
+        self.agents_search_editing = false;
+        self.clamp_agents_selected();
+    }
+
+    /// Discards the in-progress search buffer and exits search-editing mode,
+    /// leaving whatever filter was applied before editing began untouched.
+    pub fn cancel_agents_search(&mut self) {
+        self.agents_search_editing = false;
     }
 
     /// Opens the details modal for the currently selected Agents-tab row, if
@@ -480,7 +559,7 @@ impl App {
     /// entry's project - so `Enter` reaches the same modal from either tab.
     pub fn open_details_modal(&mut self) {
         let cwd = match self.active_tab {
-            Tab::Agents => self.directory_groups().get(self.agents_selected).map(|group| group.cwd.clone()),
+            Tab::Agents => self.visible_agent_groups().get(self.agents_selected).map(|group| group.cwd.clone()),
             Tab::Logs => self
                 .visible_logs()
                 .get(self.logs_pagination.selected)
@@ -1374,6 +1453,190 @@ mod tests {
         app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
 
         assert_eq!(app.agents_selected, 0, "selection must clamp once a row disappears");
+    }
+
+    #[test]
+    fn visible_agent_groups_filters_by_a_case_insensitive_substring_of_project_name() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                agent_in("/tmp/LAB-1234", "a", AgentStatus::Running),
+                agent_in("/tmp/other-project", "b", AgentStatus::Running),
+            ],
+            Vec::new(),
+        );
+
+        app.agents_search_applied = Some("1234".to_string());
+        let groups = app.visible_agent_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].cwd, PathBuf::from("/tmp/LAB-1234"));
+
+        app.agents_search_applied = Some("lab".to_string());
+        assert_eq!(app.visible_agent_groups().len(), 1, "match must be case-insensitive");
+
+        app.agents_search_applied = Some("no-such-project".to_string());
+        assert!(app.visible_agent_groups().is_empty(), "a non-matching filter shows no rows");
+
+        app.agents_search_applied = None;
+        assert_eq!(app.visible_agent_groups().len(), 2, "no filter shows every row");
+    }
+
+    #[test]
+    fn visible_agent_groups_preserves_the_unfiltered_relative_order() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo {
+                    last_updated_ms: 1_000,
+                    ..agent_in("/tmp/project-a", "a", AgentStatus::Running)
+                },
+                AgentInfo {
+                    last_updated_ms: 2_000,
+                    ..agent_in("/tmp/project-b", "b", AgentStatus::Running)
+                },
+            ],
+            Vec::new(),
+        );
+
+        app.agents_search_applied = Some("project".to_string());
+        let groups = app.visible_agent_groups();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].cwd, PathBuf::from("/tmp/project-b"), "most recently updated stays first");
+        assert_eq!(groups[1].cwd, PathBuf::from("/tmp/project-a"));
+    }
+
+    #[test]
+    fn visible_agent_groups_filters_live_against_the_in_progress_buffer_while_editing() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                agent_in("/tmp/LAB-1234", "a", AgentStatus::Running),
+                agent_in("/tmp/other-project", "b", AgentStatus::Running),
+            ],
+            Vec::new(),
+        );
+
+        app.open_agents_search();
+        app.push_agents_search_char('1');
+        app.push_agents_search_char('2');
+        app.push_agents_search_char('3');
+        app.push_agents_search_char('4');
+
+        let groups = app.visible_agent_groups();
+        assert_eq!(
+            groups.len(),
+            1,
+            "typing must filter the list immediately, before Enter commits it"
+        );
+        assert_eq!(groups[0].cwd, PathBuf::from("/tmp/LAB-1234"));
+    }
+
+    #[test]
+    fn agents_selection_is_clamped_when_a_search_filter_shrinks_the_visible_rows() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                agent_in("/tmp/a", "a", AgentStatus::Running),
+                agent_in("/tmp/b", "b", AgentStatus::Running),
+            ],
+            Vec::new(),
+        );
+        app.move_agents_selection(1);
+        assert_eq!(app.agents_selected, 1);
+
+        app.agents_search_buffer = "a".to_string();
+        app.commit_agents_search();
+
+        assert_eq!(app.agents_selected, 0, "selection must clamp once the filter drops the selected row");
+    }
+
+    #[test]
+    fn open_agents_search_seeds_the_buffer_from_the_applied_filter() {
+        let mut app = App::new();
+        app.agents_search_applied = Some("lab".to_string());
+
+        app.open_agents_search();
+
+        assert!(app.agents_search_editing);
+        assert_eq!(app.agents_search_buffer, "lab");
+    }
+
+    #[test]
+    fn open_agents_search_seeds_an_empty_buffer_when_no_filter_is_applied() {
+        let mut app = App::new();
+
+        app.open_agents_search();
+
+        assert!(app.agents_search_editing);
+        assert_eq!(app.agents_search_buffer, "");
+    }
+
+    #[test]
+    fn push_and_pop_agents_search_char_edit_the_buffer() {
+        let mut app = App::new();
+        app.open_agents_search();
+
+        app.push_agents_search_char('a');
+        app.push_agents_search_char('b');
+        assert_eq!(app.agents_search_buffer, "ab");
+
+        app.pop_agents_search_char();
+        assert_eq!(app.agents_search_buffer, "a");
+    }
+
+    #[test]
+    fn commit_agents_search_applies_a_non_empty_buffer_and_exits_editing() {
+        let mut app = App::new();
+        app.open_agents_search();
+        app.push_agents_search_char('x');
+
+        app.commit_agents_search();
+
+        assert_eq!(app.agents_search_applied.as_deref(), Some("x"));
+        assert!(!app.agents_search_editing);
+    }
+
+    #[test]
+    fn commit_agents_search_with_an_empty_buffer_clears_the_applied_filter() {
+        let mut app = App::new();
+        app.agents_search_applied = Some("x".to_string());
+        app.open_agents_search();
+        app.pop_agents_search_char();
+
+        app.commit_agents_search();
+
+        assert_eq!(app.agents_search_applied, None);
+        assert!(!app.agents_search_editing);
+    }
+
+    #[test]
+    fn cancel_agents_search_restores_the_prior_applied_filter() {
+        let mut app = App::new();
+        app.agents_search_applied = Some("x".to_string());
+        app.open_agents_search();
+        app.push_agents_search_char('y');
+
+        app.cancel_agents_search();
+
+        assert_eq!(
+            app.agents_search_applied.as_deref(),
+            Some("x"),
+            "cancelling must restore the filter that was applied before editing began"
+        );
+        assert!(!app.agents_search_editing);
+    }
+
+    #[test]
+    fn cancel_agents_search_with_no_prior_filter_leaves_none_applied() {
+        let mut app = App::new();
+        app.open_agents_search();
+        app.push_agents_search_char('y');
+
+        app.cancel_agents_search();
+
+        assert_eq!(app.agents_search_applied, None);
+        assert!(!app.agents_search_editing);
     }
 
     #[test]

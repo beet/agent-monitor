@@ -26,6 +26,14 @@ pub enum InputAction {
 /// keys (including `g`/`G`) are handled while one is showing, so the tab
 /// underneath never accidentally reacts to a key meant for the modal.
 pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputAction {
+    // Diverts all input into the Agents tab's `/`-search prompt while it's
+    // being edited - checked before the global `q` quit shortcut (and
+    // everything else) so a typed `q`, `?`, `A`, `L`, `R`, or `Tab` becomes
+    // part of the search string instead of firing its usual global effect.
+    if app.agents_search_editing {
+        return handle_agents_search_editing_key(app, key.code);
+    }
+
     if let KeyCode::Char('q') = key.code {
         return InputAction::Quit;
     }
@@ -77,8 +85,23 @@ fn handle_agents_tab_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('j') | KeyCode::Down => app.move_agents_selection(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_agents_selection(-1),
         KeyCode::Enter => app.open_details_modal(),
+        KeyCode::Char('/') => app.open_agents_search(),
         _ => {}
     }
+}
+
+/// Handles a key while the Agents tab's `/`-search prompt is being edited -
+/// see "Agents tab supports incremental search by project name" and
+/// "Committing, cancelling, and clearing the Agents tab search".
+fn handle_agents_search_editing_key(app: &mut App, code: KeyCode) -> InputAction {
+    match code {
+        KeyCode::Enter => app.commit_agents_search(),
+        KeyCode::Esc => app.cancel_agents_search(),
+        KeyCode::Backspace => app.pop_agents_search_char(),
+        KeyCode::Char(c) => app.push_agents_search_char(c),
+        _ => {}
+    }
+    InputAction::Continue
 }
 
 fn handle_logs_tab_key(app: &mut App, code: KeyCode, page_size: usize) {
@@ -387,6 +410,130 @@ mod tests {
         assert_eq!(app.agents_selected, 1);
         press(&mut app, KeyCode::Char('k'));
         assert_eq!(app.agents_selected, 0);
+    }
+
+    #[test]
+    fn slash_enters_agents_search_editing_mode() {
+        let mut app = App::new();
+
+        press(&mut app, KeyCode::Char('/'));
+
+        assert!(app.agents_search_editing);
+    }
+
+    #[test]
+    fn while_editing_agents_search_global_shortcut_keys_are_typed_instead_of_firing() {
+        let mut app = App::new();
+        app.open_agents_search();
+
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('?'),
+            KeyCode::Char('A'),
+            KeyCode::Char('L'),
+            KeyCode::Char('R'),
+        ] {
+            let action = press(&mut app, code);
+            assert_eq!(action, InputAction::Continue, "must not fire the global effect for {code:?}");
+        }
+        press(&mut app, KeyCode::Tab);
+
+        assert!(app.agents_search_editing, "must still be editing - none of these should have exited edit mode");
+        assert!(!is_help_modal_open(&app), "? must not open the help modal while editing");
+        assert_eq!(app.active_tab, Tab::Agents, "A/L/R/Tab must not switch tabs while editing");
+        assert_eq!(app.agents_search_buffer, "q?ALR", "every key typed above must land in the search buffer");
+    }
+
+    #[test]
+    fn enter_commits_the_agents_search_and_filters_the_list() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo {
+                    session_id: SessionId("a".to_string()),
+                    cwd: PathBuf::from("/tmp/LAB-1234"),
+                    host_context: HostContext::Terminal,
+                    pid: 1,
+                    status: AgentStatus::Running,
+                    last_updated_ms: 0,
+                    status_since_ms: 0,
+                    run_started_ms: 0,
+                },
+                AgentInfo {
+                    session_id: SessionId("b".to_string()),
+                    cwd: PathBuf::from("/tmp/other"),
+                    host_context: HostContext::Terminal,
+                    pid: 2,
+                    status: AgentStatus::Running,
+                    last_updated_ms: 0,
+                    status_since_ms: 0,
+                    run_started_ms: 0,
+                },
+            ],
+            Vec::new(),
+        );
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(!app.agents_search_editing);
+        assert_eq!(app.agents_search_applied.as_deref(), Some("1234"));
+        assert_eq!(app.visible_agent_groups().len(), 1);
+        assert_eq!(app.visible_agent_groups()[0].cwd, PathBuf::from("/tmp/LAB-1234"));
+    }
+
+    #[test]
+    fn escape_cancels_editing_and_restores_the_prior_applied_filter() {
+        let mut app = App::new();
+        app.agents_search_applied = Some("kept".to_string());
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+
+        assert!(!app.agents_search_editing);
+        assert_eq!(app.agents_search_applied.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn escape_cancels_editing_with_no_prior_filter() {
+        let mut app = App::new();
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+
+        assert!(!app.agents_search_editing);
+        assert_eq!(app.agents_search_applied, None);
+    }
+
+    #[test]
+    fn backspace_removes_the_last_character_while_editing() {
+        let mut app = App::new();
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.agents_search_buffer, "a");
+    }
+
+    #[test]
+    fn re_editing_an_applied_filter_starts_from_its_text() {
+        let mut app = App::new();
+        app.agents_search_applied = Some("prior".to_string());
+
+        press(&mut app, KeyCode::Char('/'));
+
+        assert_eq!(app.agents_search_buffer, "prior");
     }
 
     #[test]
