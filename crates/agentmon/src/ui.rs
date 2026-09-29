@@ -1287,8 +1287,11 @@ fn reminder_agents_column_segment(reminder: &ReminderInfo, app: &App, now_ms: u6
             let eta = format_reminder_eta(started, reminder.duration_minutes);
             vec![
                 Span::styled("⏳ ", Style::new().fg(Color::Blue)),
-                Span::styled(reminder.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!(" {elapsed}, ETA {eta}")),
+                Span::styled(
+                    reminder.name.clone(),
+                    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {elapsed}, ETA {eta}"), Style::new().fg(Color::Blue)),
             ]
         }
         ReminderStatus::Done => {
@@ -1297,8 +1300,11 @@ fn reminder_agents_column_segment(reminder: &ReminderInfo, app: &App, now_ms: u6
             let outcome = reminder_outcome_word(app, reminder);
             vec![
                 Span::styled("✅ ", Style::new().fg(Color::Green)),
-                Span::styled(reminder.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
-                Span::raw(format!(" {outcome}, {elapsed}")),
+                Span::styled(
+                    reminder.name.clone(),
+                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {outcome}, {elapsed}"), Style::new().fg(Color::Green)),
             ]
         }
     }
@@ -3758,6 +3764,56 @@ mod tests {
         assert!(text.contains("First"), "got: {text}");
         assert!(text.contains("Second"), "got: {text}");
         assert!(text.contains(" · "), "expected a bullet separator between reminders, got: {text}");
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_colors_a_running_reminders_entire_segment_blue() {
+        let app = App::new();
+        let reminder = reminder_in(
+            "/tmp/project",
+            "r1",
+            "Build",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(0),
+            0,
+        );
+
+        let segment = reminder_agents_column_segment(&reminder, &app, 1_000);
+
+        assert!(segment.len() > 1, "expected more than just the emoji span, got: {segment:?}");
+        for span in &segment {
+            assert_eq!(
+                span.style.fg,
+                Some(Color::Blue),
+                "expected every span (not just the emoji) to be Blue, got span {span:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_tab_reminders_column_colors_a_done_reminders_entire_segment_green() {
+        let app = App::new();
+        let reminder = reminder_in(
+            "/tmp/project",
+            "r1",
+            "Build",
+            agentmon_proto::ReminderStatus::Done,
+            10,
+            Some(0),
+            600_000,
+        );
+
+        let segment = reminder_agents_column_segment(&reminder, &app, 1_000_000);
+
+        assert!(segment.len() > 1, "expected more than just the emoji span, got: {segment:?}");
+        for span in &segment {
+            assert_eq!(
+                span.style.fg,
+                Some(Color::Green),
+                "expected every span (not just the emoji) to be Green, got span {span:?}"
+            );
+        }
     }
 
     #[test]
