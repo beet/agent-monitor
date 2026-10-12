@@ -582,6 +582,10 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) -> (usize, usize) {
             render_help_modal(frame);
             (0, 0)
         }
+        Modal::QuitConfirm => {
+            render_quit_confirm_modal(frame);
+            (0, 0)
+        }
         Modal::Details(cwd) => render_details_modal(frame, app, cwd),
     };
 
@@ -842,8 +846,8 @@ fn render_help_modal(frame: &mut Frame) {
         "e         edit a reminder (modal)",
         "Del/Bksp  delete a reminder (modal)",
         "?         toggle this help",
-        "Esc       close modal / form / dialog",
-        "q         quit",
+        "Esc       close modal / form / dialog, or ask to quit if none is open",
+        "q         quit (no confirmation)",
     ]
     .join("\n");
 
@@ -1440,6 +1444,36 @@ fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
         ReminderFormField::Duration => (1, form.duration_minutes.chars().count()),
     };
     frame.set_cursor_position((inner.x + REMINDER_FORM_LABEL_WIDTH + field_len as u16, inner.y + row));
+}
+
+/// Renders the bold, red quit-confirmation dialog opened by a top-level
+/// `Esc` - see "Navigation and quit do not affect tracked agents".
+fn render_quit_confirm_modal(frame: &mut Frame) {
+    let area = centered_rect(50, 20, frame.area());
+    frame.render_widget(Clear, area);
+
+    let text = vec![
+        Line::from(Span::styled(
+            "Quit agentmon?",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter: quit   Esc: cancel",
+            Style::new().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .title(Span::styled("Quit", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ),
+        area,
+    );
 }
 
 /// Renders the bold, red delete-confirmation dialog on top of the details
@@ -4132,6 +4166,26 @@ mod tests {
         // dialog's own red text, not the background pane's.
         let (x, y) = find_text(term.backend().buffer(), "Delete \"Check the build\"?")
             .expect("expected the dialog's own line");
+        let cell = term.backend().buffer().cell((x, y)).unwrap();
+        assert!(cell.style().fg == Some(Color::Red), "the dialog text should be red");
+    }
+
+    #[test]
+    fn quit_confirmation_dialog_renders_in_red_bold_with_its_hint() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.open_quit_confirm();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Quit agentmon?"), "got:\n{text}");
+        assert!(text.contains("Enter: quit"), "got:\n{text}");
+        assert!(text.contains("Esc: cancel"), "got:\n{text}");
+
+        let (x, y) =
+            find_text(term.backend().buffer(), "Quit agentmon?").expect("expected the dialog's own line");
         let cell = term.backend().buffer().cell((x, y)).unwrap();
         assert!(cell.style().fg == Some(Color::Red), "the dialog text should be red");
     }

@@ -173,6 +173,9 @@ pub enum Modal {
     /// The working directory of the project whose details are shown.
     Details(PathBuf),
     Help,
+    /// Confirms a top-level `Esc` press before it quits the app - see
+    /// "Navigation and quit do not affect tracked agents".
+    QuitConfirm,
 }
 
 /// Which of the details modal's two interactive panes (Logs, Reminders)
@@ -597,6 +600,12 @@ impl App {
 
     pub fn open_help_modal(&mut self) {
         self.modal = Some(Modal::Help);
+    }
+
+    /// Opens the quit-confirmation dialog - a top-level `Esc` press when no
+    /// modal, form, dialog, or search prompt is open.
+    pub fn open_quit_confirm(&mut self) {
+        self.modal = Some(Modal::QuitConfirm);
     }
 
     pub fn close_modal(&mut self) {
@@ -1702,6 +1711,17 @@ mod tests {
 
         app.open_help_modal();
         assert_eq!(app.modal, Some(Modal::Help));
+
+        app.close_modal();
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn quit_confirm_modal_opens_and_closes() {
+        let mut app = App::new();
+
+        app.open_quit_confirm();
+        assert_eq!(app.modal, Some(Modal::QuitConfirm));
 
         app.close_modal();
         assert_eq!(app.modal, None);

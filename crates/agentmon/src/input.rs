@@ -24,7 +24,9 @@ pub enum InputAction {
 /// A modal, if open, takes priority over tab-level keys: only `Esc` (close),
 /// `q` (quit), and - for `Modal::Details` - its own focused pane's pagination
 /// keys (including `g`/`G`) are handled while one is showing, so the tab
-/// underneath never accidentally reacts to a key meant for the modal.
+/// underneath never accidentally reacts to a key meant for the modal. At the
+/// top level (no modal open), `Esc` opens `Modal::QuitConfirm` rather than
+/// quitting directly - only `q` quits immediately there.
 pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputAction {
     // Diverts all input into the Agents tab's `/`-search prompt while it's
     // being edited - checked before the global `q` quit shortcut (and
@@ -43,7 +45,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputA
     }
 
     match key.code {
-        KeyCode::Esc => return InputAction::Quit,
+        KeyCode::Esc => {
+            app.open_quit_confirm();
+            return InputAction::Continue;
+        }
         KeyCode::Tab => {
             app.cycle_tab();
             return InputAction::Continue;
@@ -172,6 +177,15 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
                 }
             }
             KeyCode::Esc => app.close_delete_reminder_confirm(),
+            _ => {}
+        }
+        return InputAction::Continue;
+    }
+
+    if app.modal == Some(Modal::QuitConfirm) {
+        match code {
+            KeyCode::Enter => return InputAction::Quit,
+            KeyCode::Esc => app.close_modal(),
             _ => {}
         }
         return InputAction::Continue;
@@ -306,9 +320,40 @@ mod tests {
     }
 
     #[test]
-    fn esc_quits_when_no_modal_is_open() {
+    fn esc_opens_quit_confirm_when_no_modal_is_open() {
         let mut app = App::new();
-        assert_eq!(press(&mut app, KeyCode::Esc), InputAction::Quit);
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.modal, Some(Modal::QuitConfirm));
+    }
+
+    #[test]
+    fn enter_confirms_quit_from_the_quit_confirm_dialog() {
+        let mut app = App::new();
+        app.open_quit_confirm();
+
+        assert_eq!(press(&mut app, KeyCode::Enter), InputAction::Quit);
+    }
+
+    #[test]
+    fn esc_cancels_the_quit_confirm_dialog() {
+        let mut app = App::new();
+        app.open_quit_confirm();
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn q_still_quits_while_the_quit_confirm_dialog_is_open() {
+        let mut app = App::new();
+        app.open_quit_confirm();
+
+        assert_eq!(press(&mut app, KeyCode::Char('q')), InputAction::Quit);
     }
 
     #[test]
