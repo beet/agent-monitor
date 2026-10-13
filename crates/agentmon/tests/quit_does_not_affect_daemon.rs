@@ -58,6 +58,7 @@ fn quitting_a_tui_client_does_not_affect_the_daemon_or_its_tracked_agents() {
                 host_context: HostContext::Terminal,
                 pid: std::process::id(),
                 status: AgentStatus::Running,
+                prompt: None,
             },
         },
     )

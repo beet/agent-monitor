@@ -7,15 +7,15 @@ Gives the daemon a short-lived, bounded history of notification-worthy agent and
 ## Requirements
 
 ### Requirement: Activity log captures notification-worthy events
-The daemon SHALL append an entry to its activity log at the same point it sends a macOS notification for an agent status transition to "done" or "needs input", for a test-run event of "started", "passed", or "failed", and for a reminder completing on its own ("finished"). The daemon SHALL also append an entry, independent of any notification, whenever an agent's status transitions to "running" from a different status, or is registered for the first time already "running" - recorded with status "started" - so each agent's later "done"/"needs input" entries have a corresponding start point in the log; and whenever a reminder is started ("started", including re-running a previously completed reminder) or a running reminder is stopped ("stopped"), even though starting and stopping a reminder do not themselves send a notification. Each entry SHALL record the working directory, an event category (agent, test-run, or reminder), the resulting status, and the time the event occurred; an agent-category entry SHALL additionally record that agent's process id, and a reminder-category entry SHALL additionally record the reminder's name as of that event, so a later-deleted reminder's past entries keep showing it. A reminder-category "started" entry SHALL additionally record the reminder's due time (its ETA) as of that event, computed from its start time and the reminder's duration at the moment it starts; this recorded ETA SHALL NOT change afterward even if the reminder's duration is later edited while it runs. Transitions that do not produce a notification and are not a transition into "running" - "declined" and "stale" - SHALL NOT produce a log entry. A repeated "needs input" event for an agent already in that status SHALL produce a separate log entry, consistent with it producing a separate notification. Editing a reminder's name or duration SHALL NOT produce a log entry.
+The daemon SHALL append an entry to its activity log at the same point it sends a macOS notification for an agent status transition to "done" or "needs input", for a test-run event of "started", "passed", or "failed", and for a reminder completing on its own ("finished"). The daemon SHALL also append an entry, independent of any notification, whenever an agent's status transitions to "running" from a different status, or is registered for the first time already "running" - recorded with status "started" - so each agent's later "done"/"needs input" entries have a corresponding start point in the log; and whenever a reminder is started ("started", including re-running a previously completed reminder) or a running reminder is stopped ("stopped"), even though starting and stopping a reminder do not themselves send a notification. Each entry SHALL record the working directory, an event category (agent, test-run, or reminder), the resulting status, and the time the event occurred; an agent-category entry SHALL additionally record that agent's process id and a snapshot of that agent's current last-prompt text, if any, as of that event (frozen at record time, the same way a reminder-category entry freezes the reminder's name, so a later prompt submitted for that agent does not alter an entry already recorded); and a reminder-category entry SHALL additionally record the reminder's name as of that event, so a later-deleted reminder's past entries keep showing it. A reminder-category "started" entry SHALL additionally record the reminder's due time (its ETA) as of that event, computed from its start time and the reminder's duration at the moment it starts; this recorded ETA SHALL NOT change afterward even if the reminder's duration is later edited while it runs. Transitions that do not produce a notification and are not a transition into "running" - "declined" and "stale" - SHALL NOT produce a log entry. A repeated "needs input" event for an agent already in that status SHALL produce a separate log entry, consistent with it producing a separate notification. Editing a reminder's name or duration SHALL NOT produce a log entry.
 
 #### Scenario: Agent completes its task
 - **WHEN** a tracked agent's status transitions to "done" and the daemon sends a completion notification
-- **THEN** the daemon appends a log entry recording the agent's working directory, category "agent", status "done", process id, and the event time
+- **THEN** the daemon appends a log entry recording the agent's working directory, category "agent", status "done", process id, its current last-prompt snapshot (if any), and the event time
 
 #### Scenario: Agent needs input
 - **WHEN** a tracked agent's status transitions to "needs input" and the daemon sends a notification
-- **THEN** the daemon appends a log entry with category "agent", status "needs input", and that agent's process id
+- **THEN** the daemon appends a log entry with category "agent", status "needs input", that agent's process id, and its current last-prompt snapshot (if any)
 
 #### Scenario: A second needs-input prompt logs again
 - **WHEN** the daemon receives a "needs input" event for an agent already in "needs input" status and sends another notification for it
@@ -68,6 +68,14 @@ The daemon SHALL append an entry to its activity log at the same point it sends 
 #### Scenario: Editing a reminder does not log an entry
 - **WHEN** a client edits a reminder's name or duration
 - **THEN** the daemon does not append a log entry for that edit
+
+#### Scenario: An agent entry with no captured prompt records none
+- **WHEN** a "started", "done", or "needs input" entry is recorded for an agent that has no last-prompt text tracked yet (e.g. the daemon began tracking it mid-session, via `PreToolUse`, before any `UserPromptSubmit` event was seen)
+- **THEN** the entry records no prompt snapshot rather than an error or placeholder text
+
+#### Scenario: A later prompt does not alter an already-recorded entry's snapshot
+- **WHEN** an agent submits a new prompt after one of its "started" or "done" entries has already been recorded
+- **THEN** that earlier entry's recorded prompt snapshot is unchanged, even though the agent's current last prompt (as shown elsewhere) now reflects the new one
 
 ### Requirement: Bounded global retention
 The activity log SHALL retain at most 500 entries in total across all projects. When appending a new entry would exceed that cap, the daemon SHALL evict the single oldest entry in the log by event time, regardless of which project or event category it belongs to, before appending the new one.

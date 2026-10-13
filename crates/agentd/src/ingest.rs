@@ -90,6 +90,7 @@ impl Ingestor {
                 pid: Some(outcome.agent.pid),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: outcome.agent.last_prompt.clone(),
             });
         }
         if should_notify(outcome.previous_status, outcome.agent.status) {
@@ -102,6 +103,7 @@ impl Ingestor {
                 pid: Some(outcome.agent.pid),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: outcome.agent.last_prompt.clone(),
             });
         }
         (outcome.agent, outcome.retired_session_ids)
@@ -123,6 +125,7 @@ impl Ingestor {
             pid: Some(test_run.pid),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         });
         test_run
     }
@@ -171,6 +174,7 @@ impl Ingestor {
             pid: None,
             reminder_name: Some(reminder.name.clone()),
             reminder_due_at_ms: Some(run_started_ms + reminder.duration_minutes as u64 * 60_000),
+            prompt: None,
         });
         Some(reminder)
     }
@@ -187,6 +191,7 @@ impl Ingestor {
             pid: None,
             reminder_name: Some(reminder.name.clone()),
             reminder_due_at_ms: None,
+            prompt: None,
         });
         Some(reminder)
     }
@@ -204,6 +209,7 @@ impl Ingestor {
             pid: None,
             reminder_name: Some(reminder.name.clone()),
             reminder_due_at_ms: None,
+            prompt: None,
         });
     }
 
@@ -311,6 +317,7 @@ mod tests {
             host_context: HostContext::Terminal,
             pid: 1,
             status,
+            prompt: None,
         }
     }
 
@@ -648,6 +655,60 @@ mod tests {
             Some(1),
             "a started entry must carry the reporting agent's process id"
         );
+    }
+
+    #[test]
+    fn a_started_entry_snapshots_the_agents_current_last_prompt() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..event(AgentStatus::Running)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].prompt.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn an_entry_with_no_tracked_prompt_records_none() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        // Models an agent first observed via PreToolUse, before any
+        // UserPromptSubmit event has been seen for it.
+        ingestor.ingest_event(event(AgentStatus::Running));
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs[0].prompt, None);
+    }
+
+    #[test]
+    fn a_later_prompt_does_not_alter_an_already_recorded_entrys_snapshot() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("First prompt".to_string()),
+            ..event(AgentStatus::Running)
+        });
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("Second prompt".to_string()),
+            ..event(AgentStatus::Running)
+        });
+        ingestor.ingest_event(event(AgentStatus::Done));
+
+        let logs = ingestor.activity_log().snapshot();
+        let started_entry = logs.iter().find(|e| e.status == "started").unwrap();
+        let done_entry = logs.iter().find(|e| e.status == "done").unwrap();
+        assert_eq!(
+            started_entry.prompt.as_deref(),
+            Some("First prompt"),
+            "the started entry's snapshot must not be altered by a later prompt"
+        );
+        assert_eq!(done_entry.prompt.as_deref(), Some("Second prompt"));
     }
 
     #[test]

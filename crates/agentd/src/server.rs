@@ -239,6 +239,7 @@ mod tests {
             host_context: HostContext::Terminal,
             pid: 123,
             status,
+            prompt: None,
         }
     }
 

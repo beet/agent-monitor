@@ -13,6 +13,10 @@ pub struct HookPayload {
     pub hook_event_name: String,
     #[serde(default)]
     pub notification_type: Option<String>,
+    /// The submitted prompt text. Only present on a `UserPromptSubmit`
+    /// payload.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 pub fn parse_hook_payload(raw: &str) -> serde_json::Result<HookPayload> {
@@ -69,6 +73,34 @@ mod tests {
         assert_eq!(payload.session_id, "abc-123");
         assert_eq!(payload.cwd, "/tmp/project");
         assert_eq!(status_for_payload(&payload), Some(AgentStatus::Running));
+    }
+
+    #[test]
+    fn parses_a_user_prompt_submit_payloads_prompt_text() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Fix the flaky test"
+        }"#;
+
+        let payload = parse_hook_payload(raw).unwrap();
+
+        assert_eq!(payload.prompt.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn a_payload_with_no_prompt_field_parses_with_no_prompt() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash"
+        }"#;
+
+        let payload = parse_hook_payload(raw).unwrap();
+
+        assert_eq!(payload.prompt, None);
     }
 
     #[test]

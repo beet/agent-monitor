@@ -436,6 +436,7 @@ mod tests {
                     last_updated_ms: 2_000,
                     status_since_ms: 0,
                     run_started_ms: 0,
+                    last_prompt: None,
                 },
                 AgentInfo {
                     session_id: SessionId("b".to_string()),
@@ -446,6 +447,7 @@ mod tests {
                     last_updated_ms: 1_000,
                     status_since_ms: 0,
                     run_started_ms: 0,
+                    last_prompt: None,
                 },
             ],
             Vec::new(),
@@ -506,6 +508,7 @@ mod tests {
                     last_updated_ms: 0,
                     status_since_ms: 0,
                     run_started_ms: 0,
+                    last_prompt: None,
                 },
                 AgentInfo {
                     session_id: SessionId("b".to_string()),
@@ -516,6 +519,7 @@ mod tests {
                     last_updated_ms: 0,
                     status_since_ms: 0,
                     run_started_ms: 0,
+                    last_prompt: None,
                 },
             ],
             Vec::new(),
@@ -597,6 +601,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -621,6 +626,7 @@ mod tests {
             pid: Some(1),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         }]);
 
         press(&mut app, KeyCode::Enter);
@@ -642,6 +648,7 @@ mod tests {
                 pid: Some(1),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: None,
             },
             LogEntry {
                 working_dir: "/tmp/b".into(),
@@ -651,6 +658,7 @@ mod tests {
                 pid: Some(1),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: None,
             },
         ]);
 
@@ -680,6 +688,7 @@ mod tests {
                     pid: Some(1),
                     reminder_name: None,
                     reminder_due_at_ms: None,
+                    prompt: None,
                 })
                 .collect(),
         );
@@ -707,6 +716,7 @@ mod tests {
                     pid: Some(1),
                     reminder_name: None,
                     reminder_due_at_ms: None,
+                    prompt: None,
                 })
                 .collect(),
         );
@@ -731,6 +741,7 @@ mod tests {
             pid: Some(1),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         }]);
 
         press(&mut app, KeyCode::Char('o'));
@@ -763,6 +774,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -791,6 +803,7 @@ mod tests {
                     pid: Some(1),
                     reminder_name: None,
                     reminder_due_at_ms: None,
+                    prompt: None,
                 })
                 .collect(),
         );
@@ -823,6 +836,7 @@ mod tests {
                     pid: Some(1),
                     reminder_name: None,
                     reminder_due_at_ms: None,
+                    prompt: None,
                 })
                 .collect(),
         );
@@ -969,6 +983,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -980,6 +995,42 @@ mod tests {
 
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
+    }
+
+    #[test]
+    fn tab_never_focuses_the_non_interactive_last_prompt_pane() {
+        // `ModalFocus` only has `Logs`/`Reminders` variants, so the Last
+        // Prompt pane (like the Agents/Tests panes) is structurally
+        // unreachable via `Tab` - this exercises several toggles to guard
+        // against a future third variant being added without updating the
+        // cycle.
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: Some("Fix the flaky test".to_string()),
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Tab);
+            assert!(
+                matches!(app.modal_focus, crate::app::ModalFocus::Logs | crate::app::ModalFocus::Reminders),
+                "Tab must only ever land on Logs or Reminders"
+            );
+        }
     }
 
     #[test]
@@ -998,6 +1049,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1033,6 +1085,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1060,6 +1113,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1093,6 +1147,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1120,6 +1175,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1152,6 +1208,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1180,6 +1237,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1214,6 +1272,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1244,6 +1303,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1278,6 +1338,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1310,6 +1371,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );
@@ -1347,6 +1409,7 @@ mod tests {
                 last_updated_ms: 0,
                 status_since_ms: 0,
                 run_started_ms: 0,
+                last_prompt: None,
             }],
             Vec::new(),
         );

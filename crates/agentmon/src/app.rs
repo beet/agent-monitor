@@ -1188,6 +1188,7 @@ mod tests {
             last_updated_ms: 0,
             status_since_ms: 0,
             run_started_ms: 0,
+            last_prompt: None,
         }
     }
 
@@ -1397,6 +1398,7 @@ mod tests {
             pid: Some(1),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         }
     }
 

@@ -59,6 +59,7 @@ mod tests {
             host_context: HostContext::Terminal,
             pid,
             status: AgentStatus::Running,
+            prompt: None,
         });
     }
 

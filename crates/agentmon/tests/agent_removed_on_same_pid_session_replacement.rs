@@ -78,6 +78,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
                 host_context: HostContext::Terminal,
                 pid,
                 status: AgentStatus::Running,
+                prompt: None,
             },
         },
     )
@@ -107,6 +108,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
                 host_context: HostContext::Terminal,
                 pid,
                 status: AgentStatus::Running,
+                prompt: None,
             },
         },
     )

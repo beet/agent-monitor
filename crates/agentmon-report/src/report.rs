@@ -17,12 +17,21 @@ const SEND_TIMEOUT: Duration = Duration::from_millis(500);
 /// correspond to a tracked status change.
 pub fn build_event(payload: &HookPayload, host_context: HostContext, pid: u32) -> Option<AgentEvent> {
     let status = status_for_payload(payload)?;
+    // Only a `UserPromptSubmit` payload carries prompt text - every other
+    // hook event reports no prompt, regardless of whether `payload.prompt`
+    // happens to be set.
+    let prompt = if payload.hook_event_name == "UserPromptSubmit" {
+        payload.prompt.clone()
+    } else {
+        None
+    };
     Some(AgentEvent {
         session_id: SessionId(payload.session_id.clone()),
         cwd: PathBuf::from(&payload.cwd),
         host_context,
         pid,
         status,
+        prompt,
     })
 }
 
@@ -88,6 +97,36 @@ mod tests {
     }
 
     #[test]
+    fn build_event_carries_the_prompt_for_user_prompt_submit() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Fix the flaky test"
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242).unwrap();
+
+        assert_eq!(event.prompt.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn build_event_carries_no_prompt_for_other_hook_events() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash"
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242).unwrap();
+
+        assert_eq!(event.prompt, None);
+    }
+
+    #[test]
     fn build_event_returns_none_for_a_non_status_notification() {
         let raw = r#"{
             "session_id": "abc-123",
@@ -146,6 +185,7 @@ mod tests {
             host_context: HostContext::Terminal,
             pid: 1,
             status: AgentStatus::Done,
+            prompt: None,
         };
 
         let started = std::time::Instant::now();

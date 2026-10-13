@@ -16,6 +16,23 @@ use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus, SessionId, TestRunInfo,
 /// retired it - has itself since been retired by C.
 const MAX_SUPERSEDED_SESSIONS: usize = 256;
 
+/// Caps how long a tracked agent's last-prompt text can grow, so pasting an
+/// arbitrarily large prompt can't make one agent's registry entry - or any
+/// activity-log entry that later snapshots it - grow unbounded.
+const MAX_LAST_PROMPT_CHARS: usize = 4_000;
+
+/// Truncates `prompt` to `MAX_LAST_PROMPT_CHARS` characters (not bytes, so a
+/// multi-byte UTF-8 character is never split), appending a trailing
+/// truncation marker when truncation actually occurred.
+fn truncate_last_prompt(prompt: &str) -> String {
+    if prompt.chars().count() <= MAX_LAST_PROMPT_CHARS {
+        return prompt.to_string();
+    }
+    let mut truncated: String = prompt.chars().take(MAX_LAST_PROMPT_CHARS).collect();
+    truncated.push_str("...");
+    truncated
+}
+
 #[derive(Default)]
 struct RegistryState {
     agents: HashMap<SessionId, AgentInfo>,
@@ -183,6 +200,15 @@ impl Registry {
             Some(agent) => agent.run_started_ms,
             None => now,
         };
+        // An event only carries prompt text when it's derived from a
+        // `UserPromptSubmit` hook event; every other event leaves the
+        // agent's existing last prompt untouched rather than clearing it.
+        // A brand-new or same-pid-replacement entry (`previous` is `None`)
+        // starts with no last prompt unless this event itself supplies one.
+        let last_prompt = match &event.prompt {
+            Some(prompt) => Some(truncate_last_prompt(prompt)),
+            None => previous.as_ref().and_then(|agent| agent.last_prompt.clone()),
+        };
 
         let agent = AgentInfo {
             session_id: event.session_id.clone(),
@@ -193,6 +219,7 @@ impl Registry {
             last_updated_ms: now,
             status_since_ms,
             run_started_ms,
+            last_prompt,
         };
         state.agents.insert(agent.session_id.clone(), agent.clone());
 
@@ -317,6 +344,7 @@ mod tests {
             host_context: HostContext::Terminal,
             pid: 123,
             status,
+            prompt: None,
         }
     }
 
@@ -594,6 +622,86 @@ mod tests {
         assert_eq!(outcome.agent.status, AgentStatus::Running);
         assert_eq!(outcome.previous_status, Some(AgentStatus::NeedsInput));
         assert_eq!(registry.snapshot()[0].status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn a_prompt_bearing_event_records_the_last_prompt() {
+        let registry = Registry::new();
+
+        let outcome = registry.upsert(AgentEvent {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..sample_event(AgentStatus::Running)
+        });
+
+        assert_eq!(outcome.agent.last_prompt.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn a_non_prompt_bearing_event_leaves_the_last_prompt_unchanged() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..sample_event(AgentStatus::Running)
+        });
+
+        // Models a `PreToolUse`/`PostToolUse`/`Stop` event, none of which
+        // carry prompt text.
+        let outcome = registry.upsert(sample_event(AgentStatus::Done));
+
+        assert_eq!(
+            outcome.agent.last_prompt.as_deref(),
+            Some("Fix the flaky test"),
+            "an event with no prompt must not clear the previously recorded one"
+        );
+    }
+
+    #[test]
+    fn a_same_pid_replacement_does_not_inherit_the_previous_sessions_prompt() {
+        let registry = Registry::new();
+        registry.upsert(AgentEvent {
+            session_id: SessionId("session-1".to_string()),
+            pid: 123,
+            prompt: Some("Fix the flaky test".to_string()),
+            ..sample_event(AgentStatus::Running)
+        });
+
+        let outcome = registry.upsert(AgentEvent {
+            session_id: SessionId("session-2".to_string()),
+            pid: 123,
+            ..sample_event(AgentStatus::Running)
+        });
+
+        assert_eq!(
+            outcome.agent.last_prompt, None,
+            "a replacement entry for a new session id must not inherit the retired session's prompt"
+        );
+    }
+
+    #[test]
+    fn an_overlong_prompt_is_truncated() {
+        let registry = Registry::new();
+        let overlong = "a".repeat(MAX_LAST_PROMPT_CHARS + 500);
+
+        let outcome = registry.upsert(AgentEvent {
+            prompt: Some(overlong),
+            ..sample_event(AgentStatus::Running)
+        });
+
+        let stored = outcome.agent.last_prompt.unwrap();
+        assert_eq!(stored.chars().count(), MAX_LAST_PROMPT_CHARS + 3);
+        assert!(stored.ends_with("..."));
+    }
+
+    #[test]
+    fn a_prompt_within_the_cap_is_stored_unmodified() {
+        let registry = Registry::new();
+
+        let outcome = registry.upsert(AgentEvent {
+            prompt: Some("short prompt".to_string()),
+            ..sample_event(AgentStatus::Running)
+        });
+
+        assert_eq!(outcome.agent.last_prompt.as_deref(), Some("short prompt"));
     }
 
     #[test]

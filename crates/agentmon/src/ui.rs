@@ -498,7 +498,34 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
         };
         text.push_str(&formatted);
     }
+    // A reminder of what this agent was asked to do, for an agent-category
+    // entry recorded with a prompt snapshot - see the activity-log
+    // capability's "Activity log captures notification-worthy events"
+    // requirement. No snippet for entries recorded with none (e.g. an agent
+    // first tracked via `PreToolUse`, before any `UserPromptSubmit`).
+    if entry.category == agentmon_proto::LogCategory::Agent {
+        if let Some(prompt) = &entry.prompt {
+            text.push_str(&format!(" — \"{}\"", prompt_snippet(prompt)));
+        }
+    }
     (text, style)
+}
+
+/// Caps how much of a log entry's recorded prompt the Logs tab/pane shows
+/// inline, per the "truncated, single-line snippet" requirement: newlines
+/// are collapsed to spaces (a multi-line prompt must still read as one
+/// line), and anything beyond `PROMPT_SNIPPET_MAX_CHARS` is cut with a
+/// trailing `...` rather than overflowing the row.
+const PROMPT_SNIPPET_MAX_CHARS: usize = 50;
+
+fn prompt_snippet(prompt: &str) -> String {
+    let flattened: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= PROMPT_SNIPPET_MAX_CHARS {
+        return flattened;
+    }
+    let mut snippet: String = flattened.chars().take(PROMPT_SNIPPET_MAX_CHARS).collect();
+    snippet.push_str("...");
+    snippet
 }
 
 /// Appends `entry`'s reporting process id to an already-built status line,
@@ -620,11 +647,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-/// Renders the selected project's details modal: four panes covering its
-/// registered agents, its last test run (if any), its reminders, and its
-/// recent activity log entries - see the "Project details modal"
-/// requirement. Returns `(logs_page_size, reminders_page_size)` (see
-/// `render` / `PageSizes`).
+/// Total height (including its border) of the details modal's Last Prompt
+/// pane - a thin, fixed-height strip rather than a proportional share of the
+/// modal, since its content is capped to a handful of wrapped lines
+/// regardless of terminal size. Carved out of the Logs pane's area, per the
+/// "Project details modal" requirement.
+const LAST_PROMPT_PANE_HEIGHT: u16 = 4;
+
+/// Renders the selected project's details modal: five panes covering its
+/// registered agents, its last test run (if any), its reminders, the most
+/// recently active agent's last prompt, and its recent activity log
+/// entries, per the "Project details modal" requirement. Returns
+/// `(logs_page_size, reminders_page_size)` (see `render` / `PageSizes`).
 fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usize) {
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, area);
@@ -636,18 +670,23 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Agents, Tests, and Reminders share the top third, side by side; Logs -
-    // typically the longest-running list - gets the remaining two-thirds
-    // beneath them.
+    // Agents, Tests, and Reminders share the top third, side by side; a
+    // thin Last Prompt strip comes next; Logs - typically the
+    // longest-running list - gets whatever remains beneath that.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+        .constraints([
+            Constraint::Ratio(1, 3),
+            Constraint::Length(LAST_PROMPT_PANE_HEIGHT),
+            Constraint::Min(0),
+        ])
         .split(inner);
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(1, 3), Constraint::Ratio(1, 3)])
         .split(rows[0]);
-    let (agents_area, tests_area, reminders_area, logs_area) = (top[0], top[1], top[2], rows[1]);
+    let (agents_area, tests_area, reminders_area) = (top[0], top[1], top[2]);
+    let (last_prompt_area, logs_area) = (rows[1], rows[2]);
 
     let group = app.directory_groups().into_iter().find(|g| g.cwd == cwd);
     let now = now_ms();
@@ -693,6 +732,8 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
         ),
         tests_area,
     );
+
+    render_last_prompt_pane(frame, &group, last_prompt_area);
 
     let reminders_page_size = render_reminders_pane(frame, app, cwd, reminders_area);
 
@@ -750,6 +791,98 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     }
 
     (logs_page_size, reminders_page_size)
+}
+
+/// Shown in the Last Prompt pane when the project has no tracked agent, or
+/// its most recently active agent has no last-prompt text yet (e.g. first
+/// tracked via `PreToolUse`/`PostToolUse`, before any `UserPromptSubmit`
+/// event was seen for it).
+const NO_PROMPT_CAPTURED_PLACEHOLDER: &str = "No prompt captured yet";
+
+/// Renders the details modal's Last Prompt pane: the last-prompt text of
+/// whichever agent in this project most recently had a status update - the
+/// tracked agent with the greatest last-updated timestamp - so it tracks
+/// "the agent that just finished or needs input" as attention moves between
+/// agents in a multi-agent project. Non-interactive, like the Agents and
+/// Tests panes: no selection, no scrolling. See the "Project details modal"
+/// requirement.
+fn render_last_prompt_pane(frame: &mut Frame, group: &Option<DirectoryGroup>, area: Rect) {
+    let block = Block::default()
+        .title("Last Prompt")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+
+    let text = group
+        .as_ref()
+        .and_then(|g| g.agents.iter().max_by_key(|a| a.last_updated_ms))
+        .and_then(|a| a.last_prompt.as_deref())
+        .unwrap_or(NO_PROMPT_CAPTURED_PLACEHOLDER);
+
+    let lines: Vec<Line> = wrap_prompt(text, inner.width as usize, inner.height as usize)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Word-wraps `text` to `width` display columns, treating embedded newlines
+/// as paragraph breaks, and returns at most `height` lines. Used by the
+/// non-interactive, non-scrolling Last Prompt pane: rather than letting
+/// ratatui silently clip overflow or wrap it off-pane, the last line
+/// returned is truncated with a trailing `...` whenever wrapping produced
+/// more than `height` lines, so truncation is visible instead of silent.
+fn wrap_prompt(text: &str, width: usize, height: usize) -> Vec<String> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let candidate = if current.is_empty() {
+                word.to_string()
+            } else {
+                format!("{current} {word}")
+            };
+            if str_width(&candidate) <= width {
+                current = candidate;
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
+        }
+        lines.push(current);
+    }
+
+    if lines.len() <= height {
+        return lines;
+    }
+    let mut visible: Vec<String> = lines.into_iter().take(height).collect();
+    if let Some(last) = visible.last_mut() {
+        *last = truncate_text_with_ellipsis(last, width);
+    }
+    visible
+}
+
+/// Truncates `text` to fit within `max_width` display columns followed by a
+/// trailing `...`, unconditionally - unlike `truncate_line`, this is only
+/// called once the caller already knows truncation occurred (content beyond
+/// what fits), so it always appends the marker rather than checking first.
+fn truncate_text_with_ellipsis(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let budget = max_width.saturating_sub(3);
+    let mut result = String::new();
+    let mut width_so_far = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width_so_far + ch_width > budget {
+            break;
+        }
+        result.push(ch);
+        width_so_far += ch_width;
+    }
+    format!("{result}...")
 }
 
 /// Renders the details modal's Reminders pane: that project's reminders,
@@ -1541,6 +1674,7 @@ mod tests {
             last_updated_ms,
             status_since_ms: last_updated_ms,
             run_started_ms: last_updated_ms,
+            last_prompt: None,
         }
     }
 
@@ -2428,6 +2562,7 @@ mod tests {
             pid: Some(1),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         }
     }
 
@@ -3186,6 +3321,158 @@ mod tests {
     }
 
     #[test]
+    fn details_modal_last_prompt_pane_shows_the_single_agents_prompt() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                last_prompt: Some("Fix the flaky test".to_string()),
+                ..agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)
+            }],
+            Vec::new(),
+        );
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Last Prompt"), "expected the pane's title, got:\n{text}");
+        assert!(text.contains("Fix the flaky test"), "expected the agent's prompt, got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_last_prompt_pane_follows_the_most_recently_updated_agent() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo {
+                    last_prompt: Some("Older prompt".to_string()),
+                    ..agent("a", AgentStatus::Running, HostContext::Terminal, 1, 1_000)
+                },
+                AgentInfo {
+                    last_prompt: Some("Newer prompt".to_string()),
+                    ..agent("b", AgentStatus::Running, HostContext::Terminal, 2, 2_000)
+                },
+            ],
+            Vec::new(),
+        );
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Newer prompt"),
+            "expected the most recently updated agent's prompt, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Older prompt"),
+            "did not expect the other agent's prompt, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_last_prompt_pane_switches_when_a_different_agent_becomes_most_recent() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo {
+                    last_prompt: Some("First agent's prompt".to_string()),
+                    ..agent("a", AgentStatus::Running, HostContext::Terminal, 1, 2_000)
+                },
+                AgentInfo {
+                    last_prompt: Some("Second agent's prompt".to_string()),
+                    ..agent("b", AgentStatus::Running, HostContext::Terminal, 2, 1_000)
+                },
+            ],
+            Vec::new(),
+        );
+        app.open_details_modal();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        assert!(buffer_text(&term).contains("First agent's prompt"), "sanity check before the update");
+
+        app.apply_update(AgentInfo {
+            last_prompt: Some("Second agent's prompt".to_string()),
+            ..agent("b", AgentStatus::Running, HostContext::Terminal, 2, 3_000)
+        });
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Second agent's prompt"),
+            "expected the pane to follow the newly-updated agent, got:\n{text}"
+        );
+        assert!(
+            !text.contains("First agent's prompt"),
+            "did not expect the no-longer-most-recent agent's prompt, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_last_prompt_pane_shows_a_placeholder_when_none_captured() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)],
+            Vec::new(),
+        );
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains(NO_PROMPT_CAPTURED_PLACEHOLDER),
+            "expected the no-prompt placeholder, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_last_prompt_pane_shows_a_placeholder_when_the_project_has_no_agents() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::TestRun,
+            "failed",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains(NO_PROMPT_CAPTURED_PLACEHOLDER),
+            "expected the no-prompt placeholder for an agent-less project, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_last_prompt_pane_truncates_a_prompt_that_does_not_fit() {
+        let overlong = "word ".repeat(200);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                last_prompt: Some(overlong),
+                ..agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)
+            }],
+            Vec::new(),
+        );
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("..."), "expected a trailing ellipsis for a prompt that overflows the pane, got:\n{text}");
+    }
+
+    #[test]
     fn details_modal_shows_placeholders_when_no_test_run_or_activity() {
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut app = App::new();
@@ -3234,6 +3521,7 @@ mod tests {
                 pid: Some(555_555),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -3243,6 +3531,7 @@ mod tests {
                 pid: Some(666_666),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -3257,6 +3546,32 @@ mod tests {
         assert!(
             !text.contains("pid 666666"),
             "a test-run entry must not show a pid in the Logs pane, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn details_modal_logs_pane_shows_the_prompt_snippet_for_agent_activities() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: PathBuf::from("/Users/beet/project"),
+            category: agentmon_proto::LogCategory::Agent,
+            status: "done".to_string(),
+            occurred_at_ms: 1_000,
+            pid: Some(555_555),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: Some("Fix the flaky test".to_string()),
+        }]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Fix the flaky test"),
+            "expected the Logs pane to show the recorded prompt snippet, got:\n{text}"
         );
     }
 
@@ -3343,6 +3658,7 @@ mod tests {
                 pid: Some(555_555),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -3352,6 +3668,7 @@ mod tests {
                 pid: Some(666_666),
                 reminder_name: None,
                 reminder_due_at_ms: None,
+                prompt: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -3390,6 +3707,7 @@ mod tests {
             pid: Some(1),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         };
         let long_entry = LogEntry {
             working_dir: PathBuf::from("/Users/beet/project"),
@@ -3399,6 +3717,7 @@ mod tests {
             pid: Some(555_555),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         };
         app.apply_log_snapshot(vec![short_entry.clone(), long_entry.clone()]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -3862,6 +4181,7 @@ mod tests {
                 pid: None,
                 reminder_name: Some("Check the build".to_string()),
                 reminder_due_at_ms: None,
+                prompt: None,
             }]);
             app
         };
@@ -4017,6 +4337,7 @@ mod tests {
             pid: None,
             reminder_name: Some("Check the build".to_string()),
             reminder_due_at_ms: None,
+            prompt: None,
         };
 
         let (text, _style) = log_entry_status_line(&[], &entry);
@@ -4034,6 +4355,7 @@ mod tests {
             pid: None,
             reminder_name: Some(name.to_string()),
             reminder_due_at_ms: None,
+            prompt: None,
         }
     }
 
@@ -4078,6 +4400,7 @@ mod tests {
             pid: None,
             reminder_name: Some("Check the build".to_string()),
             reminder_due_at_ms: Some(600_000),
+            prompt: None,
         };
 
         let (text, _style) = log_entry_status_line(&[], &entry);
@@ -4086,6 +4409,73 @@ mod tests {
             text,
             format!("⏰ reminder started: Check the build, ETA: {}", format_eta_ms(600_000)),
             "got: {text}"
+        );
+    }
+
+    #[test]
+    fn an_agent_entry_with_a_recorded_prompt_shows_its_snippet() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(
+            text.contains("\"Fix the flaky test\""),
+            "expected the recorded prompt snippet, got: {text}"
+        );
+    }
+
+    #[test]
+    fn an_agent_entry_with_no_recorded_prompt_shows_no_snippet() {
+        let entry = log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0);
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(!text.contains('"'), "expected no prompt snippet, got: {text}");
+    }
+
+    #[test]
+    fn a_non_agent_entry_with_a_prompt_field_set_shows_no_snippet() {
+        // Only agent-category entries ever carry a prompt in practice, but
+        // the rendering itself must also gate on category, not merely on
+        // whether the field happens to be `Some`.
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::TestRun, "failed", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(!text.contains('"'), "expected no prompt snippet on a non-agent entry, got: {text}");
+    }
+
+    #[test]
+    fn a_long_prompt_is_truncated_with_a_trailing_ellipsis() {
+        let overlong = "a".repeat(PROMPT_SNIPPET_MAX_CHARS + 20);
+        let entry = LogEntry {
+            prompt: Some(overlong),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(text.contains("...\""), "expected the snippet to end with an ellipsis, got: {text}");
+    }
+
+    #[test]
+    fn a_multiline_prompt_is_flattened_to_a_single_line() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky\ntest in CI".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(
+            text.contains("\"Fix the flaky test in CI\""),
+            "expected the prompt's newline collapsed to a space, got: {text}"
         );
     }
 

@@ -102,6 +102,7 @@ classDiagram
         +HostContext host_context
         +u32 pid
         +AgentStatus status
+        +Option~String~ prompt
     }
     class AgentInfo {
         +SessionId session_id
@@ -112,6 +113,7 @@ classDiagram
         +u64 last_updated_ms
         +u64 status_since_ms
         +u64 run_started_ms
+        +Option~String~ last_prompt
     }
     class TestRunInfo {
         +PathBuf cwd
@@ -138,6 +140,7 @@ classDiagram
         +Option~u32~ pid
         +Option~String~ reminder_name
         +Option~u64~ reminder_due_at_ms
+        +Option~String~ prompt
     }
     class AgentStatus {
         <<enumeration>>

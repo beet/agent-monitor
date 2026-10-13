@@ -153,6 +153,7 @@ mod tests {
             last_updated_ms: 1_700_000_000_000,
             status_since_ms: 1_700_000_000_000,
             run_started_ms: 1_700_000_000_000,
+            last_prompt: None,
         }
     }
 

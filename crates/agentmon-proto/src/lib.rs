@@ -90,6 +90,10 @@ pub struct AgentEvent {
     pub host_context: HostContext,
     pub pid: u32,
     pub status: AgentStatus,
+    /// The text of the user prompt that triggered this event. Only
+    /// `UserPromptSubmit`-derived events carry this - every other hook
+    /// event reports `None`.
+    pub prompt: Option<String>,
 }
 
 /// The daemon's view of a tracked agent, as sent to clients.
@@ -114,6 +118,11 @@ pub struct AgentInfo {
     /// agent's pid persists across many started -> running -> done turns
     /// over the life of a session.
     pub run_started_ms: u64,
+    /// The text of this agent's most recently submitted user prompt, if
+    /// any. Set from an `AgentEvent`'s `prompt` when present, and carried
+    /// forward unchanged across subsequent events that report none - see
+    /// the agent-daemon spec's "Agent registry" requirement.
+    pub last_prompt: Option<String>,
 }
 
 /// Category of event recorded in the activity log - see the activity-log
@@ -150,6 +159,12 @@ pub struct LogEntry {
     /// its start time and duration at the moment it started; it does not
     /// change if the reminder's duration is edited later.
     pub reminder_due_at_ms: Option<u64>,
+    /// A snapshot of the reporting agent's last-prompt text as of this
+    /// event, frozen at record time like `reminder_name` is for a reminder
+    /// entry - a later prompt submitted for that agent does not alter an
+    /// already-recorded entry. Populated only for agent-category entries,
+    /// and only when that agent had a last prompt tracked at the time.
+    pub prompt: Option<String>,
 }
 
 /// Identifies a reminder across client commands and daemon updates.
@@ -283,6 +298,7 @@ mod tests {
             last_updated_ms: 1_700_000_000_000,
             status_since_ms: 1_700_000_000_000,
             run_started_ms: 1_700_000_000_000,
+            last_prompt: Some("Fix the flaky test".to_string()),
         }
     }
 
@@ -294,6 +310,7 @@ mod tests {
             host_context: HostContext::Terminal,
             pid: 99,
             status: AgentStatus::NeedsInput,
+            prompt: Some("Fix the flaky test".to_string()),
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -317,6 +334,10 @@ mod tests {
         assert!(
             json.contains("\"run_started_ms\":1700000000000"),
             "expected run_started_ms field in JSON, got: {json}"
+        );
+        assert!(
+            json.contains("\"last_prompt\":\"Fix the flaky test\""),
+            "expected last_prompt field in JSON, got: {json}"
         );
     }
 
@@ -343,6 +364,7 @@ mod tests {
             pid: Some(4242),
             reminder_name: None,
             reminder_due_at_ms: None,
+            prompt: None,
         }
     }
 
@@ -642,6 +664,7 @@ mod tests {
                 host_context: HostContext::Desktop,
                 pid: 7,
                 status: AgentStatus::Idle,
+                prompt: None,
             },
         };
 
