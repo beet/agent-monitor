@@ -103,10 +103,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         match rx.recv() {
             Ok(AppEvent::Client(ClientEvent::Unreachable(reason))) => app.set_unreachable(reason),
             Ok(AppEvent::Client(ClientEvent::Reconnecting)) => app.set_reconnecting(),
-            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs, logs, reminders))) => {
+            Ok(AppEvent::Client(ClientEvent::Snapshot(agents, test_runs, logs, reminders, project_names))) => {
                 app.apply_snapshot(agents, test_runs);
                 app.apply_log_snapshot(logs);
                 app.apply_reminder_snapshot(reminders);
+                app.apply_project_names_snapshot(project_names);
             }
             Ok(AppEvent::Client(ClientEvent::Update(agent))) => app.apply_update(agent),
             Ok(AppEvent::Client(ClientEvent::TestRunUpdate(test_run))) => {
@@ -124,6 +125,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 }
             }
             Ok(AppEvent::Client(ClientEvent::ReminderRemoved(id))) => app.remove_reminder(&id),
+            Ok(AppEvent::Client(ClientEvent::ProjectRenamed(project_name))) => {
+                app.apply_project_renamed(project_name)
+            }
             Ok(AppEvent::Key(key)) => match handle_key(&mut app, key, page_sizes) {
                 InputAction::Quit => return Ok(()),
                 InputAction::SendReminderCommand(message) => {

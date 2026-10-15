@@ -92,6 +92,14 @@ fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) -> PageSizes 
         None => (0, 0),
     };
 
+    // Unlike the reminder form, the rename form is reachable with no
+    // `Modal` open at all (from the Agents tab), so it's drawn as its own
+    // overlay here rather than nested inside `render_modal` - see the
+    // "Project rename form" requirement.
+    if let Some(form) = &app.rename_form {
+        render_rename_form(frame, form);
+    }
+
     PageSizes { logs_tab, modal_logs, reminders_tab, modal_reminders }
 }
 
@@ -157,7 +165,7 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
     // REMINDERS can each be sized to what they actually need this frame
     // instead of a fixed weighted ratio that leaves a narrow column
     // cramped while others sit mostly blank next to it.
-    let project_texts: Vec<String> = groups.iter().map(|g| project_name(&g.cwd)).collect();
+    let project_texts: Vec<String> = groups.iter().map(|g| app.project_name(&g.cwd)).collect();
     let agents_lines: Vec<Line> = groups.iter().map(|g| agents_status_line(g, now, true)).collect();
     let tests_lines: Vec<Line> = groups.iter().map(|g| tests_status_line(g, now, true)).collect();
     let reminders_lines: Vec<Line> = groups.iter().map(|g| reminders_status_line(g, app, now)).collect();
@@ -272,7 +280,7 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let rows = entries.iter().map(|entry| {
         let (status_text, status_style) = log_entry_status_line(&app.logs, entry);
         Row::new([
-            Cell::from(project_name(&entry.working_dir)),
+            Cell::from(app.project_name(&entry.working_dir)),
             Cell::from(log_category_label(entry.category)),
             Cell::from(Span::styled(status_text, status_style)),
             Cell::from(format_last_updated(entry.occurred_at_ms)),
@@ -559,9 +567,10 @@ fn agents_tab_title(app: &App, banner: Option<&str>) -> Line<'static> {
         vec![
             Span::raw("Agents  Filter [/]: "),
             Span::styled(filter.clone(), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("  Rename [n]"),
         ]
     } else {
-        vec![Span::raw("Agents  Filter [/]")]
+        vec![Span::raw("Agents  Filter [/]  Rename [n]")]
     };
     if let Some(banner) = banner {
         spans.push(Span::raw(format!(" - {banner}")));
@@ -664,7 +673,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(format!("Details - {}", project_name(cwd)))
+        .title(format!("Details - {}  Rename [n]", app.project_name(cwd)))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
@@ -1031,12 +1040,6 @@ fn format_running_duration(status_since_ms: u64, now_ms: u64) -> String {
     }
 }
 
-fn project_name(cwd: &Path) -> String {
-    cwd.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| cwd.display().to_string())
-}
-
 /// Builds a project's AGENTS cell: one styled segment per distinct agent
 /// status present (in `AGENT_STATUS_ORDER`, so the same set of statuses
 /// always renders in the same order), joined by " · " so no status is
@@ -1216,7 +1219,7 @@ fn render_reminders_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option
     let rows = entries.iter().map(|reminder| {
         let (status_text, status_style) = reminder_status_cell_text_and_style(reminder, now, false);
         Row::new([
-            Cell::from(project_name(&reminder.cwd)),
+            Cell::from(app.project_name(&reminder.cwd)),
             Cell::from(reminder.name.clone()),
             Cell::from(format!("{}m", reminder.duration_minutes)),
             Cell::from(Span::styled(status_text, status_style)),
@@ -1577,6 +1580,50 @@ fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
         ReminderFormField::Duration => (1, form.duration_minutes.chars().count()),
     };
     frame.set_cursor_position((inner.x + REMINDER_FORM_LABEL_WIDTH + field_len as u16, inner.y + row));
+}
+
+/// Renders the project rename form - see the "Project rename form"
+/// requirement. Shows the in-progress text with a cursor at its end, and -
+/// when client-side validation has rejected the current text - an inline
+/// error line beneath it in bold red, matching how other validation-style
+/// feedback in this TUI (e.g. the quit/delete confirmations) uses red for
+/// something the user should notice.
+fn render_rename_form(frame: &mut Frame, form: &crate::app::RenameForm) {
+    let area = centered_rect(50, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title("Rename Project")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+
+    let mut text = vec![
+        Line::from(vec![
+            Span::styled("Name: ", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(form.name.clone()),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(error) = &form.error {
+        text.push(Line::from(Span::styled(
+            error.clone(),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        text.push(Line::from(""));
+    }
+    text.push(Line::from(Span::styled(
+        "Enter: save   Esc: cancel",
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(text).block(block), area);
+
+    const RENAME_FORM_LABEL_WIDTH: u16 = 6;
+    frame.set_cursor_position((
+        inner.x + RENAME_FORM_LABEL_WIDTH + form.name.chars().count() as u16,
+        inner.y,
+    ));
 }
 
 /// Renders the bold, red quit-confirmation dialog opened by a top-level
@@ -2486,6 +2533,51 @@ mod tests {
     }
 
     #[test]
+    fn agents_tab_title_shows_a_rename_hint_after_the_filter_hint() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Agents  Filter [/]  Rename [n]"), "got:\n{text}");
+    }
+
+    #[test]
+    fn agents_tab_title_shows_the_rename_hint_after_an_applied_filter_too() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.agents_search_applied = Some("xyz".to_string());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Agents  Filter [/]: xyz  Rename [n]"),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn agents_tab_title_hides_the_rename_hint_while_editing_the_search_prompt() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_agents_search();
+        app.push_agents_search_char('a');
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("Rename [n]"),
+            "the rename hint must not show while the search prompt is being edited, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn agents_tab_title_becomes_a_live_search_prompt_while_editing() {
         let mut term = terminal();
         let mut app = App::new();
@@ -3206,6 +3298,19 @@ mod tests {
         assert!(text.contains("Logs"), "got:\n{text}");
         assert!(text.contains("running"), "expected the agent's status, got:\n{text}");
         assert!(text.contains("tests failed"), "expected the test run's status, got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_title_shows_a_rename_hint_after_the_project_name() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Details - project  Rename [n]"), "got:\n{text}");
     }
 
     #[test]
@@ -4632,5 +4737,80 @@ mod tests {
             ratatui::layout::Position { x: duration_x + REMINDER_FORM_LABEL_WIDTH + 1, y: duration_y },
             "cursor should sit right after the typed digit, before the trailing 'm'"
         );
+    }
+
+    #[test]
+    fn rename_form_renders_from_the_agents_tab_with_no_modal_open() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Rename Project"), "got:\n{text}");
+        assert!(text.contains("Name:"), "got:\n{text}");
+        assert!(text.contains("project"), "expected the pre-populated default name, got:\n{text}");
+        assert!(text.contains("Enter: save"), "got:\n{text}");
+        assert!(text.contains("Esc: cancel"), "got:\n{text}");
+    }
+
+    #[test]
+    fn rename_form_shows_the_cursor_at_the_end_of_the_typed_text() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+        app.rename_form_input_char('!');
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        const RENAME_FORM_LABEL_WIDTH: u16 = 6;
+        let (name_x, name_y) = find_text(term.backend().buffer(), "Name:").expect("expected the Name label");
+        let cursor = term.get_cursor_position().expect("cursor position should be set");
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position {
+                x: name_x + RENAME_FORM_LABEL_WIDTH + "project!".len() as u16,
+                y: name_y,
+            },
+            "cursor should sit right after the typed text"
+        );
+    }
+
+    #[test]
+    fn rename_form_shows_an_inline_error_on_invalid_submission() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+        while !app.rename_form.as_ref().unwrap().name.is_empty() {
+            app.rename_form_backspace();
+        }
+        app.submit_rename_form();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Name cannot be blank"), "got:\n{text}");
+        let (x, y) =
+            find_text(term.backend().buffer(), "Name cannot be blank").expect("expected the error line");
+        let cell = term.backend().buffer().cell((x, y)).unwrap();
+        assert_eq!(cell.style().fg, Some(Color::Red), "the error text should be red");
+    }
+
+    #[test]
+    fn rename_form_renders_as_an_overlay_on_the_details_modal() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+        app.open_rename_form_from_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Rename Project"), "got:\n{text}");
     }
 }

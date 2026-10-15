@@ -36,6 +36,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputA
         return handle_agents_search_editing_key(app, key.code);
     }
 
+    // Also checked before the global `q` quit shortcut, for the same reason
+    // as `agents_search_editing` above: a project name is free text the user
+    // types, and "q" is a plausible character to want in one.
+    if app.rename_form.is_some() {
+        return handle_rename_form_key(app, key.code);
+    }
+
     if let KeyCode::Char('q') = key.code {
         return InputAction::Quit;
     }
@@ -91,7 +98,36 @@ fn handle_agents_tab_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('k') | KeyCode::Up => app.move_agents_selection(-1),
         KeyCode::Enter => app.open_details_modal(),
         KeyCode::Char('/') => app.open_agents_search(),
+        KeyCode::Char('n') => app.open_rename_form_from_agents_tab(),
         _ => {}
+    }
+}
+
+/// Handles a key while the project rename form is open. `Esc` discards the
+/// form without sending anything; `Enter` validates and, on success, returns
+/// the `RenameProject` message to send (closing the form), or leaves it open
+/// with its inline error set on failure; `Backspace` and printable
+/// characters (including `q` - see this form's check in `handle_key`) edit
+/// its text.
+fn handle_rename_form_key(app: &mut App, code: KeyCode) -> InputAction {
+    match code {
+        KeyCode::Esc => {
+            app.close_rename_form();
+            InputAction::Continue
+        }
+        KeyCode::Enter => match app.submit_rename_form() {
+            Some(message) => InputAction::SendReminderCommand(message),
+            None => InputAction::Continue,
+        },
+        KeyCode::Backspace => {
+            app.rename_form_backspace();
+            InputAction::Continue
+        }
+        KeyCode::Char(c) => {
+            app.rename_form_input_char(c);
+            InputAction::Continue
+        }
+        _ => InputAction::Continue,
     }
 }
 
@@ -207,6 +243,13 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
         // [R]` hint in the Reminders pane's title.
         if code == KeyCode::Char('R') {
             app.open_reminder_create_form();
+            return InputAction::Continue;
+        }
+        // Renaming likewise doesn't depend on a highlighted selection, so
+        // it works regardless of which pane currently holds focus - matching
+        // its `Rename [n]` hint in the modal's title.
+        if code == KeyCode::Char('n') {
+            app.open_rename_form_from_details_modal();
             return InputAction::Continue;
         }
 
@@ -1423,5 +1466,108 @@ mod tests {
         assert_eq!(action, InputAction::Continue);
         assert!(app.reminder_form.is_none());
         assert!(app.modal.is_some(), "Esc on the form must not also close the modal");
+    }
+
+    fn app_with_one_agent() -> App {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app
+    }
+
+    #[test]
+    fn n_opens_the_rename_form_from_the_agents_tab() {
+        let mut app = app_with_one_agent();
+
+        let action = press(&mut app, KeyCode::Char('n'));
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.rename_form.as_ref().unwrap().name, "a");
+    }
+
+    #[test]
+    fn typing_q_while_the_rename_form_is_open_appends_it_instead_of_quitting() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+
+        let action = press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(action, InputAction::Continue, "q must not quit while the rename form is open");
+        assert_eq!(app.rename_form.as_ref().unwrap().name, "aq");
+    }
+
+    #[test]
+    fn esc_cancels_the_rename_form_without_a_message() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert!(app.rename_form.is_none());
+        assert_eq!(app.project_name(std::path::Path::new("/tmp/a")), "a");
+    }
+
+    #[test]
+    fn enter_submits_a_valid_rename_from_the_agents_tab() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('!'));
+
+        let action = press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            InputAction::SendReminderCommand(ClientMessage::RenameProject {
+                cwd: std::path::PathBuf::from("/tmp/a"),
+                name: "a!".to_string(),
+            })
+        );
+        assert!(app.rename_form.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_blank_rename_keeps_the_form_open_with_an_error() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Backspace);
+
+        let action = press(&mut app, KeyCode::Enter);
+
+        assert_eq!(action, InputAction::Continue);
+        let form = app.rename_form.expect("form must stay open on invalid input");
+        assert!(form.error.is_some());
+    }
+
+    #[test]
+    fn n_opens_the_rename_form_from_the_details_modal_regardless_of_focus() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // open details modal, default focus Logs
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.rename_form.as_ref().unwrap().cwd, std::path::PathBuf::from("/tmp/a"));
+        app.close_rename_form();
+
+        press(&mut app, KeyCode::Tab); // switch focus to Reminders
+        assert_eq!(app.modal_focus, ModalFocus::Reminders);
+        let action = press(&mut app, KeyCode::Char('n'));
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.rename_form.as_ref().unwrap().cwd, std::path::PathBuf::from("/tmp/a"));
     }
 }

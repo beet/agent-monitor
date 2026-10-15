@@ -6,7 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use agentmon_proto::{
-    AgentInfo, ClientMessage, LogEntry, ReminderId, ReminderInfo, ServerMessage, SessionId, TestRunInfo,
+    AgentInfo, ClientMessage, LogEntry, ProjectName, ReminderId, ReminderInfo, ServerMessage, SessionId,
+    TestRunInfo,
 };
 
 use crate::ingest::Ingestor;
@@ -27,6 +28,7 @@ enum Update {
     AgentRemoved(SessionId),
     Reminder(ReminderInfo),
     ReminderRemoved(ReminderId),
+    ProjectRenamed(ProjectName),
 }
 
 /// Fans out registry updates to every currently-subscribed client.
@@ -137,14 +139,24 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
                 broadcaster.publish(Update::Reminder(reminder));
             }
         }
+        Some(ClientMessage::RenameProject { cwd, name }) => {
+            match ingestor.ingest_rename_project(cwd, name) {
+                Some(project_name) => broadcaster.publish(Update::ProjectRenamed(project_name)),
+                // Blank, or collides with another known project's current
+                // effective name - dropped, matching how a reminder past
+                // the per-project cap is handled above.
+                None => eprintln!("agentd: rejecting project rename, blank or duplicate name"),
+            }
+        }
         Some(ClientMessage::Subscribe) => {
             let agents = ingestor.registry().snapshot();
             let test_runs = ingestor.registry().snapshot_test_runs();
             let logs = ingestor.activity_log().snapshot();
             let reminders = ingestor.reminders().snapshot();
+            let project_names = ingestor.registry().custom_names();
             let sent = write_message(
                 &mut writer,
-                &ServerMessage::Snapshot { agents, test_runs, logs, reminders },
+                &ServerMessage::Snapshot { agents, test_runs, logs, reminders, project_names },
             );
             if sent.is_err() {
                 return;
@@ -158,6 +170,7 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
                     Update::AgentRemoved(session_id) => ServerMessage::AgentRemoved { session_id },
                     Update::Reminder(reminder) => ServerMessage::ReminderUpdate { reminder },
                     Update::ReminderRemoved(id) => ServerMessage::ReminderRemoved { id },
+                    Update::ProjectRenamed(ProjectName { cwd, name }) => ServerMessage::ProjectRenamed { cwd, name },
                 };
                 if write_message(&mut writer, &message).is_err() {
                     break;
@@ -991,5 +1004,106 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(notified, 1, "a natural completion must send exactly one reminder notification");
+    }
+
+    #[test]
+    fn a_successful_rename_is_broadcast_to_a_second_connected_client() {
+        let (path, _notifier) = spawn_test_server("rename-broadcast");
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::RenameProject {
+                    cwd: PathBuf::from("/tmp/project"),
+                    name: "My Project".to_string(),
+                },
+            )
+            .expect("send rename");
+        }
+
+        let message: ServerMessage = read_message(&mut reader)
+            .expect("read message")
+            .expect("connection should not close before message");
+        let ServerMessage::ProjectRenamed { cwd, name } = message else {
+            panic!("expected a ProjectRenamed message, got {message:?}");
+        };
+        assert_eq!(cwd, PathBuf::from("/tmp/project"));
+        assert_eq!(name, "My Project");
+    }
+
+    #[test]
+    fn a_rejected_rename_is_not_broadcast_and_leaves_the_name_unchanged() {
+        let (path, _notifier) = spawn_test_server("rename-rejected");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent {
+                    event: sample_event(AgentStatus::Running),
+                },
+            )
+            .expect("send running event");
+        }
+        wait_for_status(&path, &SessionId("session-1".to_string()), AgentStatus::Running);
+
+        let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
+        let mut writer = subscriber.try_clone().expect("clone stream");
+        write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut reader = BufReader::new(subscriber);
+        let _snapshot: ServerMessage = read_message(&mut reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect as reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::RenameProject {
+                    cwd: PathBuf::from("/tmp/project"),
+                    name: "   ".to_string(),
+                },
+            )
+            .expect("send blank rename");
+        }
+
+        // Nothing else happens on the daemon after the rejected rename, so
+        // prove no broadcast arrived by racing a message read against a
+        // short timeout - a fresh connection's snapshot confirms the name
+        // is unaffected either way.
+        subscriber_set_read_timeout(&mut reader, Duration::from_millis(200));
+        let result = read_message::<_, ServerMessage>(&mut reader);
+        assert!(
+            result.is_err(),
+            "expected no message to arrive after a rejected rename, got {result:?}"
+        );
+
+        let fresh = UnixStream::connect(&path).expect("connect as fresh subscriber");
+        let mut fresh_writer = fresh.try_clone().expect("clone stream");
+        write_message(&mut fresh_writer, &ClientMessage::Subscribe).expect("send subscribe");
+        let mut fresh_reader = BufReader::new(fresh);
+        let snapshot: ServerMessage = read_message(&mut fresh_reader)
+            .expect("read snapshot")
+            .expect("connection should not close before snapshot");
+        let ServerMessage::Snapshot { project_names, .. } = snapshot else {
+            panic!("expected a Snapshot message, got {snapshot:?}");
+        };
+        assert!(
+            project_names.is_empty(),
+            "a rejected rename must not leave any custom name behind"
+        );
+    }
+
+    fn subscriber_set_read_timeout(reader: &mut BufReader<UnixStream>, timeout: Duration) {
+        reader.get_ref().set_read_timeout(Some(timeout)).expect("set read timeout");
     }
 }

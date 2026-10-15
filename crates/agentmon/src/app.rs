@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use agentmon_proto::{
-    AgentInfo, ClientMessage, LogEntry, ReminderId, ReminderInfo, ReminderStatus, SessionId, TestRunInfo,
+    AgentInfo, ClientMessage, LogEntry, ProjectName, ReminderId, ReminderInfo, ReminderStatus, SessionId,
+    TestRunInfo,
 };
 
 /// A paginated list's selection and scroll-window state - shared by the Logs
@@ -215,6 +216,22 @@ pub struct ReminderForm {
     pub field: ReminderFormField,
 }
 
+/// The project rename form's in-progress state - see the "Project rename
+/// form" requirement. Reachable from the Agents tab with no modal open, or
+/// from inside the details modal; either way `cwd` is the project being
+/// renamed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameForm {
+    pub cwd: PathBuf,
+    pub name: String,
+    /// Set by client-side validation when `Enter` is pressed on invalid
+    /// input (blank, or a duplicate of another known project's name);
+    /// cleared on any subsequent edit. Never set by anything the daemon
+    /// sends back - there is nothing for it to send back, since a rejected
+    /// `RenameProject` is silently dropped (see design.md).
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connecting,
@@ -312,6 +329,13 @@ pub struct App {
     /// auto-start it. Cleared once matched, or overwritten by a later
     /// create before this one is confirmed.
     pending_new_reminder: Option<(PathBuf, String)>,
+    /// Every project currently assigned a custom display name, keyed by
+    /// working directory - mirrors the daemon's own map (see the
+    /// project-renaming spec). Absence of an entry means that project still
+    /// uses its directory-derived default name.
+    pub project_names: HashMap<PathBuf, String>,
+    /// The project rename form, when open.
+    pub rename_form: Option<RenameForm>,
 }
 
 impl App {
@@ -342,6 +366,8 @@ impl App {
             reminder_form: None,
             confirm_delete_reminder: None,
             pending_new_reminder: None,
+            project_names: HashMap::new(),
+            rename_form: None,
         }
     }
 
@@ -498,7 +524,7 @@ impl App {
                 let filter = filter.to_lowercase();
                 groups
                     .into_iter()
-                    .filter(|g| project_name(&g.cwd).to_lowercase().contains(&filter))
+                    .filter(|g| project_name(&g.cwd, &self.project_names).to_lowercase().contains(&filter))
                     .collect()
             }
         }
@@ -633,14 +659,14 @@ impl App {
             .filter(|e| {
                 self.logs_filter_project
                     .as_deref()
-                    .is_none_or(|p| project_name(&e.working_dir) == p)
+                    .is_none_or(|p| project_name(&e.working_dir, &self.project_names) == p)
             })
             .filter(|e| self.logs_filter_status.as_deref().is_none_or(|s| e.status == s))
             .collect();
 
         match self.logs_sort {
             LogSort::Recency => entries.sort_by_key(|e| std::cmp::Reverse(e.occurred_at_ms)),
-            LogSort::Project => entries.sort_by_key(|e| project_name(&e.working_dir)),
+            LogSort::Project => entries.sort_by_key(|e| project_name(&e.working_dir, &self.project_names)),
             LogSort::Status => entries.sort_by(|a, b| a.status.cmp(&b.status)),
         }
 
@@ -745,7 +771,11 @@ impl App {
     /// the full (unfiltered) log, in alphabetical order, then back to no
     /// filter.
     pub fn cycle_logs_project_filter(&mut self) {
-        let mut projects: Vec<String> = self.logs.iter().map(|e| project_name(&e.working_dir)).collect();
+        let mut projects: Vec<String> = self
+            .logs
+            .iter()
+            .map(|e| project_name(&e.working_dir, &self.project_names))
+            .collect();
         projects.sort();
         projects.dedup();
         self.logs_filter_project = next_in_cycle(self.logs_filter_project.as_deref(), &projects);
@@ -823,7 +853,7 @@ impl App {
             .filter(|r| {
                 self.reminders_filter_project
                     .as_deref()
-                    .is_none_or(|p| project_name(&r.cwd) == p)
+                    .is_none_or(|p| project_name(&r.cwd, &self.project_names) == p)
             })
             .filter(|r| {
                 self.reminders_filter_status
@@ -834,7 +864,7 @@ impl App {
 
         match self.reminders_sort {
             ReminderSort::Recency => entries.sort_by_key(|r| std::cmp::Reverse(reminder_recency_key(r))),
-            ReminderSort::Project => entries.sort_by_key(|r| project_name(&r.cwd)),
+            ReminderSort::Project => entries.sort_by_key(|r| project_name(&r.cwd, &self.project_names)),
             ReminderSort::Status => entries.sort_by_key(|r| reminder_status_word(r.status).to_string()),
         }
 
@@ -930,7 +960,11 @@ impl App {
     /// Cycles the Project filter through every distinct project present
     /// among tracked reminders, alphabetically, then back to no filter.
     pub fn cycle_reminders_project_filter(&mut self) {
-        let mut projects: Vec<String> = self.reminders.iter().map(|r| project_name(&r.cwd)).collect();
+        let mut projects: Vec<String> = self
+            .reminders
+            .iter()
+            .map(|r| project_name(&r.cwd, &self.project_names))
+            .collect();
         projects.sort();
         projects.dedup();
         self.reminders_filter_project = next_in_cycle(self.reminders_filter_project.as_deref(), &projects);
@@ -1110,6 +1144,115 @@ impl App {
         let id = self.confirm_delete_reminder.take()?;
         Some(ClientMessage::DeleteReminder { id })
     }
+
+    /// Replaces the custom-name map with the daemon's current snapshot, per
+    /// the project-renaming spec's "Renames are visible to every connected
+    /// client" requirement.
+    pub fn apply_project_names_snapshot(&mut self, project_names: Vec<ProjectName>) {
+        self.project_names = project_names.into_iter().map(|p| (p.cwd, p.name)).collect();
+    }
+
+    /// Applies a single project rename pushed by the daemon.
+    pub fn apply_project_renamed(&mut self, project_name: ProjectName) {
+        self.project_names.insert(project_name.cwd, project_name.name);
+    }
+
+    /// This project's current effective display name - its custom name if
+    /// it has one, otherwise its directory-derived default.
+    pub fn project_name(&self, cwd: &Path) -> String {
+        project_name(cwd, &self.project_names)
+    }
+
+    /// Opens the rename form for the Agents tab's currently selected
+    /// project row, pre-populated with its current display name. A no-op
+    /// if the Agents tab's project list is empty.
+    pub fn open_rename_form_from_agents_tab(&mut self) {
+        let Some(group) = self.visible_agent_groups().get(self.agents_selected).cloned() else {
+            return;
+        };
+        self.rename_form = Some(RenameForm {
+            name: self.project_name(&group.cwd),
+            cwd: group.cwd,
+            error: None,
+        });
+    }
+
+    /// Opens the rename form for the details modal's current project,
+    /// pre-populated with its current display name. A no-op if the details
+    /// modal isn't open.
+    pub fn open_rename_form_from_details_modal(&mut self) {
+        let Some(Modal::Details(cwd)) = &self.modal else { return };
+        let cwd = cwd.clone();
+        self.rename_form = Some(RenameForm {
+            name: self.project_name(&cwd),
+            cwd,
+            error: None,
+        });
+    }
+
+    pub fn close_rename_form(&mut self) {
+        self.rename_form = None;
+    }
+
+    /// Appends a typed character to the rename form's text. No character is
+    /// treated specially - including `q`, since a project name is free text
+    /// the user must be able to type without triggering the global quit
+    /// shortcut (see `input.rs`'s key-routing precedence).
+    pub fn rename_form_input_char(&mut self, c: char) {
+        if let Some(form) = &mut self.rename_form {
+            form.name.push(c);
+            form.error = None;
+        }
+    }
+
+    /// Removes the last character from the rename form's text.
+    pub fn rename_form_backspace(&mut self) {
+        if let Some(form) = &mut self.rename_form {
+            form.name.pop();
+            form.error = None;
+        }
+    }
+
+    /// Validates the rename form's text against the project-renaming
+    /// capability's rules (non-blank after trimming; unique, case-sensitive,
+    /// among every other known project's current effective display name) and,
+    /// on success, closes the form and returns the `ClientMessage` to send.
+    /// On failure, sets the form's inline error and leaves it open, returning
+    /// `None`. `None` is also returned if no form is open.
+    ///
+    /// "Every known project" mirrors the daemon's own definition (see the
+    /// project-renaming spec and `Ingestor::ingest_rename_project`): every
+    /// working directory seen in this client's tracked agents, test runs,
+    /// log entries, or reminders, plus every key already in
+    /// `self.project_names`.
+    pub fn submit_rename_form(&mut self) -> Option<ClientMessage> {
+        let form = self.rename_form.as_ref()?;
+        let trimmed = form.name.trim();
+        if trimmed.is_empty() {
+            self.rename_form.as_mut().unwrap().error = Some("Name cannot be blank".to_string());
+            return None;
+        }
+        let trimmed = trimmed.to_string();
+        let cwd = form.cwd.clone();
+
+        let mut known_cwds: std::collections::HashSet<PathBuf> = self.project_names.keys().cloned().collect();
+        known_cwds.extend(self.agents.iter().map(|a| a.cwd.clone()));
+        known_cwds.extend(self.test_runs.iter().map(|t| t.cwd.clone()));
+        known_cwds.extend(self.logs.iter().map(|e| e.working_dir.clone()));
+        known_cwds.extend(self.reminders.iter().map(|r| r.cwd.clone()));
+
+        let collides = known_cwds
+            .iter()
+            .filter(|other_cwd| *other_cwd != &cwd)
+            .any(|other_cwd| self.project_name(other_cwd) == trimmed);
+        if collides {
+            self.rename_form.as_mut().unwrap().error = Some("Name is already in use".to_string());
+            return None;
+        }
+
+        self.rename_form = None;
+        Some(ClientMessage::RenameProject { cwd, name: trimmed })
+    }
 }
 
 /// The status word a reminder's status maps to for filtering/sorting -
@@ -1156,7 +1299,14 @@ fn next_in_cycle(current: Option<&str>, options: &[String]) -> Option<String> {
     }
 }
 
-fn project_name(cwd: &Path) -> String {
+/// A project's current effective display name: its custom name from `names`
+/// if it has one, otherwise its directory-derived default (the working
+/// directory's final path segment, falling back to the full path if it has
+/// none).
+fn project_name(cwd: &Path, names: &HashMap<PathBuf, String>) -> String {
+    if let Some(name) = names.get(cwd) {
+        return name.clone();
+    }
     cwd.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| cwd.display().to_string())
@@ -2582,5 +2732,185 @@ mod tests {
         app.close_delete_reminder_confirm();
 
         assert!(app.confirm_delete_reminder.is_none());
+    }
+
+    #[test]
+    fn apply_project_names_snapshot_populates_the_map() {
+        let mut app = App::new();
+
+        app.apply_project_names_snapshot(vec![ProjectName {
+            cwd: PathBuf::from("/tmp/a"),
+            name: "My Project".to_string(),
+        }]);
+
+        assert_eq!(app.project_name(Path::new("/tmp/a")), "My Project");
+    }
+
+    #[test]
+    fn apply_project_renamed_updates_the_map() {
+        let mut app = App::new();
+        assert_eq!(app.project_name(Path::new("/tmp/a")), "a");
+
+        app.apply_project_renamed(ProjectName {
+            cwd: PathBuf::from("/tmp/a"),
+            name: "My Project".to_string(),
+        });
+
+        assert_eq!(app.project_name(Path::new("/tmp/a")), "My Project");
+    }
+
+    #[test]
+    fn open_rename_form_from_agents_tab_prepopulates_the_selected_projects_name() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.apply_project_renamed(ProjectName {
+            cwd: PathBuf::from("/tmp/a"),
+            name: "My Project".to_string(),
+        });
+
+        app.open_rename_form_from_agents_tab();
+
+        let form = app.rename_form.expect("rename form should be open");
+        assert_eq!(form.cwd, PathBuf::from("/tmp/a"));
+        assert_eq!(form.name, "My Project");
+        assert_eq!(form.error, None);
+    }
+
+    #[test]
+    fn open_rename_form_from_agents_tab_is_a_no_op_with_no_rows() {
+        let mut app = App::new();
+
+        app.open_rename_form_from_agents_tab();
+
+        assert!(app.rename_form.is_none());
+    }
+
+    #[test]
+    fn open_rename_form_from_details_modal_prepopulates_the_projects_name() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+
+        app.open_rename_form_from_details_modal();
+
+        let form = app.rename_form.expect("rename form should be open");
+        assert_eq!(form.cwd, PathBuf::from("/tmp/a"));
+        assert_eq!(form.name, "a");
+    }
+
+    #[test]
+    fn open_rename_form_from_details_modal_is_a_no_op_with_no_modal_open() {
+        let mut app = App::new();
+
+        app.open_rename_form_from_details_modal();
+
+        assert!(app.rename_form.is_none());
+    }
+
+    #[test]
+    fn close_rename_form_discards_it() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+
+        app.close_rename_form();
+
+        assert!(app.rename_form.is_none());
+    }
+
+    #[test]
+    fn rename_form_input_char_and_backspace_edit_the_text() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+
+        app.rename_form_input_char('!');
+        assert_eq!(app.rename_form.as_ref().unwrap().name, "a!");
+
+        app.rename_form_backspace();
+        assert_eq!(app.rename_form.as_ref().unwrap().name, "a");
+    }
+
+    #[test]
+    fn submit_rename_form_sends_a_valid_rename_and_closes_the_form() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+        app.rename_form_input_char('!');
+
+        let message = app.submit_rename_form();
+
+        assert_eq!(
+            message,
+            Some(ClientMessage::RenameProject {
+                cwd: PathBuf::from("/tmp/a"),
+                name: "a!".to_string(),
+            })
+        );
+        assert!(app.rename_form.is_none(), "a valid submission must close the form");
+    }
+
+    #[test]
+    fn submit_rename_form_rejects_a_blank_name_and_keeps_the_form_open() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+        while !app.rename_form.as_ref().unwrap().name.is_empty() {
+            app.rename_form_backspace();
+        }
+
+        let message = app.submit_rename_form();
+
+        assert_eq!(message, None);
+        let form = app.rename_form.expect("form must stay open on invalid input");
+        assert_eq!(form.error, Some("Name cannot be blank".to_string()));
+    }
+
+    #[test]
+    fn submit_rename_form_rejects_a_duplicate_name_and_keeps_the_form_open() {
+        let mut app = App::new();
+        // /tmp/a is given the more recent `last_updated_ms` so it sorts
+        // first deterministically (`directory_groups` ties otherwise break
+        // on `HashMap` iteration order, which is reseeded - and so not
+        // reliably comparable across separate calls - on every rebuild).
+        app.apply_snapshot(
+            vec![
+                AgentInfo { last_updated_ms: 1, ..agent_in("/tmp/a", "a", AgentStatus::Running) },
+                AgentInfo { last_updated_ms: 0, ..agent_in("/tmp/b", "b", AgentStatus::Running) },
+            ],
+            Vec::new(),
+        );
+        app.agents_selected = 0;
+        app.open_rename_form_from_agents_tab();
+        assert_eq!(app.rename_form.as_ref().unwrap().cwd, PathBuf::from("/tmp/a"));
+        while !app.rename_form.as_ref().unwrap().name.is_empty() {
+            app.rename_form_backspace();
+        }
+        for c in "b".chars() {
+            app.rename_form_input_char(c);
+        }
+
+        let message = app.submit_rename_form();
+
+        assert_eq!(message, None);
+        let form = app.rename_form.expect("form must stay open on invalid input");
+        assert_eq!(form.error, Some("Name is already in use".to_string()));
+    }
+
+    #[test]
+    fn submit_rename_form_accepts_resubmitting_the_projects_own_current_name() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+
+        let message = app.submit_rename_form();
+
+        assert_eq!(
+            message,
+            Some(ClientMessage::RenameProject {
+                cwd: PathBuf::from("/tmp/a"),
+                name: "a".to_string(),
+            })
+        );
     }
 }

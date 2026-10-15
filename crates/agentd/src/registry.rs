@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus, SessionId, TestRunInfo, TestRunStatus};
+use agentmon_proto::{AgentEvent, AgentInfo, AgentStatus, ProjectName, SessionId, TestRunInfo, TestRunStatus};
 
 /// Cap on how many retired session ids `RegistryState::superseded_sessions`
 /// remembers, evicting the oldest once exceeded - the same bounded-eviction
@@ -53,6 +53,10 @@ struct RegistryState {
     /// Mirrors `superseded_sessions` for O(1) membership checks; kept in
     /// sync with it on every insert and eviction.
     superseded_session_set: HashSet<SessionId>,
+    /// Custom display names assigned via `RenameProject`, keyed by working
+    /// directory. Absence of an entry means that project still uses its
+    /// directory-derived default name - see the project-renaming spec.
+    custom_names: HashMap<PathBuf, String>,
 }
 
 impl RegistryState {
@@ -319,6 +323,62 @@ impl Registry {
         }
 
         groups.into_values().collect()
+    }
+
+    /// A project's default display name - its working directory's final
+    /// path segment, falling back to the full path if it has none. Mirrors
+    /// the identically-named helper in `agentmon`'s `ui.rs`/`app.rs`.
+    pub fn default_project_name(cwd: &Path) -> String {
+        cwd.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.display().to_string())
+    }
+
+    /// A project's current effective display name: its custom name if one
+    /// has been assigned, otherwise its directory-derived default.
+    pub fn project_name(&self, cwd: &Path) -> String {
+        let state = self.state.lock().unwrap();
+        state
+            .custom_names
+            .get(cwd)
+            .cloned()
+            .unwrap_or_else(|| Self::default_project_name(cwd))
+    }
+
+    /// Every project currently assigned a custom display name - sent to a
+    /// newly-connecting client as part of `Snapshot`.
+    pub fn custom_names(&self) -> Vec<ProjectName> {
+        let state = self.state.lock().unwrap();
+        state
+            .custom_names
+            .iter()
+            .map(|(cwd, name)| ProjectName { cwd: cwd.clone(), name: name.clone() })
+            .collect()
+    }
+
+    /// Every working directory known from a tracked agent, a tracked test
+    /// run, or a previously assigned custom name. Does not include
+    /// directories known only via the activity log or reminders - callers
+    /// that need the full "every known project" set (e.g. validating a
+    /// rename's uniqueness) merge those in separately, since this registry
+    /// has no knowledge of either (see `Ingestor::ingest_rename_project`).
+    pub fn known_cwds(&self) -> HashSet<PathBuf> {
+        let state = self.state.lock().unwrap();
+        state
+            .agents
+            .values()
+            .map(|a| a.cwd.clone())
+            .chain(state.test_runs.keys().cloned())
+            .chain(state.custom_names.keys().cloned())
+            .collect()
+    }
+
+    /// Unconditionally assigns `cwd` a custom display name, overwriting any
+    /// previous one. Callers are responsible for validation (non-blank,
+    /// unique) before calling this - see `Ingestor::ingest_rename_project`.
+    pub fn set_custom_name(&self, cwd: PathBuf, name: String) {
+        let mut state = self.state.lock().unwrap();
+        state.custom_names.insert(cwd, name);
     }
 }
 
@@ -1026,5 +1086,58 @@ mod tests {
         let groups = registry.directory_groups();
 
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn project_name_uses_the_directory_derived_default_with_no_custom_name() {
+        let registry = Registry::new();
+
+        assert_eq!(registry.project_name(Path::new("/tmp/project")), "project");
+    }
+
+    #[test]
+    fn project_name_uses_the_custom_name_once_set() {
+        let registry = Registry::new();
+        registry.set_custom_name(PathBuf::from("/tmp/project"), "My Project".to_string());
+
+        assert_eq!(registry.project_name(Path::new("/tmp/project")), "My Project");
+    }
+
+    #[test]
+    fn custom_names_lists_every_renamed_project() {
+        let registry = Registry::new();
+        registry.set_custom_name(PathBuf::from("/tmp/project-a"), "A".to_string());
+        registry.set_custom_name(PathBuf::from("/tmp/project-b"), "B".to_string());
+
+        let mut names = registry.custom_names();
+        names.sort_by(|a, b| a.cwd.cmp(&b.cwd));
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].name, "A");
+        assert_eq!(names[1].name, "B");
+    }
+
+    #[test]
+    fn known_cwds_includes_a_project_known_only_via_a_past_rename() {
+        let registry = Registry::new();
+        registry.set_custom_name(PathBuf::from("/tmp/project"), "My Project".to_string());
+
+        let known = registry.known_cwds();
+
+        assert!(
+            known.contains(&PathBuf::from("/tmp/project")),
+            "a project with no currently tracked agent or test run must still be known once it has been renamed"
+        );
+    }
+
+    #[test]
+    fn known_cwds_includes_projects_with_a_tracked_agent_or_test_run() {
+        let registry = Registry::new();
+        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert_test_run(PathBuf::from("/tmp/other-project"), 1, TestRunStatus::Running);
+
+        let known = registry.known_cwds();
+
+        assert!(known.contains(&PathBuf::from("/tmp/project")));
+        assert!(known.contains(&PathBuf::from("/tmp/other-project")));
     }
 }

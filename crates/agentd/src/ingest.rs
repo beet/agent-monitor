@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmon_proto::{
-    AgentEvent, AgentInfo, AgentStatus, LogCategory, LogEntry, ReminderId, ReminderInfo, SessionId,
-    TestRunInfo, TestRunStatus,
+    AgentEvent, AgentInfo, AgentStatus, LogCategory, LogEntry, ProjectName, ReminderId, ReminderInfo,
+    SessionId, TestRunInfo, TestRunStatus,
 };
 
 use crate::activity_log::ActivityLog;
@@ -215,6 +215,42 @@ impl Ingestor {
 
     pub fn reminders(&self) -> &ReminderRegistry {
         &self.reminders
+    }
+
+    /// Requests a custom display name for `cwd`, per the project-renaming
+    /// spec's "Rename validation" requirement. Trims the submitted name and
+    /// rejects it - returning `None` without side effects - if it is empty
+    /// after trimming, or if it collides (exact, case-sensitive) with any
+    /// other known project's current effective display name. "Every known
+    /// project" is the union of every working directory with a tracked
+    /// agent or test run (`Registry::known_cwds`, which also covers a
+    /// project known only via a past rename), every working directory with
+    /// an activity-log entry, and every working directory with a tracked
+    /// reminder - the registry alone knows nothing about the latter two, so
+    /// this method is where they're merged in. Resubmitting `cwd`'s own
+    /// current effective name is accepted as a no-op rather than rejected
+    /// as a collision with itself.
+    pub fn ingest_rename_project(&self, cwd: PathBuf, name: String) -> Option<ProjectName> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let trimmed = trimmed.to_string();
+
+        let mut known_cwds = self.registry.known_cwds();
+        known_cwds.extend(self.activity_log.snapshot().into_iter().map(|entry| entry.working_dir));
+        known_cwds.extend(self.reminders.snapshot().into_iter().map(|reminder| reminder.cwd));
+
+        let collides = known_cwds
+            .iter()
+            .filter(|other_cwd| *other_cwd != &cwd)
+            .any(|other_cwd| self.registry.project_name(other_cwd) == trimmed);
+        if collides {
+            return None;
+        }
+
+        self.registry.set_custom_name(cwd.clone(), trimmed.clone());
+        Some(ProjectName { cwd, name: trimmed })
     }
 
     fn record_log(&self, entry: LogEntry) {
@@ -1022,5 +1058,140 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].reminder_name.as_deref(), Some("Check the build"));
         assert!(ingestor.reminders().get(&created.id).is_none());
+    }
+
+    #[test]
+    fn renaming_a_project_sets_its_custom_name() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project"), "My Project".to_string());
+
+        assert_eq!(
+            renamed,
+            Some(ProjectName {
+                cwd: PathBuf::from("/tmp/project"),
+                name: "My Project".to_string(),
+            })
+        );
+        assert_eq!(ingestor.registry().project_name(&PathBuf::from("/tmp/project")), "My Project");
+    }
+
+    #[test]
+    fn renaming_a_project_trims_whitespace() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project"), "  My Project  ".to_string());
+
+        assert_eq!(renamed.unwrap().name, "My Project");
+    }
+
+    #[test]
+    fn a_blank_name_is_rejected() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project"), "   ".to_string());
+
+        assert_eq!(renamed, None);
+        assert_eq!(ingestor.registry().project_name(&PathBuf::from("/tmp/project")), "project");
+    }
+
+    #[test]
+    fn a_name_colliding_with_another_projects_default_name_is_rejected() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_test_run(PathBuf::from("/tmp/other"), 2, TestRunStatus::Running);
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project"), "other".to_string());
+
+        assert_eq!(renamed, None);
+    }
+
+    #[test]
+    fn a_name_colliding_with_another_projects_custom_name_is_rejected() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        ingestor
+            .ingest_rename_project(PathBuf::from("/tmp/project-a"), "Taken".to_string())
+            .unwrap();
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project-b"), "Taken".to_string());
+
+        assert_eq!(renamed, None);
+    }
+
+    #[test]
+    fn a_collision_with_a_project_known_only_from_the_activity_log_is_rejected() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        // Transitioning running -> done records a "done" activity-log entry
+        // for /tmp/project without leaving any tracked test run or reminder
+        // behind, so this project is known only via the activity log.
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Done));
+        ingestor.ingest_test_run(PathBuf::from("/tmp/other"), 1, TestRunStatus::Running);
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/other"), "project".to_string());
+
+        assert_eq!(
+            renamed, None,
+            "a project known only via a past activity-log entry must still block the collision"
+        );
+    }
+
+    #[test]
+    fn a_collision_with_a_project_known_only_from_a_reminder_is_rejected() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        ingestor.ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 10);
+        ingestor.ingest_test_run(PathBuf::from("/tmp/other"), 1, TestRunStatus::Running);
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/other"), "project".to_string());
+
+        assert_eq!(renamed, None);
+    }
+
+    #[test]
+    fn resubmitting_a_projects_own_current_name_succeeds_as_a_no_op() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        ingestor
+            .ingest_rename_project(PathBuf::from("/tmp/project"), "My Project".to_string())
+            .unwrap();
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project"), "My Project".to_string());
+
+        assert_eq!(renamed.unwrap().name, "My Project");
+    }
+
+    #[test]
+    fn resubmitting_a_projects_own_unchanged_default_name_succeeds_as_a_no_op() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        ingestor.ingest_event(event(AgentStatus::Running));
+
+        let renamed = ingestor.ingest_rename_project(PathBuf::from("/tmp/project"), "project".to_string());
+
+        assert_eq!(renamed.unwrap().name, "project");
+    }
+
+    #[test]
+    fn renaming_again_replaces_the_previous_custom_name() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+        ingestor
+            .ingest_rename_project(PathBuf::from("/tmp/project"), "First".to_string())
+            .unwrap();
+
+        ingestor
+            .ingest_rename_project(PathBuf::from("/tmp/project"), "Second".to_string())
+            .unwrap();
+
+        assert_eq!(ingestor.registry().project_name(&PathBuf::from("/tmp/project")), "Second");
+        let names = ingestor.registry().custom_names();
+        assert_eq!(names.len(), 1, "the previous custom name must not linger as a separate entry");
     }
 }

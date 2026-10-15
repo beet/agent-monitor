@@ -142,6 +142,10 @@ classDiagram
         +Option~u64~ reminder_due_at_ms
         +Option~String~ prompt
     }
+    class ProjectName {
+        +PathBuf cwd
+        +String name
+    }
     class AgentStatus {
         <<enumeration>>
         Running
@@ -185,6 +189,7 @@ classDiagram
         DeleteReminder
         StartReminder
         StopReminder
+        RenameProject
     }
     class ServerMessage {
         <<enumeration>>
@@ -195,6 +200,7 @@ classDiagram
         AgentRemoved
         ReminderUpdate
         ReminderRemoved
+        ProjectRenamed
     }
 
     AgentEvent --> AgentStatus : status
@@ -212,6 +218,7 @@ classDiagram
     ServerMessage --> LogEntry : Snapshot(logs) / LogAppended(entry)
     ServerMessage --> ReminderInfo : Snapshot(reminders) / ReminderUpdate(reminder)
     ServerMessage --> ReminderId : ReminderRemoved(id)
+    ServerMessage --> ProjectName : Snapshot(project_names)
 ```
 
 ## Activity log

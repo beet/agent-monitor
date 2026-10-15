@@ -203,6 +203,15 @@ pub struct ReminderInfo {
     pub last_updated_ms: u64,
 }
 
+/// A project's custom display name, keyed by its working directory - see the
+/// project-renaming spec. Absence of an entry for a given `cwd` means that
+/// project still uses its directory-derived default name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectName {
+    pub cwd: PathBuf,
+    pub name: String,
+}
+
 /// The first message a connection sends, telling the daemon whether it is a
 /// short-lived hook event report or a long-lived subscriber (e.g. the TUI).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +250,13 @@ pub enum ClientMessage {
     StartReminder { id: ReminderId },
     /// Stops a running reminder. Does not send a notification.
     StopReminder { id: ReminderId },
+    /// Requests a custom display name for a project. Fire-and-forget, like
+    /// every other mutation here: the daemon validates (non-blank, unique
+    /// among all known projects' effective display names) and, if accepted,
+    /// broadcasts the result as a `ProjectRenamed` to every connected
+    /// client; a rejected request is silently dropped - see the
+    /// project-renaming spec.
+    RenameProject { cwd: PathBuf, name: String },
 }
 
 /// A message sent from the daemon to a connected client (e.g. the TUI).
@@ -255,6 +271,8 @@ pub enum ServerMessage {
         logs: Vec<LogEntry>,
         /// Every currently tracked reminder, across all projects.
         reminders: Vec<ReminderInfo>,
+        /// Every project currently assigned a custom display name.
+        project_names: Vec<ProjectName>,
     },
     /// An incremental update to a single agent's state.
     AgentUpdate { agent: AgentInfo },
@@ -272,6 +290,9 @@ pub enum ServerMessage {
     /// A reminder has been deleted and should be dropped from a client's
     /// local state.
     ReminderRemoved { id: ReminderId },
+    /// A project was assigned a new custom display name - replaces any
+    /// previous custom name for that `cwd` in a client's local state.
+    ProjectRenamed { cwd: PathBuf, name: String },
 }
 
 #[cfg(test)]
@@ -388,12 +409,55 @@ mod tests {
             test_runs: vec![sample_test_run()],
             logs: vec![sample_log_entry()],
             reminders: vec![sample_reminder()],
+            project_names: vec![ProjectName {
+                cwd: PathBuf::from("/tmp/project"),
+                name: "my-renamed-project".to_string(),
+            }],
         };
 
         let json = serde_json::to_string(&message).unwrap();
         let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
 
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn client_message_rename_project_round_trips_through_json() {
+        let message = ClientMessage::RenameProject {
+            cwd: PathBuf::from("/tmp/project"),
+            name: "my-renamed-project".to_string(),
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ClientMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn server_message_project_renamed_round_trips_through_json() {
+        let message = ServerMessage::ProjectRenamed {
+            cwd: PathBuf::from("/tmp/project"),
+            name: "my-renamed-project".to_string(),
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn project_name_round_trips_through_json() {
+        let project_name = ProjectName {
+            cwd: PathBuf::from("/tmp/project"),
+            name: "my-renamed-project".to_string(),
+        };
+
+        let json = serde_json::to_string(&project_name).unwrap();
+        let decoded: ProjectName = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(project_name, decoded);
     }
 
     #[test]

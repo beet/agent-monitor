@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use agentmon_proto::{
-    read_message, write_message, AgentInfo, ClientMessage, LogEntry, ReminderId, ReminderInfo,
+    read_message, write_message, AgentInfo, ClientMessage, LogEntry, ProjectName, ReminderId, ReminderInfo,
     ServerMessage, SessionId, TestRunInfo,
 };
 
@@ -21,7 +21,7 @@ pub enum ClientEvent {
     /// A previously-established connection dropped and a reconnect attempt
     /// is under way.
     Reconnecting,
-    Snapshot(Vec<AgentInfo>, Vec<TestRunInfo>, Vec<LogEntry>, Vec<ReminderInfo>),
+    Snapshot(Vec<AgentInfo>, Vec<TestRunInfo>, Vec<LogEntry>, Vec<ReminderInfo>, Vec<ProjectName>),
     Update(AgentInfo),
     TestRunUpdate(TestRunInfo),
     LogAppended(LogEntry),
@@ -33,6 +33,8 @@ pub enum ClientEvent {
     /// A reminder was deleted and should be dropped from the UI's local
     /// reminder list.
     ReminderRemoved(ReminderId),
+    /// A project was assigned a new custom display name.
+    ProjectRenamed(ProjectName),
 }
 
 /// Connects to the daemon at `socket_path`, subscribes, and forwards every
@@ -113,9 +115,9 @@ fn connect_and_stream(socket_path: &Path, events: &Sender<ClientEvent>) -> Strea
     let mut reader = BufReader::new(stream);
     loop {
         match read_message::<_, ServerMessage>(&mut reader) {
-            Ok(Some(ServerMessage::Snapshot { agents, test_runs, logs, reminders })) => {
+            Ok(Some(ServerMessage::Snapshot { agents, test_runs, logs, reminders, project_names })) => {
                 if events
-                    .send(ClientEvent::Snapshot(agents, test_runs, logs, reminders))
+                    .send(ClientEvent::Snapshot(agents, test_runs, logs, reminders, project_names))
                     .is_err()
                 {
                     return StreamOutcome::ReceiverGone;
@@ -148,6 +150,14 @@ fn connect_and_stream(socket_path: &Path, events: &Sender<ClientEvent>) -> Strea
             }
             Ok(Some(ServerMessage::ReminderRemoved { id })) => {
                 if events.send(ClientEvent::ReminderRemoved(id)).is_err() {
+                    return StreamOutcome::ReceiverGone;
+                }
+            }
+            Ok(Some(ServerMessage::ProjectRenamed { cwd, name })) => {
+                if events
+                    .send(ClientEvent::ProjectRenamed(ProjectName { cwd, name }))
+                    .is_err()
+                {
                     return StreamOutcome::ReceiverGone;
                 }
             }
@@ -225,6 +235,7 @@ mod tests {
                     test_runs: Vec::new(),
                     logs: Vec::new(),
                     reminders: Vec::new(),
+                    project_names: Vec::new(),
                 },
             )
             .unwrap();
@@ -252,6 +263,7 @@ mod tests {
             snapshot,
             ClientEvent::Snapshot(
                 vec![sample_agent(AgentStatus::Running)],
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new()
@@ -289,6 +301,7 @@ mod tests {
                     test_runs: Vec::new(),
                     logs: Vec::new(),
                     reminders: Vec::new(),
+                    project_names: Vec::new(),
                 },
             )
             .unwrap();
@@ -341,6 +354,7 @@ mod tests {
                         test_runs: Vec::new(),
                         logs: Vec::new(),
                         reminders: Vec::new(),
+                        project_names: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -371,6 +385,7 @@ mod tests {
                     test_runs: Vec::new(),
                     logs: Vec::new(),
                     reminders: Vec::new(),
+                    project_names: Vec::new(),
                 },
             )
             .unwrap();
@@ -380,7 +395,7 @@ mod tests {
         spawn_client(path, tx);
 
         match rx.recv_timeout(Duration::from_secs(2)).expect("initial snapshot") {
-            ClientEvent::Snapshot(agents, _, _, _) => {
+            ClientEvent::Snapshot(agents, _, _, _, _) => {
                 assert_eq!(agents, vec![sample_agent(AgentStatus::Running)])
             }
             other => panic!("expected initial Snapshot, got {other:?}"),
@@ -392,7 +407,7 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(3)) {
                 Ok(ClientEvent::Reconnecting) => saw_reconnecting = true,
                 Ok(ClientEvent::Unreachable(_)) => {}
-                Ok(ClientEvent::Snapshot(agents, _, _, _)) => {
+                Ok(ClientEvent::Snapshot(agents, _, _, _, _)) => {
                     final_snapshot = Some(agents);
                     break;
                 }
@@ -446,6 +461,7 @@ mod tests {
                     test_runs: vec![sample_test_run(agentmon_proto::TestRunStatus::Running)],
                     logs: Vec::new(),
                     reminders: Vec::new(),
+                    project_names: Vec::new(),
                 },
             )
             .unwrap();
@@ -467,6 +483,7 @@ mod tests {
             ClientEvent::Snapshot(
                 Vec::new(),
                 vec![sample_test_run(agentmon_proto::TestRunStatus::Running)],
+                Vec::new(),
                 Vec::new(),
                 Vec::new()
             )
@@ -529,6 +546,7 @@ mod tests {
                     test_runs: Vec::new(),
                     logs: vec![sample_log_entry()],
                     reminders: Vec::new(),
+                    project_names: Vec::new(),
                 },
             )
             .unwrap();
@@ -547,7 +565,7 @@ mod tests {
         let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
         assert_eq!(
             snapshot,
-            ClientEvent::Snapshot(Vec::new(), Vec::new(), vec![sample_log_entry()], Vec::new())
+            ClientEvent::Snapshot(Vec::new(), Vec::new(), vec![sample_log_entry()], Vec::new(), Vec::new())
         );
 
         let appended = rx.recv_timeout(Duration::from_secs(2)).expect("log appended event");
@@ -578,6 +596,7 @@ mod tests {
                     test_runs: Vec::new(),
                     logs: Vec::new(),
                     reminders: vec![sample_reminder(agentmon_proto::ReminderStatus::Running)],
+                    project_names: Vec::new(),
                 },
             )
             .unwrap();
@@ -607,7 +626,8 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                vec![sample_reminder(agentmon_proto::ReminderStatus::Running)]
+                vec![sample_reminder(agentmon_proto::ReminderStatus::Running)],
+                Vec::new()
             )
         );
 
@@ -621,6 +641,75 @@ mod tests {
         assert_eq!(
             removed,
             ClientEvent::ReminderRemoved(ReminderId("reminder-1".to_string()))
+        );
+
+        server.join().expect("mock daemon thread should not panic");
+    }
+
+    #[test]
+    fn forwards_a_snapshot_with_project_names_then_a_project_renamed_push() {
+        let path = unique_socket_path("project-names");
+        let listener = UnixListener::bind(&path).expect("bind mock daemon listener");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client connection");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            let subscribe: ClientMessage = read_message(&mut reader)
+                .expect("read subscribe")
+                .expect("connection should not close before subscribing");
+            assert_eq!(subscribe, ClientMessage::Subscribe);
+
+            write_message(
+                &mut writer,
+                &ServerMessage::Snapshot {
+                    agents: Vec::new(),
+                    test_runs: Vec::new(),
+                    logs: Vec::new(),
+                    reminders: Vec::new(),
+                    project_names: vec![ProjectName {
+                        cwd: PathBuf::from("/tmp/project"),
+                        name: "Previously Renamed".to_string(),
+                    }],
+                },
+            )
+            .unwrap();
+            write_message(
+                &mut writer,
+                &ServerMessage::ProjectRenamed {
+                    cwd: PathBuf::from("/tmp/project"),
+                    name: "My Project".to_string(),
+                },
+            )
+            .unwrap();
+        });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_client(path, tx);
+
+        let snapshot = rx.recv_timeout(Duration::from_secs(2)).expect("snapshot event");
+        assert_eq!(
+            snapshot,
+            ClientEvent::Snapshot(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![ProjectName {
+                    cwd: PathBuf::from("/tmp/project"),
+                    name: "Previously Renamed".to_string(),
+                }]
+            )
+        );
+
+        let renamed = rx.recv_timeout(Duration::from_secs(2)).expect("project renamed event");
+        assert_eq!(
+            renamed,
+            ClientEvent::ProjectRenamed(ProjectName {
+                cwd: PathBuf::from("/tmp/project"),
+                name: "My Project".to_string(),
+            })
         );
 
         server.join().expect("mock daemon thread should not panic");
