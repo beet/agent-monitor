@@ -169,7 +169,7 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
     // further column between each of the 5 columns below.
     let selection_width: u16 = if groups.is_empty() { 0 } else { 2 };
     const COLUMN_SPACING: u16 = 1;
-    const UPDATED_WIDTH: u16 = 19;
+    const UPDATED_WIDTH: u16 = 22;
     let available_for_dynamic = inner
         .width
         .saturating_sub(selection_width)
@@ -283,7 +283,7 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
         Constraint::Fill(2),
         Constraint::Length(10),
         Constraint::Fill(1),
-        Constraint::Length(19),
+        Constraint::Length(22),
     ];
 
     // Computed from the un-titled block so a page is however many data rows
@@ -472,7 +472,7 @@ fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option
 /// visible the same way it already is on the Agents tab - see
 /// `log_completion_duration_ms`. The name comes before the ETA/duration
 /// (e.g. "reminder finished: Check the build 10m", "reminder started: Check
-/// the build, ETA: 10:45"), reading as a single "what, when/how long" phrase.
+/// the build, ETA: 10:45 AM"), reading as a single "what, when/how long" phrase.
 fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
     let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
     // Carries the reminder's name as of this event, so a later-deleted
@@ -756,7 +756,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
             })
             .collect()
     };
-    let logs_widths = [Constraint::Fill(1), Constraint::Length(19)];
+    let logs_widths = [Constraint::Fill(1), Constraint::Length(22)];
 
     // No header row in this pane (per the "Project details modal"
     // requirement), so every visible row is content - unlike the Logs tab,
@@ -904,7 +904,7 @@ fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -
 
     // This pane is only a third of the modal's top third, so its Status
     // column has little room - a running reminder's "⏳ Running Xm, ETA:
-    // HH:MM" easily overflows it. Resolves the exact column widths the
+    // h:MM AM/PM" easily overflows it. Resolves the exact column widths the
     // `Table` below will use (including its default 1-column spacing
     // between columns, which a bare `Layout::split` doesn't apply on its
     // own) and truncates to fit - the same technique used for the Agents
@@ -1002,7 +1002,7 @@ fn format_last_updated(last_updated_ms: u64) -> String {
         .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
     datetime
         .with_timezone(&chrono::Local)
-        .format("%Y-%m-%d %H:%M:%S")
+        .format("%Y-%m-%d %-I:%M:%S %p")
         .to_string()
 }
 
@@ -1229,7 +1229,7 @@ fn render_reminders_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option
         Constraint::Fill(2),
         Constraint::Length(9),
         Constraint::Fill(2),
-        Constraint::Length(19),
+        Constraint::Length(22),
     ];
 
     let bare_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
@@ -1339,24 +1339,24 @@ fn format_reminder_duration_ms(elapsed_ms: u64) -> String {
 }
 
 /// Formats a Unix epoch milliseconds timestamp as the system's local time,
-/// `HH:MM` (e.g. `12:34`) - the "ETA" shown wherever a reminder's due time
-/// appears, whether computed live (`format_reminder_eta`) or read from a
-/// log entry's recorded due time.
+/// `h:MM AM/PM` (e.g. `2:05 PM`) - the "ETA" shown wherever a reminder's due
+/// time appears, whether computed live (`format_reminder_eta`) or read from
+/// a log entry's recorded due time.
 fn format_eta_ms(due_at_ms: u64) -> String {
     let datetime = chrono::DateTime::from_timestamp_millis(due_at_ms as i64)
         .unwrap_or_else(|| chrono::DateTime::from_timestamp_millis(0).unwrap());
-    datetime.with_timezone(&chrono::Local).format("%H:%M").to_string()
+    datetime.with_timezone(&chrono::Local).format("%-I:%M %p").to_string()
 }
 
 /// A running reminder's estimated completion time, in the system's local
-/// timezone, formatted `HH:MM` (e.g. `12:34`) - the "ETA" shown alongside its
-/// live elapsed duration.
+/// timezone, formatted `h:MM AM/PM` (e.g. `2:05 PM`) - the "ETA" shown
+/// alongside its live elapsed duration.
 fn format_reminder_eta(run_started_ms: u64, duration_minutes: u32) -> String {
     format_eta_ms(run_started_ms + duration_minutes as u64 * 60_000)
 }
 
 /// The Reminders tab/pane's STATUS cell: blank while not-yet-started,
-/// `⏳ Running <dur>, ETA: HH:MM` while running, `✅ Done <dur>` once done -
+/// `⏳ Running <dur>, ETA: h:MM AM/PM` while running, `✅ Done <dur>` once done -
 /// see the "Reminders tab shows an aggregated, paginated reminder list"
 /// requirement. `with_category_prefix` adds "reminder" after the emoji, for
 /// cross-category views (the Agents tab's Reminders column); the top-level
@@ -2075,7 +2075,7 @@ mod tests {
         let expected = chrono::DateTime::from_timestamp_millis(last_updated_ms as i64)
             .unwrap()
             .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S")
+            .format("%Y-%m-%d %-I:%M:%S %p")
             .to_string();
 
         let text = buffer_text(&term);
@@ -2464,7 +2464,7 @@ mod tests {
         let expected = chrono::DateTime::from_timestamp_millis(2_000)
             .unwrap()
             .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S")
+            .format("%Y-%m-%d %-I:%M:%S %p")
             .to_string();
         let text = buffer_text(&term);
         assert!(
@@ -4285,7 +4285,7 @@ mod tests {
     fn details_modal_reminders_pane_truncates_a_running_reminders_status_instead_of_overflowing() {
         // Regression test: the Reminders pane is only a third of the
         // modal's top third, so a running reminder's "Running Xm, ETA:
-        // HH:MM" status must be truncated to fit rather than spilling past
+        // h:MM AM/PM" status must be truncated to fit rather than spilling past
         // the pane's right border.
         let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
         let mut app = App::new();
