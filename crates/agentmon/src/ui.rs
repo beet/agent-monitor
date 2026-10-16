@@ -386,6 +386,7 @@ fn log_category_label(category: agentmon_proto::LogCategory) -> &'static str {
         agentmon_proto::LogCategory::Agent => "agent",
         agentmon_proto::LogCategory::TestRun => "test-run",
         agentmon_proto::LogCategory::Reminder => "reminder",
+        agentmon_proto::LogCategory::Prompt => "prompt",
     }
 }
 
@@ -396,7 +397,9 @@ fn log_category_label(category: agentmon_proto::LogCategory) -> &'static str {
 /// Logs tab.
 fn log_entry_tree_prefix(category: agentmon_proto::LogCategory) -> &'static str {
     match category {
-        agentmon_proto::LogCategory::Agent | agentmon_proto::LogCategory::Reminder => "",
+        agentmon_proto::LogCategory::Agent
+        | agentmon_proto::LogCategory::Reminder
+        | agentmon_proto::LogCategory::Prompt => "",
         agentmon_proto::LogCategory::TestRun => "├─ ",
     }
 }
@@ -438,6 +441,11 @@ fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status:
             };
             (format!("⏰ reminder {status}"), Style::new().fg(color))
         }
+        // The one category with no status-specific color: a prompt entry
+        // has exactly one status ("submitted"), so there is nothing for a
+        // color to distinguish it from - per the "Status is visually
+        // distinguishable" requirement's prompt-category marker.
+        agentmon_proto::LogCategory::Prompt => ("🗣️ prompt submitted".to_string(), Style::new()),
     }
 }
 
@@ -510,8 +518,13 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
     // entry recorded with a prompt snapshot - see the activity-log
     // capability's "Activity log captures notification-worthy events"
     // requirement. No snippet for entries recorded with none (e.g. an agent
-    // first tracked via `PreToolUse`, before any `UserPromptSubmit`).
-    if entry.category == agentmon_proto::LogCategory::Agent {
+    // first tracked via `PreToolUse`, before any `UserPromptSubmit`). A
+    // prompt-category entry always carries one, since that's the event that
+    // produced it.
+    if matches!(
+        entry.category,
+        agentmon_proto::LogCategory::Agent | agentmon_proto::LogCategory::Prompt
+    ) {
         if let Some(prompt) = &entry.prompt {
             text.push_str(&format!(" — \"{}\"", prompt_snippet(prompt)));
         }
@@ -1124,11 +1137,14 @@ fn status_label_and_style(status: AgentStatus) -> (&'static str, Style) {
     match status {
         AgentStatus::Running => ("🔧 running", Style::new().fg(Color::Blue)),
         AgentStatus::Idle => ("💤 idle", Style::new().fg(Color::Gray)),
+        // "needs input" and "done" share the 🤖 marker rather than each
+        // having its own - they're told apart by color instead, per the
+        // "Status is visually distinguishable" requirement.
         AgentStatus::NeedsInput => (
-            "🔔 NEEDS INPUT",
+            "🤖 NEEDS INPUT",
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        AgentStatus::Done => ("✅ done", Style::new().fg(Color::Green)),
+        AgentStatus::Done => ("🤖 done", Style::new().fg(Color::Green)),
         AgentStatus::Stale => (
             // 🕸️ (U+1F578 + VS16) rendered half-width in some terminal
             // fonts, corrupting the selected-row highlight; 👻 (U+1F47B) has
@@ -1173,7 +1189,7 @@ fn agent_status_text_and_style(status: AgentStatus, with_category_prefix: bool) 
 /// view (the Logs tab or the details modal's Logs pane), never in the
 /// Agents tab's AGENTS column or the modal's Agents pane.
 fn agent_started_text_and_style() -> (String, Style) {
-    ("⏳ agent started".to_string(), Style::new().fg(Color::Blue))
+    ("🤖 agent started".to_string(), Style::new().fg(Color::Blue))
 }
 
 /// The Logs tab/pane's one-time "a test run began" log entry, independent of
@@ -1183,7 +1199,7 @@ fn agent_started_text_and_style() -> (String, Style) {
 /// the Agents tab's TESTS column or the modal's Tests pane (which show the
 /// live `TestRunStatus::Running` status as "running" instead).
 fn test_run_started_text_and_style() -> (String, Style) {
-    ("⏳ tests started".to_string(), Style::new().fg(Color::Blue))
+    ("🧪 tests started".to_string(), Style::new().fg(Color::Blue))
 }
 
 /// The STATUS cell's text and style for a test run, with the "tests"
@@ -2193,7 +2209,7 @@ mod tests {
         let (text, _) = status_cell_text_and_style(&done, 999_999_999, false);
 
         assert_eq!(
-            text, "✅ done 2m14s",
+            text, "🤖 done 2m14s",
             "done's duration must be fixed (status_since - run_started), not computed against `now`"
         );
     }
@@ -2682,19 +2698,19 @@ mod tests {
     fn log_status_cell_uses_the_same_emoji_markers_as_the_agents_tab() {
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "started").0,
-            "⏳ agent started"
+            "🤖 agent started"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "done").0,
-            "✅ agent done"
+            "🤖 agent done"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Agent, "needs_input").0,
-            "🔔 agent NEEDS INPUT"
+            "🤖 agent NEEDS INPUT"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "started").0,
-            "⏳ tests started"
+            "🧪 tests started"
         );
         assert_eq!(
             log_status_cell_text_and_style(agentmon_proto::LogCategory::TestRun, "passed").0,
@@ -2735,7 +2751,7 @@ mod tests {
         // and its trailing label as separate substrings rather than one
         // contiguous string spanning the wide-character boundary.
         let text = buffer_text(&term);
-        assert!(text.contains('🔔'), "got:\n{text}");
+        assert!(text.contains('🤖'), "got:\n{text}");
         assert!(text.contains("NEEDS INPUT"), "got:\n{text}");
         assert!(text.contains('❌'), "got:\n{text}");
         assert!(text.contains("tests failed"), "got:\n{text}");
@@ -2797,7 +2813,7 @@ mod tests {
         term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
-        assert!(text.contains('⏳'), "got:\n{text}");
+        assert!(text.contains('🤖'), "got:\n{text}");
         assert!(text.contains("agent started"), "got:\n{text}");
     }
 
@@ -2853,7 +2869,7 @@ mod tests {
         term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
-        assert!(text.contains('⏳'), "got:\n{text}");
+        assert!(text.contains('🤖'), "got:\n{text}");
         assert!(text.contains("agent started"), "got:\n{text}");
     }
 
@@ -4554,6 +4570,34 @@ mod tests {
         let (text, _style) = log_entry_status_line(&[], &entry);
 
         assert!(!text.contains('"'), "expected no prompt snippet on a non-agent entry, got: {text}");
+    }
+
+    #[test]
+    fn a_prompt_entry_renders_its_marker_with_no_color() {
+        let (text, style) =
+            log_status_cell_text_and_style(agentmon_proto::LogCategory::Prompt, "submitted");
+
+        assert_eq!(text, "🗣️ prompt submitted");
+        assert_eq!(
+            style,
+            Style::new(),
+            "a prompt entry's marker must carry no status-specific color, unlike every other category"
+        );
+    }
+
+    #[test]
+    fn a_prompt_entry_always_shows_its_submitted_text() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
+        assert!(
+            text.contains("\"Fix the flaky test\""),
+            "expected the prompt entry's own submitted text, got: {text}"
+        );
     }
 
     #[test]

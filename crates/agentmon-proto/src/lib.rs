@@ -133,6 +133,7 @@ pub enum LogCategory {
     Agent,
     TestRun,
     Reminder,
+    Prompt,
 }
 
 /// One notification-worthy event recorded in the daemon's bounded activity
@@ -148,7 +149,8 @@ pub struct LogEntry {
     /// Unix epoch milliseconds of when this event occurred.
     pub occurred_at_ms: u64,
     /// The reporting process id, when known. Populated for agent-category
-    /// entries; test-run and reminder entries leave this `None`.
+    /// and prompt-category entries; test-run and reminder entries leave this
+    /// `None`.
     pub pid: Option<u32>,
     /// The reminder's name as of this event. Populated only for
     /// reminder-category entries, so a later-deleted reminder's past entries
@@ -162,8 +164,10 @@ pub struct LogEntry {
     /// A snapshot of the reporting agent's last-prompt text as of this
     /// event, frozen at record time like `reminder_name` is for a reminder
     /// entry - a later prompt submitted for that agent does not alter an
-    /// already-recorded entry. Populated only for agent-category entries,
-    /// and only when that agent had a last prompt tracked at the time.
+    /// already-recorded entry. Populated for agent-category entries only
+    /// when that agent had a last prompt tracked at the time; always
+    /// populated for prompt-category entries, since the event that produces
+    /// one always carries a submitted prompt.
     pub prompt: Option<String>,
 }
 

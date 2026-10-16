@@ -67,6 +67,9 @@ impl Ingestor {
     /// event (see `UpsertOutcome::retired_session_ids`), so the caller can
     /// broadcast their removal to already-connected clients.
     pub fn ingest_event(&self, event: AgentEvent) -> (AgentInfo, Vec<SessionId>) {
+        let submitted_prompt = event.prompt.clone();
+        let pid = event.pid;
+        let cwd = event.cwd.clone();
         let outcome = self.registry.upsert(event);
         if outcome.stale_event_ignored {
             // A late event for an already-superseded session id: `agent` and
@@ -77,7 +80,30 @@ impl Ingestor {
             // notifies regardless of whether it changed.
             return (outcome.agent, outcome.retired_session_ids);
         }
-        if is_run_start(outcome.previous_status, outcome.agent.status) {
+        let run_starting = is_run_start(outcome.previous_status, outcome.agent.status);
+        if let Some(prompt) = submitted_prompt {
+            // Recorded before the "started" entry below (when one is also
+            // produced by this same event), and sharing its exact timestamp,
+            // so the stable recency sort both the daemon's `ActivityLog` and
+            // the TUI use keeps the prompt entry ahead of it - see the
+            // activity-log spec's "A prompt that also starts a run logs
+            // before the started entry".
+            self.record_log(LogEntry {
+                working_dir: cwd,
+                category: LogCategory::Prompt,
+                status: "submitted".to_string(),
+                occurred_at_ms: if run_starting {
+                    outcome.agent.run_started_ms
+                } else {
+                    now_ms()
+                },
+                pid: Some(pid),
+                reminder_name: None,
+                reminder_due_at_ms: None,
+                prompt: Some(prompt),
+            });
+        }
+        if run_starting {
             // Uses `run_started_ms` (rather than a fresh `now_ms()` call) so
             // this entry's timestamp exactly matches the value the registry
             // just set/reset it to - the same value a "done" entry's
@@ -704,8 +730,13 @@ mod tests {
         });
 
         let logs = ingestor.activity_log().snapshot();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].prompt.as_deref(), Some("Fix the flaky test"));
+        assert_eq!(
+            logs.len(),
+            2,
+            "this run-starting prompt event must log both a prompt entry and a started entry"
+        );
+        let started_entry = logs.iter().find(|e| e.category == LogCategory::Agent).unwrap();
+        assert_eq!(started_entry.prompt.as_deref(), Some("Fix the flaky test"));
     }
 
     #[test]
@@ -745,6 +776,89 @@ mod tests {
             "the started entry's snapshot must not be altered by a later prompt"
         );
         assert_eq!(done_entry.prompt.as_deref(), Some("Second prompt"));
+    }
+
+    #[test]
+    fn a_prompt_submission_is_logged_with_its_own_category() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..event(AgentStatus::Running)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        let prompt_entry = logs
+            .iter()
+            .find(|e| e.category == LogCategory::Prompt)
+            .expect("a prompt-bearing event must log a prompt-category entry");
+        assert_eq!(prompt_entry.status, "submitted");
+        assert_eq!(prompt_entry.pid, Some(1));
+        assert_eq!(prompt_entry.prompt.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn a_prompt_that_starts_a_run_shares_the_started_entrys_timestamp() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..event(AgentStatus::Running)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        let prompt_entry = logs.iter().find(|e| e.category == LogCategory::Prompt).unwrap();
+        let started_entry = logs.iter().find(|e| e.category == LogCategory::Agent).unwrap();
+        assert_eq!(
+            prompt_entry.occurred_at_ms, started_entry.occurred_at_ms,
+            "a prompt entry and the started entry it precipitates must share the same timestamp"
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_starts_a_run_is_recorded_before_the_started_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..event(AgentStatus::Running)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(
+            logs[0].category,
+            LogCategory::Prompt,
+            "the prompt entry must be recorded before the started entry it precipitates"
+        );
+        assert_eq!(logs[1].category, LogCategory::Agent);
+        assert_eq!(logs[1].status, "started");
+    }
+
+    #[test]
+    fn a_followup_prompt_mid_session_logs_on_its_own_with_no_started_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(AgentEvent {
+            prompt: Some("A follow-up prompt".to_string()),
+            ..event(AgentStatus::Running)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        assert_eq!(
+            logs.len(),
+            2,
+            "the initial started entry, plus one standalone prompt entry for the follow-up"
+        );
+        assert_eq!(logs[0].category, LogCategory::Agent);
+        assert_eq!(logs[0].status, "started");
+        assert_eq!(logs[1].category, LogCategory::Prompt);
+        assert_eq!(logs[1].prompt.as_deref(), Some("A follow-up prompt"));
     }
 
     #[test]

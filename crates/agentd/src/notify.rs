@@ -61,7 +61,7 @@ fn reminder_notification_script(cwd: &Path, name: &str) -> String {
         .unwrap_or_else(|| cwd.display().to_string());
     format!(
         "display notification {} with title {} sound name {}",
-        applescript_literal(&format!("{project}: {name}")),
+        applescript_literal(&format!("⏰ {project}: {name}")),
         applescript_literal("agentmon"),
         applescript_literal("Blow")
     )
@@ -73,10 +73,10 @@ fn reminder_notification_script(cwd: &Path, name: &str) -> String {
 /// notifications, so a test-run event is never confused with a different
 /// event or with an agent notification by ear.
 fn test_run_notification_script(cwd: &Path, status: TestRunStatus) -> String {
-    let (status_label, sound_name) = match status {
-        TestRunStatus::Running => ("tests started", "Pop"),
-        TestRunStatus::Passed => ("tests passed", "Tink"),
-        TestRunStatus::Failed => ("tests failed", "Basso"),
+    let (emoji, status_label, sound_name) = match status {
+        TestRunStatus::Running => ("🧪", "tests started", "Pop"),
+        TestRunStatus::Passed => ("✅", "tests passed", "Tink"),
+        TestRunStatus::Failed => ("❌", "tests failed", "Basso"),
     };
     let project = cwd
         .file_name()
@@ -84,7 +84,7 @@ fn test_run_notification_script(cwd: &Path, status: TestRunStatus) -> String {
         .unwrap_or_else(|| cwd.display().to_string());
     format!(
         "display notification {} with title {} sound name {}",
-        applescript_literal(&format!("{project} {status_label}")),
+        applescript_literal(&format!("{emoji} {project} {status_label}")),
         applescript_literal("agentmon"),
         applescript_literal(sound_name)
     )
@@ -100,7 +100,7 @@ fn notification_script(agent: &AgentInfo) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| agent.cwd.display().to_string());
     let body = format!(
-        "{project} ({}) {status_label}",
+        "🤖 {project} ({}) {status_label}",
         host_context_label(agent.host_context)
     );
     Some(format!(
@@ -176,6 +176,24 @@ mod tests {
     }
 
     #[test]
+    fn notification_script_body_is_prefixed_with_the_robot_emoji_when_done() {
+        let script = notification_script(&sample_agent(AgentStatus::Done)).unwrap();
+        assert!(
+            script.contains("\"🤖 enclaudinate"),
+            "script's body did not start with the 🤖 prefix: {script}"
+        );
+    }
+
+    #[test]
+    fn notification_script_body_is_prefixed_with_the_robot_emoji_when_needs_input() {
+        let script = notification_script(&sample_agent(AgentStatus::NeedsInput)).unwrap();
+        assert!(
+            script.contains("\"🤖 enclaudinate"),
+            "script's body did not start with the 🤖 prefix: {script}"
+        );
+    }
+
+    #[test]
     fn notification_script_is_none_for_non_attention_states() {
         assert!(notification_script(&sample_agent(AgentStatus::Running)).is_none());
         assert!(notification_script(&sample_agent(AgentStatus::Idle)).is_none());
@@ -211,6 +229,33 @@ mod tests {
     }
 
     #[test]
+    fn test_run_notification_script_body_is_prefixed_with_the_test_tube_emoji_when_started() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Running);
+        assert!(
+            script.contains("\"🧪 project"),
+            "script's body did not start with the 🧪 prefix: {script}"
+        );
+    }
+
+    #[test]
+    fn test_run_notification_script_body_is_prefixed_with_a_checkmark_when_passed() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Passed);
+        assert!(
+            script.contains("\"✅ project"),
+            "script's body did not start with the ✅ prefix: {script}"
+        );
+    }
+
+    #[test]
+    fn test_run_notification_script_body_is_prefixed_with_a_cross_mark_when_failed() {
+        let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Failed);
+        assert!(
+            script.contains("\"❌ project"),
+            "script's body did not start with the ❌ prefix: {script}"
+        );
+    }
+
+    #[test]
     fn test_run_notification_script_identifies_the_directory() {
         let script = test_run_notification_script(&PathBuf::from("/tmp/project"), TestRunStatus::Failed);
         assert!(
@@ -225,6 +270,15 @@ mod tests {
         assert!(
             script.ends_with("sound name \"Blow\""),
             "script did not end with the Blow sound clause: {script}"
+        );
+    }
+
+    #[test]
+    fn reminder_notification_script_body_is_prefixed_with_the_clock_emoji() {
+        let script = reminder_notification_script(&PathBuf::from("/tmp/project"), "Check the build");
+        assert!(
+            script.contains("\"⏰ project"),
+            "script's body did not start with the ⏰ prefix: {script}"
         );
     }
 
