@@ -26,7 +26,9 @@ pub enum InputAction {
 /// keys (including `g`/`G`) are handled while one is showing, so the tab
 /// underneath never accidentally reacts to a key meant for the modal. At the
 /// top level (no modal open), `Esc` opens `Modal::QuitConfirm` rather than
-/// quitting directly - only `q` quits immediately there.
+/// quitting directly - only `q` quits immediately there. The reminder form,
+/// though reached through a modal, is checked ahead of all of that - see the
+/// `reminder_form` check below.
 pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputAction {
     // Diverts all input into the Agents tab's `/`-search prompt while it's
     // being edited - checked before the global `q` quit shortcut (and
@@ -41,6 +43,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputA
     // types, and "q" is a plausible character to want in one.
     if app.rename_form.is_some() {
         return handle_rename_form_key(app, key.code);
+    }
+
+    // Also checked before the global `q` quit shortcut, for the same reason
+    // as `agents_search_editing` and `rename_form` above: a reminder's name
+    // is free text the user types, and "q" is a plausible character to want
+    // in one. The reminder form is otherwise reached through `handle_modal_key`
+    // (it's only ever open alongside `Modal::Details`), but it must be
+    // checked here, ahead of the quit guard, rather than there.
+    if app.reminder_form.is_some() {
+        return handle_reminder_form_key(app, key);
     }
 
     if let KeyCode::Char('q') = key.code {
@@ -191,20 +203,19 @@ fn handle_reminders_tab_key(app: &mut App, code: KeyCode, page_size: usize) -> I
     InputAction::Continue
 }
 
-/// Handles a key while a modal is open. `Esc` closes whatever is topmost -
-/// the reminder form, then the delete confirmation, then the modal itself -
-/// so each layer peels back independently. A `Modal::Details` additionally
-/// routes `j`/`k`/`d`/`u`/`g`/`G`/page-down/page-up to whichever of its Logs
-/// or Reminders panes currently holds focus (`Tab` toggles which), per the
+/// Handles a key while a modal is open. The reminder form - though only ever
+/// open alongside `Modal::Details` - is intercepted earlier, in `handle_key`,
+/// so it never reaches here. Of what's left, `Esc` closes whatever is
+/// topmost (the delete confirmation, then the modal itself), so each layer
+/// peels back independently. A `Modal::Details` additionally routes
+/// `j`/`k`/`d`/`u`/`g`/`G`/page-down/page-up to whichever of its Logs or
+/// Reminders panes currently holds focus (`Tab` toggles which), per the
 /// "Paginated lists support keyboard navigation" requirement's precedence
 /// rule. `Modal::Help` has no list of its own, so no other key does anything
 /// while it's open.
 fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputAction {
     let code = key.code;
 
-    if app.reminder_form.is_some() {
-        return handle_reminder_form_key(app, key);
-    }
     if app.confirm_delete_reminder.is_some() {
         match code {
             KeyCode::Enter => {
@@ -1466,6 +1477,48 @@ mod tests {
         assert_eq!(action, InputAction::Continue);
         assert!(app.reminder_form.is_none());
         assert!(app.modal.is_some(), "Esc on the form must not also close the modal");
+    }
+
+    #[test]
+    fn typing_q_while_the_reminder_form_is_open_appends_it_instead_of_quitting() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter); // open details modal
+        press(&mut app, KeyCode::Char('R')); // open the reminder creation form, Name field focused
+
+        let action = press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(action, InputAction::Continue, "q must not quit while the reminder form is open");
+        assert_eq!(app.reminder_form.as_ref().unwrap().name, "q");
+    }
+
+    #[test]
+    fn q_still_quits_with_no_free_text_input_open() {
+        // Guards against the reminder-form fix over-widening the exemption:
+        // with no reminder form, rename form, or search prompt open, q must
+        // still quit immediately, including while some other modal is open.
+        let mut app = App::new();
+        assert_eq!(press(&mut app, KeyCode::Char('q')), InputAction::Quit);
+
+        let mut app = App::new();
+        app.open_help_modal();
+        assert_eq!(press(&mut app, KeyCode::Char('q')), InputAction::Quit);
     }
 
     fn app_with_one_agent() -> App {
