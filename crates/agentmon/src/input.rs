@@ -1,8 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use tui_input::backend::crossterm::EventHandler;
 
 use agentmon_proto::ClientMessage;
 
-use crate::app::{App, Modal, ModalFocus, PageSizes, Tab};
+use crate::app::{App, Modal, ModalFocus, PageSizes, ReminderFormField, Tab};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
@@ -35,14 +36,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputA
     // everything else) so a typed `q`, `?`, `A`, `L`, `R`, or `Tab` becomes
     // part of the search string instead of firing its usual global effect.
     if app.agents_search_editing {
-        return handle_agents_search_editing_key(app, key.code);
+        return handle_agents_search_editing_key(app, key);
     }
 
     // Also checked before the global `q` quit shortcut, for the same reason
     // as `agents_search_editing` above: a project name is free text the user
     // types, and "q" is a plausible character to want in one.
     if app.rename_form.is_some() {
-        return handle_rename_form_key(app, key.code);
+        return handle_rename_form_key(app, key);
     }
 
     // Also checked before the global `q` quit shortcut, for the same reason
@@ -118,11 +119,14 @@ fn handle_agents_tab_key(app: &mut App, code: KeyCode) {
 /// Handles a key while the project rename form is open. `Esc` discards the
 /// form without sending anything; `Enter` validates and, on success, returns
 /// the `RenameProject` message to send (closing the form), or leaves it open
-/// with its inline error set on failure; `Backspace` and printable
-/// characters (including `q` - see this form's check in `handle_key`) edit
-/// its text.
-fn handle_rename_form_key(app: &mut App, code: KeyCode) -> InputAction {
-    match code {
+/// with its inline error set on failure. Every other key (including `q` -
+/// see this form's check in `handle_key`) is forwarded to the form's
+/// `tui_input::Input`, which owns the text's cursor and handles movement,
+/// insertion, and deletion - see design.md's "Key handling forwards to
+/// `Input::handle_event`" decision. The inline error is cleared only when
+/// that edit actually changed the text, not on pure cursor movement.
+fn handle_rename_form_key(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
         KeyCode::Esc => {
             app.close_rename_form();
             InputAction::Continue
@@ -131,28 +135,31 @@ fn handle_rename_form_key(app: &mut App, code: KeyCode) -> InputAction {
             Some(message) => InputAction::SendReminderCommand(message),
             None => InputAction::Continue,
         },
-        KeyCode::Backspace => {
-            app.rename_form_backspace();
+        _ => {
+            if let Some(form) = &mut app.rename_form {
+                let changed = form.name.handle_event(&Event::Key(key)).is_some_and(|r| r.value);
+                if changed {
+                    form.error = None;
+                }
+            }
             InputAction::Continue
         }
-        KeyCode::Char(c) => {
-            app.rename_form_input_char(c);
-            InputAction::Continue
-        }
-        _ => InputAction::Continue,
     }
 }
 
 /// Handles a key while the Agents tab's `/`-search prompt is being edited -
 /// see "Agents tab supports incremental search by project name" and
-/// "Committing, cancelling, and clearing the Agents tab search".
-fn handle_agents_search_editing_key(app: &mut App, code: KeyCode) -> InputAction {
-    match code {
+/// "Committing, cancelling, and clearing the Agents tab search". `Enter`
+/// commits the search and `Esc` cancels it; every other key is forwarded to
+/// the search buffer's `tui_input::Input` - see `handle_rename_form_key`'s
+/// doc comment.
+fn handle_agents_search_editing_key(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
         KeyCode::Enter => app.commit_agents_search(),
         KeyCode::Esc => app.cancel_agents_search(),
-        KeyCode::Backspace => app.pop_agents_search_char(),
-        KeyCode::Char(c) => app.push_agents_search_char(c),
-        _ => {}
+        _ => {
+            app.agents_search_buffer.handle_event(&Event::Key(key));
+        }
     }
     InputAction::Continue
 }
@@ -310,11 +317,32 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
     InputAction::Continue
 }
 
+/// Whether a key reaching the reminder form's Duration field should be
+/// forwarded to its `tui_input::Input`. `tui-input`'s own crossterm mapping
+/// treats a bare `Ctrl+<letter>` (without `Alt`) as a line-editing command -
+/// `Ctrl+B`/`F`/`A`/`E`/`W`/`D`/`U`/`K`/`H` - not a literal character, so
+/// those always pass through regardless of field. Everything else that
+/// reaches here as a `Char` is literal text input (unmodified, `Shift`, or
+/// `Ctrl+Alt`), so the Duration field's existing digits-only rule applies to
+/// it, same as before this field delegated to `tui_input`.
+fn should_forward_to_duration_field(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(c) => {
+            let bare_ctrl = key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+            bare_ctrl || c.is_ascii_digit()
+        }
+        _ => true,
+    }
+}
+
 /// Handles a key while the reminder creation/editing form is open. `Tab`
-/// moves between the Name and Duration fields; `Enter` saves and closes the
-/// form, returning the command to send; `Escape` discards the form without
-/// sending anything; `Backspace` and printable characters edit whichever
-/// field currently has focus.
+/// moves between the Name and Duration fields, resetting the cursor to the
+/// newly-focused field's end; `Enter` saves and closes the form, returning
+/// the command to send; `Escape` discards the form without sending
+/// anything. Every other key is forwarded to whichever field currently has
+/// focus's `tui_input::Input` - see `handle_rename_form_key`'s doc comment -
+/// except a non-digit character key on the Duration field, which is ignored
+/// per `should_forward_to_duration_field`.
 fn handle_reminder_form_key(app: &mut App, key: KeyEvent) -> InputAction {
     match key.code {
         KeyCode::Esc => {
@@ -329,15 +357,21 @@ fn handle_reminder_form_key(app: &mut App, key: KeyEvent) -> InputAction {
             app.toggle_reminder_form_field();
             InputAction::Continue
         }
-        KeyCode::Backspace => {
-            app.reminder_form_backspace();
+        _ => {
+            if let Some(form) = &mut app.reminder_form {
+                match form.field {
+                    ReminderFormField::Name => {
+                        form.name.handle_event(&Event::Key(key));
+                    }
+                    ReminderFormField::Duration => {
+                        if should_forward_to_duration_field(&key) {
+                            form.duration_minutes.handle_event(&Event::Key(key));
+                        }
+                    }
+                }
+            }
             InputAction::Continue
         }
-        KeyCode::Char(c) => {
-            app.reminder_form_input_char(c);
-            InputAction::Continue
-        }
-        _ => InputAction::Continue,
     }
 }
 
@@ -365,6 +399,12 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> InputAction {
         handle_key(app, key(code), page_sizes())
+    }
+
+    /// Presses `code` with `Ctrl` held - for exercising `tui-input`'s
+    /// bare-`Ctrl` line-editing bindings (`Ctrl+Left`/`Right`/`W`/`K`/`U`).
+    fn press_ctrl(app: &mut App, code: KeyCode) -> InputAction {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::CONTROL), page_sizes())
     }
 
     #[test]
@@ -542,7 +582,7 @@ mod tests {
         assert!(app.agents_search_editing, "must still be editing - none of these should have exited edit mode");
         assert!(!is_help_modal_open(&app), "? must not open the help modal while editing");
         assert_eq!(app.active_tab, Tab::Agents, "A/L/R/Tab must not switch tabs while editing");
-        assert_eq!(app.agents_search_buffer, "q?ALR", "every key typed above must land in the search buffer");
+        assert_eq!(app.agents_search_buffer.value(), "q?ALR", "every key typed above must land in the search buffer");
     }
 
     #[test]
@@ -626,7 +666,7 @@ mod tests {
         press(&mut app, KeyCode::Char('b'));
         press(&mut app, KeyCode::Backspace);
 
-        assert_eq!(app.agents_search_buffer, "a");
+        assert_eq!(app.agents_search_buffer.value(), "a");
     }
 
     #[test]
@@ -636,7 +676,199 @@ mod tests {
 
         press(&mut app, KeyCode::Char('/'));
 
-        assert_eq!(app.agents_search_buffer, "prior");
+        assert_eq!(app.agents_search_buffer.value(), "prior");
+        assert_eq!(app.agents_search_buffer.cursor(), 5, "cursor should seed at the end of the filter's text");
+    }
+
+    #[test]
+    fn left_and_right_move_the_search_cursor_without_changing_the_text() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "xay".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.agents_search_buffer.cursor(), 3);
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.agents_search_buffer.cursor(), 2);
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.agents_search_buffer.cursor(), 3);
+        assert_eq!(app.agents_search_buffer.value(), "xay");
+    }
+
+    #[test]
+    fn search_cursor_cannot_move_past_either_end_of_the_string() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('a'));
+
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.agents_search_buffer.cursor(), 0, "must clamp at the start");
+
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.agents_search_buffer.cursor(), 1, "must clamp at the end");
+    }
+
+    #[test]
+    fn home_and_end_jump_the_search_cursor_to_either_end() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "abc".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.agents_search_buffer.cursor(), 0);
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.agents_search_buffer.cursor(), 3);
+    }
+
+    #[test]
+    fn ctrl_left_and_ctrl_right_move_the_search_cursor_by_word() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "foo bar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let end = app.agents_search_buffer.cursor();
+
+        press_ctrl(&mut app, KeyCode::Left);
+        let after_left = app.agents_search_buffer.cursor();
+        assert!(after_left < end, "Ctrl+Left should move the cursor backward by a word");
+        assert_eq!(app.agents_search_buffer.value(), "foo bar", "word movement must not change the text");
+
+        press_ctrl(&mut app, KeyCode::Right);
+        assert_eq!(app.agents_search_buffer.cursor(), end, "Ctrl+Right should return to the end");
+    }
+
+    #[test]
+    fn typing_mid_string_inserts_at_the_cursor_and_updates_matches() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "ay".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert_eq!(app.agents_search_buffer.value(), "axy");
+        assert_eq!(app.agents_search_buffer.cursor(), 2);
+    }
+
+    #[test]
+    fn backspace_mid_string_deletes_the_character_before_the_cursor() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "axy".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.agents_search_buffer.value(), "ay");
+        assert_eq!(app.agents_search_buffer.cursor(), 1);
+    }
+
+    /// An `App` tracking a single agent for project `/tmp/foobar` - used by
+    /// search-filter tests that need a project name long enough for a
+    /// meaningful substring-match check (unlike `app_with_one_agent`'s
+    /// single-character "a").
+    fn app_with_foobar_project() -> App {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/foobar"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app
+    }
+
+    #[test]
+    fn delete_removes_the_character_after_the_search_cursor_and_updates_matches() {
+        let mut app = app_with_foobar_project();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "fooXbar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.agents_search_buffer.cursor(), 3, "cursor should sit right before the stray \"X\"");
+        assert_eq!(app.visible_agent_groups().len(), 0, "\"fooXbar\" must not match project \"foobar\"");
+
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.agents_search_buffer.value(), "foobar");
+        assert_eq!(app.agents_search_buffer.cursor(), 3, "Delete must not move the cursor");
+        assert_eq!(app.visible_agent_groups().len(), 1, "\"foobar\" matches project \"foobar\" again");
+    }
+
+    #[test]
+    fn ctrl_w_removes_the_word_before_the_search_cursor_and_updates_matches() {
+        let mut app = app_with_foobar_project();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "extra foobar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.visible_agent_groups().len(), 0, "\"extra foobar\" must not match project \"foobar\"");
+        press(&mut app, KeyCode::Home);
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.agents_search_buffer.cursor(), 6, "cursor should sit right before \"foobar\"");
+
+        press_ctrl(&mut app, KeyCode::Char('w'));
+
+        assert_eq!(app.agents_search_buffer.value().trim(), "foobar");
+        assert_eq!(app.visible_agent_groups().len(), 1, "the filter should match project \"foobar\" again");
+    }
+
+    #[test]
+    fn ctrl_k_clears_from_the_search_cursor_to_the_end() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "aXY".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+
+        press_ctrl(&mut app, KeyCode::Char('k'));
+
+        assert_eq!(app.agents_search_buffer.value(), "a");
+        assert_eq!(app.visible_agent_groups().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_search_string() {
+        let mut app = App::new();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "anything".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press_ctrl(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(app.agents_search_buffer.value(), "");
+        assert_eq!(app.agents_search_buffer.cursor(), 0);
     }
 
     #[test]
@@ -1405,8 +1637,140 @@ mod tests {
         press(&mut app, KeyCode::Char('7'));
 
         let form = app.reminder_form.as_ref().unwrap();
-        assert_eq!(form.name, "X");
-        assert_eq!(form.duration_minutes, "7");
+        assert_eq!(form.name.value(), "X");
+        assert_eq!(form.duration_minutes.value(), "7");
+    }
+
+    /// Opens the reminder creation form (Name field focused) for a single
+    /// tracked project - shared setup for the cursor/line-editing tests
+    /// below.
+    fn app_with_reminder_form_open() -> App {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('R'));
+        app
+    }
+
+    #[test]
+    fn reminder_form_non_digit_key_leaves_the_duration_field_unchanged() {
+        let mut app = app_with_reminder_form_open();
+        press(&mut app, KeyCode::Tab); // focus Duration
+
+        press(&mut app, KeyCode::Char('x'));
+
+        let form = app.reminder_form.as_ref().unwrap();
+        assert_eq!(form.duration_minutes.value(), "");
+        assert_eq!(form.duration_minutes.cursor(), 0);
+    }
+
+    #[test]
+    fn reminder_form_name_field_supports_left_right_home_end_and_delete() {
+        let mut app = app_with_reminder_form_open();
+        for c in "fooXbar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.cursor(), 3, "cursor should sit right before the stray \"X\"");
+
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.value(), "foobar");
+
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.cursor(), 0);
+
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.cursor(), 2);
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.cursor(), 6);
+    }
+
+    #[test]
+    fn reminder_form_name_field_ctrl_w_removes_the_word_before_the_cursor() {
+        let mut app = app_with_reminder_form_open();
+        for c in "extra foobar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Home);
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Right);
+        }
+
+        press_ctrl(&mut app, KeyCode::Char('w'));
+
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.value().trim(), "foobar");
+    }
+
+    #[test]
+    fn reminder_form_name_field_ctrl_k_clears_from_the_cursor_to_the_end() {
+        let mut app = app_with_reminder_form_open();
+        for c in "foobar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+
+        press_ctrl(&mut app, KeyCode::Char('k'));
+
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.value(), "foo");
+    }
+
+    #[test]
+    fn reminder_form_name_field_ctrl_u_clears_the_field() {
+        let mut app = app_with_reminder_form_open();
+        for c in "anything".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press_ctrl(&mut app, KeyCode::Char('u'));
+
+        let form = app.reminder_form.as_ref().unwrap();
+        assert_eq!(form.name.value(), "");
+        assert_eq!(form.name.cursor(), 0);
+    }
+
+    #[test]
+    fn reminder_form_duration_field_supports_cursor_movement_and_deletion() {
+        let mut app = app_with_reminder_form_open();
+        press(&mut app, KeyCode::Tab); // focus Duration
+        for c in "123".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes.cursor(), 2);
+
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes.value(), "13");
+
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes.value(), "1");
+
+        press_ctrl(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes.value(), "");
     }
 
     #[test]
@@ -1505,7 +1869,7 @@ mod tests {
         let action = press(&mut app, KeyCode::Char('q'));
 
         assert_eq!(action, InputAction::Continue, "q must not quit while the reminder form is open");
-        assert_eq!(app.reminder_form.as_ref().unwrap().name, "q");
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.value(), "q");
     }
 
     #[test]
@@ -1550,7 +1914,7 @@ mod tests {
         let action = press(&mut app, KeyCode::Char('n'));
 
         assert_eq!(action, InputAction::Continue);
-        assert_eq!(app.rename_form.as_ref().unwrap().name, "a");
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "a");
     }
 
     #[test]
@@ -1561,7 +1925,114 @@ mod tests {
         let action = press(&mut app, KeyCode::Char('q'));
 
         assert_eq!(action, InputAction::Continue, "q must not quit while the rename form is open");
-        assert_eq!(app.rename_form.as_ref().unwrap().name, "aq");
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "aq");
+    }
+
+    #[test]
+    fn typing_q_mid_string_inserts_it_at_the_cursor_instead_of_quitting() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('x')); // pre-populated "a" -> "ax"
+        press(&mut app, KeyCode::Left); // cursor between "a" and "x"
+
+        let action = press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(action, InputAction::Continue, "q must not quit while the rename form is open");
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "aqx");
+    }
+
+    #[test]
+    fn rename_form_supports_left_right_home_end_and_delete() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n')); // pre-populated with "a"
+        press(&mut app, KeyCode::Backspace); // clear it
+        for c in "fooXbar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.rename_form.as_ref().unwrap().name.cursor(), 3, "cursor should sit right before the stray \"X\"");
+
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "foobar");
+
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.rename_form.as_ref().unwrap().name.cursor(), 0);
+
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.rename_form.as_ref().unwrap().name.cursor(), 2);
+
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.rename_form.as_ref().unwrap().name.cursor(), 6);
+    }
+
+    #[test]
+    fn rename_form_ctrl_left_and_ctrl_right_move_the_cursor_by_word() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Backspace);
+        for c in "foo bar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let end = app.rename_form.as_ref().unwrap().name.cursor();
+
+        press_ctrl(&mut app, KeyCode::Left);
+        let after_left = app.rename_form.as_ref().unwrap().name.cursor();
+        assert!(after_left < end, "Ctrl+Left should move the cursor backward by a word");
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "foo bar");
+
+        press_ctrl(&mut app, KeyCode::Right);
+        assert_eq!(app.rename_form.as_ref().unwrap().name.cursor(), end, "Ctrl+Right should return to the end");
+    }
+
+    #[test]
+    fn rename_form_ctrl_w_removes_the_word_before_the_cursor() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Backspace);
+        for c in "extra foobar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Home);
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Right);
+        }
+
+        press_ctrl(&mut app, KeyCode::Char('w'));
+
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value().trim(), "foobar");
+    }
+
+    #[test]
+    fn rename_form_ctrl_k_clears_from_the_cursor_to_the_end() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Backspace);
+        for c in "foobar".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+
+        press_ctrl(&mut app, KeyCode::Char('k'));
+
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "foo");
+    }
+
+    #[test]
+    fn rename_form_ctrl_u_clears_the_field() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Char('n'));
+
+        press_ctrl(&mut app, KeyCode::Char('u'));
+
+        let form = app.rename_form.as_ref().unwrap();
+        assert_eq!(form.name.value(), "");
+        assert_eq!(form.name.cursor(), 0);
     }
 
     #[test]

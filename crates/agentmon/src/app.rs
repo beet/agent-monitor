@@ -5,6 +5,7 @@ use agentmon_proto::{
     AgentInfo, ClientMessage, LogEntry, ProjectName, ReminderId, ReminderInfo, ReminderStatus, SessionId,
     TestRunInfo,
 };
+use tui_input::Input;
 
 /// A paginated list's selection and scroll-window state - shared by the Logs
 /// tab and the details modal's Logs pane so their `j`/`k`/`d`/`u` behavior
@@ -206,13 +207,19 @@ pub enum ReminderFormField {
 /// The reminder creation/editing form's in-progress state - see "Reminder
 /// creation and editing form". Only meaningful while the details modal is
 /// open; `cwd` is the project the reminder belongs (or will belong) to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `name` and `duration_minutes` are `tui_input::Input` rather than `String`
+/// so each field carries its own cursor position - `tui_input::Input` has no
+/// `PartialEq`/`Eq` impl, which is why this struct (and `App`, which holds it)
+/// no longer derive them either; nothing compares either by whole-struct
+/// equality.
+#[derive(Debug, Clone)]
 pub struct ReminderForm {
     pub mode: ReminderFormMode,
     pub cwd: PathBuf,
-    pub name: String,
+    pub name: Input,
     /// Raw digit-only text buffer; parsed to `u32` on submit.
-    pub duration_minutes: String,
+    pub duration_minutes: Input,
     pub field: ReminderFormField,
 }
 
@@ -220,10 +227,14 @@ pub struct ReminderForm {
 /// form" requirement. Reachable from the Agents tab with no modal open, or
 /// from inside the details modal; either way `cwd` is the project being
 /// renamed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `name` is a `tui_input::Input` rather than a `String` so it carries its
+/// own cursor position - see `ReminderForm`'s doc comment on why this struct
+/// no longer derives `PartialEq`/`Eq`.
+#[derive(Debug, Clone)]
 pub struct RenameForm {
     pub cwd: PathBuf,
-    pub name: String,
+    pub name: Input,
     /// Set by client-side validation when `Enter` is pressed on invalid
     /// input (blank, or a duplicate of another known project's name);
     /// cleared on any subsequent edit. Never set by anything the daemon
@@ -279,7 +290,11 @@ impl DirectoryGroup {
 
 /// Pure application state: what's on screen, decoupled from the terminal
 /// and the socket connection so it can be tested without either.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Does not derive `PartialEq`/`Eq` - `agents_search_buffer` is a
+/// `tui_input::Input`, which has neither impl, and nothing compares a whole
+/// `App` by equality (see `ReminderForm`'s doc comment for the same note).
+#[derive(Debug, Clone)]
 pub struct App {
     pub connection: ConnectionStatus,
     pub agents: Vec<AgentInfo>,
@@ -292,7 +307,7 @@ pub struct App {
     /// The in-progress search text while `agents_search_editing` is true.
     /// Seeded from `agents_search_applied` when editing begins, and discarded
     /// (without touching `agents_search_applied`) if editing is cancelled.
-    pub agents_search_buffer: String,
+    pub agents_search_buffer: Input,
     /// The committed Agents-tab search filter, applied as a case-insensitive
     /// substring match against each row's project name.
     pub agents_search_applied: Option<String>,
@@ -347,7 +362,7 @@ impl App {
             active_tab: Tab::Agents,
             agents_selected: 0,
             agents_search_editing: false,
-            agents_search_buffer: String::new(),
+            agents_search_buffer: Input::default(),
             agents_search_applied: None,
             logs: Vec::new(),
             logs_pagination: Paginator::default(),
@@ -514,7 +529,7 @@ impl App {
     pub fn visible_agent_groups(&self) -> Vec<DirectoryGroup> {
         let groups = self.directory_groups();
         let filter = if self.agents_search_editing {
-            Some(self.agents_search_buffer.as_str())
+            Some(self.agents_search_buffer.value())
         } else {
             self.agents_search_applied.as_deref()
         };
@@ -546,30 +561,33 @@ impl App {
     /// buffer from whatever filter is already applied so refining or
     /// clearing it doesn't require retyping it.
     pub fn open_agents_search(&mut self) {
-        self.agents_search_buffer = self.agents_search_applied.clone().unwrap_or_default();
+        self.agents_search_buffer = Input::new(self.agents_search_applied.clone().unwrap_or_default());
         self.agents_search_editing = true;
     }
 
-    /// Appends a character to the in-progress search buffer - the Agents
-    /// tab's `/`-search-editing mode.
+    /// Inserts a character at the in-progress search buffer's cursor - the
+    /// Agents tab's `/`-search-editing mode. A thin wrapper around
+    /// `tui_input::Input::handle`, kept as a convenience for tests that don't
+    /// need to go through `input::handle_key`'s full event forwarding.
     pub fn push_agents_search_char(&mut self, c: char) {
-        self.agents_search_buffer.push(c);
+        self.agents_search_buffer.handle(tui_input::InputRequest::InsertChar(c));
     }
 
-    /// Removes the last character of the in-progress search buffer - the
-    /// Agents tab's `/`-search-editing mode.
+    /// Removes the character before the in-progress search buffer's cursor -
+    /// the Agents tab's `/`-search-editing mode. See `push_agents_search_char`'s
+    /// doc comment.
     pub fn pop_agents_search_char(&mut self) {
-        self.agents_search_buffer.pop();
+        self.agents_search_buffer.handle(tui_input::InputRequest::DeletePrevChar);
     }
 
     /// Commits the in-progress search buffer as the Agents tab's applied
     /// filter (or clears it, if the buffer is empty) and exits
     /// search-editing mode.
     pub fn commit_agents_search(&mut self) {
-        self.agents_search_applied = if self.agents_search_buffer.is_empty() {
+        self.agents_search_applied = if self.agents_search_buffer.value().is_empty() {
             None
         } else {
-            Some(std::mem::take(&mut self.agents_search_buffer))
+            Some(std::mem::take(&mut self.agents_search_buffer).into())
         };
         self.agents_search_editing = false;
         self.clamp_agents_selected();
@@ -1025,8 +1043,8 @@ impl App {
         self.reminder_form = Some(ReminderForm {
             mode: ReminderFormMode::Create,
             cwd: cwd.clone(),
-            name: String::new(),
-            duration_minutes: String::new(),
+            name: Input::default(),
+            duration_minutes: Input::default(),
             field: ReminderFormField::Name,
         });
     }
@@ -1047,8 +1065,8 @@ impl App {
         self.reminder_form = Some(ReminderForm {
             mode: ReminderFormMode::Edit(reminder.id),
             cwd,
-            name: reminder.name,
-            duration_minutes: reminder.duration_minutes.to_string(),
+            name: Input::new(reminder.name),
+            duration_minutes: Input::new(reminder.duration_minutes.to_string()),
             field: ReminderFormField::Name,
         });
     }
@@ -1058,40 +1076,54 @@ impl App {
     }
 
     /// Moves input focus between the form's Name and Duration fields - the
-    /// `Tab` key while the form is open.
+    /// `Tab` key while the form is open. Resets the newly-focused field's
+    /// cursor to the end of its text, per the "Reminder creation and editing
+    /// form" requirement's "the cursor moves when focus moves between
+    /// fields" scenario.
     pub fn toggle_reminder_form_field(&mut self) {
         if let Some(form) = &mut self.reminder_form {
             form.field = match form.field {
                 ReminderFormField::Name => ReminderFormField::Duration,
                 ReminderFormField::Duration => ReminderFormField::Name,
             };
+            match form.field {
+                ReminderFormField::Name => form.name = Input::new(form.name.value().to_string()),
+                ReminderFormField::Duration => {
+                    form.duration_minutes = Input::new(form.duration_minutes.value().to_string())
+                }
+            }
         }
     }
 
-    /// Appends a typed character to whichever field currently has focus.
-    /// The Duration field only accepts digits.
+    /// Inserts a typed character at the cursor of whichever field currently
+    /// has focus. The Duration field only accepts digits. A thin wrapper
+    /// around `tui_input::Input::handle`, kept as a convenience for tests -
+    /// see `push_agents_search_char`'s doc comment.
     pub fn reminder_form_input_char(&mut self, c: char) {
         if let Some(form) = &mut self.reminder_form {
             match form.field {
-                ReminderFormField::Name => form.name.push(c),
+                ReminderFormField::Name => {
+                    form.name.handle(tui_input::InputRequest::InsertChar(c));
+                }
                 ReminderFormField::Duration => {
                     if c.is_ascii_digit() {
-                        form.duration_minutes.push(c);
+                        form.duration_minutes.handle(tui_input::InputRequest::InsertChar(c));
                     }
                 }
             }
         }
     }
 
-    /// Removes the last character from whichever field currently has focus.
+    /// Removes the character before the cursor of whichever field currently
+    /// has focus. See `reminder_form_input_char`'s doc comment.
     pub fn reminder_form_backspace(&mut self) {
         if let Some(form) = &mut self.reminder_form {
             match form.field {
                 ReminderFormField::Name => {
-                    form.name.pop();
+                    form.name.handle(tui_input::InputRequest::DeletePrevChar);
                 }
                 ReminderFormField::Duration => {
-                    form.duration_minutes.pop();
+                    form.duration_minutes.handle(tui_input::InputRequest::DeletePrevChar);
                 }
             }
         }
@@ -1104,19 +1136,19 @@ impl App {
     /// it and highlight/auto-start it - see that method's doc comment.
     pub fn submit_reminder_form(&mut self) -> Option<ClientMessage> {
         let form = self.reminder_form.take()?;
-        let duration_minutes: u32 = form.duration_minutes.parse().unwrap_or(0);
+        let duration_minutes: u32 = form.duration_minutes.value().parse().unwrap_or(0);
         Some(match form.mode {
             ReminderFormMode::Create => {
-                self.pending_new_reminder = Some((form.cwd.clone(), form.name.clone()));
+                self.pending_new_reminder = Some((form.cwd.clone(), form.name.value().to_string()));
                 ClientMessage::CreateReminder {
                     cwd: form.cwd,
-                    name: form.name,
+                    name: form.name.into(),
                     duration_minutes,
                 }
             }
             ReminderFormMode::Edit(id) => ClientMessage::UpdateReminder {
                 id,
-                name: form.name,
+                name: form.name.into(),
                 duration_minutes,
             },
         })
@@ -1171,7 +1203,7 @@ impl App {
             return;
         };
         self.rename_form = Some(RenameForm {
-            name: self.project_name(&group.cwd),
+            name: Input::new(self.project_name(&group.cwd)),
             cwd: group.cwd,
             error: None,
         });
@@ -1184,7 +1216,7 @@ impl App {
         let Some(Modal::Details(cwd)) = &self.modal else { return };
         let cwd = cwd.clone();
         self.rename_form = Some(RenameForm {
-            name: self.project_name(&cwd),
+            name: Input::new(self.project_name(&cwd)),
             cwd,
             error: None,
         });
@@ -1194,21 +1226,24 @@ impl App {
         self.rename_form = None;
     }
 
-    /// Appends a typed character to the rename form's text. No character is
-    /// treated specially - including `q`, since a project name is free text
-    /// the user must be able to type without triggering the global quit
-    /// shortcut (see `input.rs`'s key-routing precedence).
+    /// Inserts a typed character at the rename form's cursor. No character
+    /// is treated specially - including `q`, since a project name is free
+    /// text the user must be able to type without triggering the global quit
+    /// shortcut (see `input.rs`'s key-routing precedence). A thin wrapper
+    /// around `tui_input::Input::handle`, kept as a convenience for tests -
+    /// see `push_agents_search_char`'s doc comment.
     pub fn rename_form_input_char(&mut self, c: char) {
         if let Some(form) = &mut self.rename_form {
-            form.name.push(c);
+            form.name.handle(tui_input::InputRequest::InsertChar(c));
             form.error = None;
         }
     }
 
-    /// Removes the last character from the rename form's text.
+    /// Removes the character before the rename form's cursor. See
+    /// `rename_form_input_char`'s doc comment.
     pub fn rename_form_backspace(&mut self) {
         if let Some(form) = &mut self.rename_form {
-            form.name.pop();
+            form.name.handle(tui_input::InputRequest::DeletePrevChar);
             form.error = None;
         }
     }
@@ -1227,7 +1262,7 @@ impl App {
     /// `self.project_names`.
     pub fn submit_rename_form(&mut self) -> Option<ClientMessage> {
         let form = self.rename_form.as_ref()?;
-        let trimmed = form.name.trim();
+        let trimmed = form.name.value().trim();
         if trimmed.is_empty() {
             self.rename_form.as_mut().unwrap().error = Some("Name cannot be blank".to_string());
             return None;
@@ -1707,7 +1742,7 @@ mod tests {
         app.move_agents_selection(1);
         assert_eq!(app.agents_selected, 1);
 
-        app.agents_search_buffer = "a".to_string();
+        app.agents_search_buffer = Input::new("a".to_string());
         app.commit_agents_search();
 
         assert_eq!(app.agents_selected, 0, "selection must clamp once the filter drops the selected row");
@@ -1721,7 +1756,7 @@ mod tests {
         app.open_agents_search();
 
         assert!(app.agents_search_editing);
-        assert_eq!(app.agents_search_buffer, "lab");
+        assert_eq!(app.agents_search_buffer.value(), "lab");
     }
 
     #[test]
@@ -1731,7 +1766,7 @@ mod tests {
         app.open_agents_search();
 
         assert!(app.agents_search_editing);
-        assert_eq!(app.agents_search_buffer, "");
+        assert_eq!(app.agents_search_buffer.value(), "");
     }
 
     #[test]
@@ -1741,10 +1776,10 @@ mod tests {
 
         app.push_agents_search_char('a');
         app.push_agents_search_char('b');
-        assert_eq!(app.agents_search_buffer, "ab");
+        assert_eq!(app.agents_search_buffer.value(), "ab");
 
         app.pop_agents_search_char();
-        assert_eq!(app.agents_search_buffer, "a");
+        assert_eq!(app.agents_search_buffer.value(), "a");
     }
 
     #[test]
@@ -2562,8 +2597,8 @@ mod tests {
         let form = app.reminder_form.as_ref().unwrap();
         assert_eq!(form.mode, ReminderFormMode::Create);
         assert_eq!(form.cwd, PathBuf::from("/tmp/a"));
-        assert_eq!(form.name, "");
-        assert_eq!(form.duration_minutes, "");
+        assert_eq!(form.name.value(), "");
+        assert_eq!(form.duration_minutes.value(), "");
     }
 
     #[test]
@@ -2580,8 +2615,40 @@ mod tests {
 
         let form = app.reminder_form.as_ref().unwrap();
         assert_eq!(form.mode, ReminderFormMode::Edit(ReminderId("r1".to_string())));
-        assert_eq!(form.name, "Check the build");
-        assert_eq!(form.duration_minutes, "25");
+        assert_eq!(form.name.value(), "Check the build");
+        assert_eq!(form.name.cursor(), "Check the build".chars().count(), "cursor should seed at the end");
+        assert_eq!(form.duration_minutes.value(), "25");
+        assert_eq!(form.duration_minutes.cursor(), 2, "cursor should seed at the end");
+    }
+
+    #[test]
+    fn toggling_the_reminder_form_field_resets_the_newly_focused_fields_cursor_to_its_end() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.apply_reminder_update(ReminderInfo {
+            duration_minutes: 25,
+            ..reminder_in("/tmp/a", "r1", "Check the build", ReminderStatus::NotYetStarted, 0, None, 0)
+        });
+        app.open_details_modal();
+        app.open_reminder_edit_form();
+        // Move the Name field's cursor away from the end before tabbing off
+        // it, to prove tabbing back resets it rather than restoring wherever
+        // it was left.
+        app.reminder_form.as_mut().unwrap().name.handle(tui_input::InputRequest::GoToStart);
+
+        app.toggle_reminder_form_field(); // Name -> Duration
+        assert_eq!(
+            app.reminder_form.as_ref().unwrap().duration_minutes.cursor(),
+            2,
+            "the newly-focused Duration field's cursor should be at its end"
+        );
+
+        app.toggle_reminder_form_field(); // Duration -> Name
+        assert_eq!(
+            app.reminder_form.as_ref().unwrap().name.cursor(),
+            "Check the build".chars().count(),
+            "tabbing back to Name should reset its cursor to the end, not restore the earlier Home position"
+        );
     }
 
     #[test]
@@ -2593,15 +2660,15 @@ mod tests {
 
         app.reminder_form_input_char('H');
         app.reminder_form_input_char('i');
-        assert_eq!(app.reminder_form.as_ref().unwrap().name, "Hi");
+        assert_eq!(app.reminder_form.as_ref().unwrap().name.value(), "Hi");
 
         app.toggle_reminder_form_field();
         app.reminder_form_input_char('5');
         app.reminder_form_input_char('x'); // non-digit, ignored on the Duration field
-        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes, "5");
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes.value(), "5");
 
         app.reminder_form_backspace();
-        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes, "");
+        assert_eq!(app.reminder_form.as_ref().unwrap().duration_minutes.value(), "");
     }
 
     #[test]
@@ -2797,7 +2864,7 @@ mod tests {
 
         let form = app.rename_form.expect("rename form should be open");
         assert_eq!(form.cwd, PathBuf::from("/tmp/a"));
-        assert_eq!(form.name, "My Project");
+        assert_eq!(form.name.value(), "My Project");
         assert_eq!(form.error, None);
     }
 
@@ -2820,7 +2887,7 @@ mod tests {
 
         let form = app.rename_form.expect("rename form should be open");
         assert_eq!(form.cwd, PathBuf::from("/tmp/a"));
-        assert_eq!(form.name, "a");
+        assert_eq!(form.name.value(), "a");
     }
 
     #[test]
@@ -2850,10 +2917,10 @@ mod tests {
         app.open_rename_form_from_agents_tab();
 
         app.rename_form_input_char('!');
-        assert_eq!(app.rename_form.as_ref().unwrap().name, "a!");
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "a!");
 
         app.rename_form_backspace();
-        assert_eq!(app.rename_form.as_ref().unwrap().name, "a");
+        assert_eq!(app.rename_form.as_ref().unwrap().name.value(), "a");
     }
 
     #[test]
@@ -2880,7 +2947,7 @@ mod tests {
         let mut app = App::new();
         app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
         app.open_rename_form_from_agents_tab();
-        while !app.rename_form.as_ref().unwrap().name.is_empty() {
+        while !app.rename_form.as_ref().unwrap().name.value().is_empty() {
             app.rename_form_backspace();
         }
 
@@ -2908,7 +2975,7 @@ mod tests {
         app.agents_selected = 0;
         app.open_rename_form_from_agents_tab();
         assert_eq!(app.rename_form.as_ref().unwrap().cwd, PathBuf::from("/tmp/a"));
-        while !app.rename_form.as_ref().unwrap().name.is_empty() {
+        while !app.rename_form.as_ref().unwrap().name.value().is_empty() {
             app.rename_form_backspace();
         }
         for c in "b".chars() {

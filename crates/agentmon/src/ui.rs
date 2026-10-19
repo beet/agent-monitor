@@ -572,9 +572,22 @@ fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry) -> (String, 
 /// and in a color distinct from the rest of the title.
 fn agents_tab_title(app: &App, banner: Option<&str>) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = if app.agents_search_editing {
+        // Fakes a cursor at the tracked position within the search buffer,
+        // rather than always after the full text: the title is a `Line`
+        // inside a `Block::title`, not an area `frame.set_cursor_position`
+        // can address, so the reversed-style span itself has to stand in
+        // for the terminal's own cursor - see design.md's "Agents-tab
+        // search prompt keeps its fake cursor" decision.
+        let text = app.agents_search_buffer.value();
+        let cursor = app.agents_search_buffer.cursor();
+        let before: String = text.chars().take(cursor).collect();
+        let mut after_chars = text.chars().skip(cursor);
+        let at = after_chars.next().map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+        let after: String = after_chars.collect();
         vec![
-            Span::raw(format!("Agents /{}", app.agents_search_buffer)),
-            Span::styled("_", Style::new().add_modifier(Modifier::REVERSED)),
+            Span::raw(format!("Agents /{before}")),
+            Span::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
+            Span::raw(after),
         ]
     } else if let Some(filter) = &app.agents_search_applied {
         vec![
@@ -1574,11 +1587,11 @@ fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
     let text = vec![
         Line::from(vec![
             Span::styled("Name:     ", field_style(ReminderFormField::Name)),
-            Span::raw(form.name.clone()),
+            Span::raw(form.name.value().to_string()),
         ]),
         Line::from(vec![
             Span::styled("Duration: ", field_style(ReminderFormField::Duration)),
-            Span::raw(format!("{}m", form.duration_minutes)),
+            Span::raw(format!("{}m", form.duration_minutes.value())),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -1589,13 +1602,13 @@ fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
 
     frame.render_widget(Paragraph::new(text).block(block), area);
 
-    // Shows the terminal's own cursor at the end of the active field's
-    // typed text, right where the next keystroke will land.
-    let (row, field_len) = match form.field {
-        ReminderFormField::Name => (0, form.name.chars().count()),
-        ReminderFormField::Duration => (1, form.duration_minutes.chars().count()),
+    // Shows the terminal's own cursor at the active field's tracked cursor
+    // position, which may be mid-string rather than always at the end.
+    let (row, field_cursor) = match form.field {
+        ReminderFormField::Name => (0, form.name.visual_cursor()),
+        ReminderFormField::Duration => (1, form.duration_minutes.visual_cursor()),
     };
-    frame.set_cursor_position((inner.x + REMINDER_FORM_LABEL_WIDTH + field_len as u16, inner.y + row));
+    frame.set_cursor_position((inner.x + REMINDER_FORM_LABEL_WIDTH + field_cursor as u16, inner.y + row));
 }
 
 /// Renders the project rename form - see the "Project rename form"
@@ -1617,7 +1630,7 @@ fn render_rename_form(frame: &mut Frame, form: &crate::app::RenameForm) {
     let mut text = vec![
         Line::from(vec![
             Span::styled("Name: ", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::raw(form.name.clone()),
+            Span::raw(form.name.value().to_string()),
         ]),
         Line::from(""),
     ];
@@ -1637,7 +1650,7 @@ fn render_rename_form(frame: &mut Frame, form: &crate::app::RenameForm) {
 
     const RENAME_FORM_LABEL_WIDTH: u16 = 6;
     frame.set_cursor_position((
-        inner.x + RENAME_FORM_LABEL_WIDTH + form.name.chars().count() as u16,
+        inner.x + RENAME_FORM_LABEL_WIDTH + form.name.visual_cursor() as u16,
         inner.y,
     ));
 }
@@ -2612,6 +2625,39 @@ mod tests {
         assert!(
             cursor_cell.modifier.contains(Modifier::REVERSED),
             "a cursor should be visible immediately after the typed text"
+        );
+    }
+
+    #[test]
+    fn agents_tab_title_shows_the_cursor_mid_string_when_moved_left() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_agents_search();
+        app.push_agents_search_char('a');
+        app.push_agents_search_char('b');
+        app.push_agents_search_char('c');
+        app.agents_search_buffer.handle(tui_input::InputRequest::GoToPrevChar);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(text.contains("Agents /ab"), "got:\n{text}");
+        let (prompt_x, prompt_y) = find_text(buffer, "Agents /ab").expect("search prompt should be rendered");
+        // The cursor sits between "ab" and "c" - the reversed-style cell
+        // should carry "c", not a blank space (which is what the end-of-
+        // string case renders instead).
+        let cursor_cell = &buffer[(prompt_x + "Agents /ab".len() as u16, prompt_y)];
+        assert!(
+            cursor_cell.modifier.contains(Modifier::REVERSED),
+            "a cursor should be visible between \"ab\" and \"c\""
+        );
+        assert_eq!(cursor_cell.symbol(), "c", "the reversed cell should show the character at the cursor, not a blank");
+        let after_cursor_cell = &buffer[(prompt_x + "Agents /ab".len() as u16 + 1, prompt_y)];
+        assert!(
+            !after_cursor_cell.modifier.contains(Modifier::REVERSED),
+            "only the character at the cursor should be reversed, not what follows it"
         );
     }
 
@@ -4784,6 +4830,46 @@ mod tests {
     }
 
     #[test]
+    fn reminder_form_shows_the_cursor_mid_string_on_each_field() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        for c in "XYZ".chars() {
+            app.reminder_form_input_char(c);
+        }
+        app.reminder_form.as_mut().unwrap().name.handle(tui_input::InputRequest::GoToPrevChar);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let (name_x, name_y) = find_text(term.backend().buffer(), "Name:").expect("expected the Name label");
+        let cursor = term.get_cursor_position().expect("cursor position should be set");
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position { x: name_x + REMINDER_FORM_LABEL_WIDTH + 2, y: name_y },
+            "cursor should sit between \"XY\" and \"Z\", not after the full \"XYZ\""
+        );
+
+        app.toggle_reminder_form_field();
+        for c in "123".chars() {
+            app.reminder_form_input_char(c);
+        }
+        app.reminder_form.as_mut().unwrap().duration_minutes.handle(tui_input::InputRequest::GoToPrevChar);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let (duration_x, duration_y) =
+            find_text(term.backend().buffer(), "Duration:").expect("expected the Duration label");
+        let cursor = term.get_cursor_position().expect("cursor position should be set");
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position { x: duration_x + REMINDER_FORM_LABEL_WIDTH + 2, y: duration_y },
+            "cursor should sit between \"12\" and \"3\", not after the full \"123\""
+        );
+    }
+
+    #[test]
     fn rename_form_renders_from_the_agents_tab_with_no_modal_open() {
         let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
         let mut app = App::new();
@@ -4824,12 +4910,34 @@ mod tests {
     }
 
     #[test]
+    fn rename_form_shows_the_cursor_mid_string() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_rename_form_from_agents_tab();
+        app.rename_form_input_char('!');
+        app.rename_form_input_char('?');
+        app.rename_form.as_mut().unwrap().name.handle(tui_input::InputRequest::GoToPrevChar);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        const RENAME_FORM_LABEL_WIDTH: u16 = 6;
+        let (name_x, name_y) = find_text(term.backend().buffer(), "Name:").expect("expected the Name label");
+        let cursor = term.get_cursor_position().expect("cursor position should be set");
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position { x: name_x + RENAME_FORM_LABEL_WIDTH + "project!".len() as u16, y: name_y },
+            "cursor should sit between \"project!\" and \"?\", not after the full \"project!?\""
+        );
+    }
+
+    #[test]
     fn rename_form_shows_an_inline_error_on_invalid_submission() {
         let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
         app.open_rename_form_from_agents_tab();
-        while !app.rename_form.as_ref().unwrap().name.is_empty() {
+        while !app.rename_form.as_ref().unwrap().name.value().is_empty() {
             app.rename_form_backspace();
         }
         app.submit_rename_form();
