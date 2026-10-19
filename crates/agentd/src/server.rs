@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -50,11 +52,88 @@ impl Broadcaster {
     }
 }
 
+/// How long `handle_connection` waits to read a connection's message before
+/// giving up on it - mirrors `agentmon_report::report::SEND_TIMEOUT`'s value
+/// and rationale on the other end of the same socket: a connection that
+/// never finishes sending its payload must not hold up `EventSequencer`
+/// forever (see `EventSequencer::wait_for_turn`).
+const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Orders the *application* of `ReportEvent`s to the registry/activity log
+/// to match the order their connections were accepted, even though each
+/// connection reads and parses its own payload independently and
+/// concurrently - see design.md's "Ordering fix" decision. A connection is
+/// handed the next ticket (`next_ticket`) the moment it's accepted, in
+/// `serve`'s single-threaded accept loop, so ticket order is accept order by
+/// construction; every connection (regardless of message type) must later
+/// call `complete` exactly once, but only a `ReportEvent` connection calls
+/// `wait_for_turn` first, blocking until every earlier ticket has completed.
+#[derive(Clone, Default)]
+struct EventSequencer {
+    inner: Arc<SequencerInner>,
+}
+
+#[derive(Default)]
+struct SequencerInner {
+    next_ticket: AtomicU64,
+    state: Mutex<SequencerState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct SequencerState {
+    /// The ticket a `ReportEvent` connection is currently allowed to apply.
+    next_to_apply: u64,
+    /// Tickets that called `complete` before `next_to_apply` caught up to
+    /// them - e.g. a later-accepted connection whose own handling (no
+    /// `wait_for_turn`) finished before an earlier-accepted one's did.
+    completed: BTreeSet<u64>,
+}
+
+impl EventSequencer {
+    /// Hands out the next ticket, in accept order. Called once per accepted
+    /// connection, in `serve`'s accept loop, before that connection's thread
+    /// is spawned.
+    fn next_ticket(&self) -> u64 {
+        self.inner.next_ticket.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Blocks until every ticket before `seq` has called `complete`. Only a
+    /// `ReportEvent` connection calls this, immediately before applying its
+    /// event - every other message type is unaffected by ticket order.
+    fn wait_for_turn(&self, seq: u64) {
+        let mut state = self.inner.state.lock().unwrap();
+        while state.next_to_apply != seq {
+            state = self.inner.cv.wait(state).unwrap();
+        }
+    }
+
+    /// Marks `seq` done, retiring it (and any now-contiguous tickets already
+    /// marked done) from the sequence. Called by every connection exactly
+    /// once, whether or not it ever called `wait_for_turn` - a connection
+    /// that never applies anything ordered (every message type but
+    /// `ReportEvent`, and a malformed/timed-out read) still must release its
+    /// slot so a later `ReportEvent`'s `wait_for_turn` isn't stuck behind it.
+    fn complete(&self, seq: u64) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.completed.insert(seq);
+        loop {
+            let next_to_apply = state.next_to_apply;
+            if !state.completed.remove(&next_to_apply) {
+                break;
+            }
+            state.next_to_apply = next_to_apply + 1;
+        }
+        self.inner.cv.notify_all();
+    }
+}
+
 /// Accepts connections on `listener` until it is closed, handling each on
 /// its own thread, and runs the liveness sweep in the background so stale
 /// agents reach subscribed clients too.
 pub fn serve(listener: UnixListener, ingestor: Ingestor, liveness_interval: Duration) {
     let broadcaster = Broadcaster::default();
+    let sequencer = EventSequencer::default();
 
     let sweep_registry = ingestor.registry().clone();
     let sweep_broadcaster = broadcaster.clone();
@@ -82,12 +161,29 @@ pub fn serve(listener: UnixListener, ingestor: Ingestor, liveness_interval: Dura
         let Ok(stream) = stream else { continue };
         let ingestor = ingestor.clone();
         let broadcaster = broadcaster.clone();
-        thread::spawn(move || handle_connection(stream, ingestor, broadcaster));
+        // Ticketed here, in this single-threaded accept loop, so ticket
+        // order is accept order by construction - see `EventSequencer`.
+        let seq = sequencer.next_ticket();
+        let sequencer = sequencer.clone();
+        thread::spawn(move || handle_connection(stream, ingestor, broadcaster, sequencer, seq));
     }
 }
 
-fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadcaster) {
-    let Ok(clone) = stream.try_clone() else { return };
+fn handle_connection(
+    stream: UnixStream,
+    ingestor: Ingestor,
+    broadcaster: Broadcaster,
+    sequencer: EventSequencer,
+    seq: u64,
+) {
+    let Ok(clone) = stream.try_clone() else {
+        sequencer.complete(seq);
+        return;
+    };
+    // A connection that accepts but never finishes sending its message must
+    // not hold its ticket (and so a later `ReportEvent`'s `wait_for_turn`)
+    // forever - see `READ_TIMEOUT`.
+    let _ = clone.set_read_timeout(Some(READ_TIMEOUT));
     let mut reader = BufReader::new(clone);
     let mut writer = stream;
 
@@ -95,17 +191,28 @@ fn handle_connection(stream: UnixStream, ingestor: Ingestor, broadcaster: Broadc
         Ok(message) => message,
         Err(err) => {
             eprintln!("agentd: rejecting malformed message on connection: {err}");
+            sequencer.complete(seq);
             return;
         }
     };
 
+    // Only a `ReportEvent` needs its application ordered against other
+    // connections (see the agent-daemon spec's "Local socket ingestion API"
+    // requirement) - every other message type releases its ticket
+    // immediately so it never holds up a later-accepted `ReportEvent`.
+    if !matches!(message, Some(ClientMessage::ReportEvent { .. })) {
+        sequencer.complete(seq);
+    }
+
     match message {
         Some(ClientMessage::ReportEvent { event }) => {
+            sequencer.wait_for_turn(seq);
             let (agent, retired_session_ids) = ingestor.ingest_event(event);
             broadcaster.publish(Update::Agent(agent));
             for session_id in retired_session_ids {
                 broadcaster.publish(Update::AgentRemoved(session_id));
             }
+            sequencer.complete(seq);
         }
         Some(ClientMessage::ReportTestRun { cwd, pid, status }) => {
             let test_run = ingestor.ingest_test_run(cwd, pid, status);
@@ -1105,5 +1212,166 @@ mod tests {
 
     fn subscriber_set_read_timeout(reader: &mut BufReader<UnixStream>, timeout: Duration) {
         reader.get_ref().set_read_timeout(Some(timeout)).expect("set read timeout");
+    }
+
+    fn race_event(session_id: &str, cwd: &str, pid: u32) -> AgentEvent {
+        AgentEvent {
+            session_id: SessionId(session_id.to_string()),
+            cwd: PathBuf::from(cwd),
+            host_context: HostContext::Terminal,
+            pid,
+            status: AgentStatus::Running,
+            prompt: None,
+        }
+    }
+
+    fn read_log_snapshot_until_at_least(path: &PathBuf, min_len: usize) -> Vec<agentmon_proto::LogEntry> {
+        for _ in 0..50 {
+            let client = UnixStream::connect(path).expect("connect as subscriber");
+            let mut writer = client.try_clone().expect("clone stream");
+            write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+            let mut reader = BufReader::new(client);
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read snapshot")
+                .expect("connection should not close before snapshot");
+
+            let ServerMessage::Snapshot { logs, .. } = message else {
+                panic!("expected a Snapshot message, got {message:?}");
+            };
+            if logs.len() >= min_len {
+                return logs;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for at least {min_len} log entries");
+    }
+
+    /// Like `read_snapshot_until_nonempty`, but polls for up to 2s rather
+    /// than 200ms - long enough to outlast `READ_TIMEOUT` (500ms), for tests
+    /// that deliberately make a `ReportEvent` wait on a hung connection's
+    /// ticket before it can be applied.
+    fn read_snapshot_until_nonempty_outlasting_read_timeout(path: &PathBuf) -> Vec<AgentInfo> {
+        for _ in 0..200 {
+            let client = UnixStream::connect(path).expect("connect as subscriber");
+            let mut writer = client.try_clone().expect("clone stream");
+            write_message(&mut writer, &ClientMessage::Subscribe).expect("send subscribe");
+            let mut reader = BufReader::new(client);
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read snapshot")
+                .expect("connection should not close before snapshot");
+
+            let ServerMessage::Snapshot { agents, .. } = message else {
+                panic!("expected a Snapshot message, got {message:?}");
+            };
+            if !agents.is_empty() {
+                return agents;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Vec::new()
+    }
+
+    #[test]
+    fn next_ticket_is_strictly_increasing_in_call_order() {
+        let sequencer = EventSequencer::default();
+        let tickets: Vec<u64> = (0..50).map(|_| sequencer.next_ticket()).collect();
+        assert_eq!(tickets, (0..50).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn wait_for_turn_is_released_only_once_every_earlier_ticket_has_completed() {
+        let sequencer = EventSequencer::default();
+        let t0 = sequencer.next_ticket();
+        let t1 = sequencer.next_ticket();
+        let t2 = sequencer.next_ticket();
+
+        // t1 completes out of order, before t0 - a later waiter (t2) must
+        // still not be released until t0 also completes.
+        sequencer.complete(t1);
+
+        let released = Arc::new(Mutex::new(false));
+        let waiter_sequencer = sequencer.clone();
+        let waiter_released = released.clone();
+        let handle = thread::spawn(move || {
+            waiter_sequencer.wait_for_turn(t2);
+            *waiter_released.lock().unwrap() = true;
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !*released.lock().unwrap(),
+            "t2 must not be released while t0 has not completed, even though t1 already has"
+        );
+
+        sequencer.complete(t0);
+        handle.join().expect("waiter thread should not panic");
+        assert!(
+            *released.lock().unwrap(),
+            "t2 must be released once both t0 and t1 have completed"
+        );
+    }
+
+    #[test]
+    fn a_connection_accepted_first_is_applied_first_even_if_its_read_finishes_later() {
+        let (path, _notifier) = spawn_test_server("turnstile-order");
+
+        // Accepted first (ticket 0), but its message is deliberately not
+        // sent yet.
+        let mut reporter_a = UnixStream::connect(&path).expect("connect reporter A");
+        thread::sleep(Duration::from_millis(50));
+
+        // Accepted second (ticket 1) and sends - and so finishes reading -
+        // immediately, well before A does.
+        {
+            let mut reporter_b = UnixStream::connect(&path).expect("connect reporter B");
+            write_message(
+                &mut reporter_b,
+                &ClientMessage::ReportEvent { event: race_event("race-b", "/tmp/race-b", 502) },
+            )
+            .expect("send B's event");
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        write_message(
+            &mut reporter_a,
+            &ClientMessage::ReportEvent { event: race_event("race-a", "/tmp/race-a", 501) },
+        )
+        .expect("send A's event");
+
+        let logs = read_log_snapshot_until_at_least(&path, 2);
+        let started: Vec<&agentmon_proto::LogEntry> = logs
+            .iter()
+            .filter(|e| e.status == "started" && matches!(e.pid, Some(501) | Some(502)))
+            .collect();
+        assert_eq!(started.len(), 2, "expected both agents' started entries, got {logs:?}");
+        assert_eq!(
+            started[0].pid,
+            Some(501),
+            "the earlier-accepted connection (A) must be applied before the later one (B), got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_never_sends_a_message_does_not_block_a_later_reportevent() {
+        let (path, _notifier) = spawn_test_server("hung-connection");
+
+        // Accepted first (ticket 0), but never writes anything - its read
+        // must time out and release its ticket rather than blocking the
+        // ReportEvent below (ticket 1) forever.
+        let _hung = UnixStream::connect(&path).expect("connect hung reporter");
+        thread::sleep(Duration::from_millis(20));
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent { event: sample_event(AgentStatus::Running) },
+            )
+            .expect("send event");
+        }
+
+        let agents = read_snapshot_until_nonempty_outlasting_read_timeout(&path);
+        assert_eq!(agents.len(), 1, "the ReportEvent must eventually be applied, got {agents:?}");
+        assert_eq!(agents[0].status, AgentStatus::Running);
     }
 }

@@ -1,7 +1,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tui_input::backend::crossterm::EventHandler;
 
-use agentmon_proto::ClientMessage;
+use agentmon_proto::{ClientMessage, LogCategory};
 
 use crate::app::{App, Modal, ModalFocus, PageSizes, ReminderFormField, Tab};
 
@@ -60,6 +60,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputA
         return InputAction::Quit;
     }
 
+    // Checked ahead of `app.modal` so it takes priority when layered over
+    // the details modal's Logs pane (as well as when opened bare, from the
+    // Logs tab) - see the "Prompt entry full-text modal" requirement.
+    // Unlike `reminder_form`/`rename_form`, this is a read-only view (like
+    // `Modal::Help`), so - unlike those - it's checked after the `q` quit
+    // guard above, not before: `q` still quits while it's open.
+    if app.prompt_detail.is_some() {
+        return handle_prompt_detail_key(app, key);
+    }
+
     if app.modal.is_some() {
         return handle_modal_key(app, key, page_sizes);
     }
@@ -103,6 +113,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> InputA
         }
         Tab::Reminders => handle_reminders_tab_key(app, key.code, page_sizes.reminders_tab),
     }
+}
+
+/// Handles a key while the full-prompt modal is open - see `App::prompt_detail`
+/// and the "Prompt entry full-text modal" requirement. `Esc` closes it,
+/// returning to whatever was showing before (the Logs tab, or the details
+/// modal with its own state untouched); `j`/`k`/`Down`/`Up` scroll by one
+/// line; `g`/`G` jump to its start/end. Every other key (including `q`,
+/// handled ahead of this in `handle_key`) does nothing while it's open.
+fn handle_prompt_detail_key(app: &mut App, key: KeyEvent) -> InputAction {
+    match key.code {
+        KeyCode::Esc => app.close_prompt_detail(),
+        KeyCode::Char('j') | KeyCode::Down => app.scroll_prompt_detail(1),
+        KeyCode::Char('k') | KeyCode::Up => app.scroll_prompt_detail(-1),
+        KeyCode::Char('g') => app.jump_prompt_detail_to_start(),
+        KeyCode::Char('G') => app.jump_prompt_detail_to_end(),
+        _ => {}
+    }
+    InputAction::Continue
 }
 
 fn handle_agents_tab_key(app: &mut App, code: KeyCode) {
@@ -279,6 +307,26 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
                 KeyCode::Char('u') | KeyCode::PageUp => app.page_modal_logs(-1, page_sizes.modal_logs),
                 KeyCode::Char('g') => app.jump_modal_logs_to_start(page_sizes.modal_logs),
                 KeyCode::Char('G') => app.jump_modal_logs_to_end(page_sizes.modal_logs),
+                // Unlike the top-level Logs tab, `Enter` here otherwise does
+                // nothing - this only opens the full-prompt modal for a
+                // prompt-category entry, per the "Prompt entry full-text
+                // modal" requirement. Consistent regardless of whether the
+                // entry's displayed snippet happens to be truncated - the
+                // user shouldn't have to judge a row's length to know what
+                // `Enter` will do.
+                KeyCode::Enter => {
+                    if let Some(Modal::Details(cwd)) = &app.modal {
+                        let cwd = cwd.clone();
+                        let prompt = app
+                            .project_logs(&cwd)
+                            .get(app.modal_logs_pagination.selected)
+                            .filter(|entry| entry.category == LogCategory::Prompt)
+                            .and_then(|entry| entry.prompt.clone());
+                        if let Some(text) = prompt {
+                            app.open_prompt_detail(text);
+                        }
+                    }
+                }
                 _ => {}
             },
             ModalFocus::Reminders => match code {
@@ -918,6 +966,285 @@ mod tests {
         press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+    }
+
+    #[test]
+    fn enter_opens_the_details_modal_on_the_logs_tab_regardless_of_category_or_truncation() {
+        use agentmon_proto::{LogCategory, LogEntry};
+        use std::path::PathBuf;
+
+        // A truncated prompt-category entry is the case that matters most
+        // here - per the "Prompt entry full-text modal" requirement, the
+        // top-level Logs tab's `Enter` is unaffected by that requirement and
+        // always opens the project details modal, the same as any other
+        // entry; only the details modal's own Logs pane diverts for a
+        // truncated prompt entry.
+        let overlong = "a".repeat(crate::ui::PROMPT_SNIPPET_MAX_CHARS + 20);
+        let mut app = App::new();
+        app.set_tab(Tab::Logs);
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Prompt,
+            status: "submitted".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: Some(overlong),
+        }]);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+        assert_eq!(
+            app.prompt_detail, None,
+            "the full-prompt modal is never opened from the top-level Logs tab"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_full_prompt_modal_from_the_details_modals_logs_pane() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let overlong = "b".repeat(crate::ui::PROMPT_SNIPPET_MAX_CHARS + 20);
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Prompt,
+            status: "submitted".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: Some(overlong.clone()),
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+
+        press(&mut app, KeyCode::Enter); // selected entry is the truncated prompt entry
+
+        assert_eq!(
+            app.prompt_detail.as_ref().map(|d| d.text.as_str()),
+            Some(overlong.as_str()),
+            "Enter on a truncated prompt entry in the modal's Logs pane must open the full-prompt modal"
+        );
+        assert_eq!(
+            app.modal,
+            Some(Modal::Details(PathBuf::from("/tmp/a"))),
+            "the details modal underneath must stay open"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_full_prompt_modal_for_a_non_truncated_prompt_entry_too() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Prompt,
+            status: "submitted".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: Some("short prompt".to_string()),
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.prompt_detail.as_ref().map(|d| d.text.as_str()),
+            Some("short prompt"),
+            "Enter on a prompt entry must open the full-prompt modal consistently, even though its snippet was never truncated"
+        );
+        assert_eq!(
+            app.modal,
+            Some(Modal::Details(PathBuf::from("/tmp/a"))),
+            "the details modal underneath must stay open"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_non_prompt_entry_in_the_logs_pane_has_no_effect() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "done".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: None,
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.prompt_detail, None, "a non-prompt entry's Enter must not open the full-prompt modal");
+        assert_eq!(
+            app.modal,
+            Some(Modal::Details(PathBuf::from("/tmp/a"))),
+            "and must not do anything else either - the details modal underneath is simply unaffected"
+        );
+    }
+
+    #[test]
+    fn navigating_to_a_later_entry_in_an_unpaginated_logs_pane_still_targets_it_on_enter() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        // Two entries, both fitting on one page (well under any reasonable
+        // page size) - the pane never needs to paginate, but a line must
+        // still be selectable and `j`/`k` must still move which entry
+        // `Enter` acts on, per the "Project details modal" requirement's
+        // "single-page Logs pane still allows selecting its one entry"
+        // scenario (which generalizes to "any entry", not just the first).
+        let overlong = "c".repeat(crate::ui::PROMPT_SNIPPET_MAX_CHARS + 20);
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![
+            LogEntry {
+                working_dir: "/tmp/a".into(),
+                category: LogCategory::Prompt,
+                status: "submitted".to_string(),
+                occurred_at_ms: 2, // most recent - selected by default (index 0)
+                pid: Some(1),
+                reminder_name: None,
+                reminder_due_at_ms: None,
+                prompt: Some("short prompt".to_string()),
+            },
+            LogEntry {
+                working_dir: "/tmp/a".into(),
+                category: LogCategory::Prompt,
+                status: "submitted".to_string(),
+                occurred_at_ms: 1, // older - index 1, reached by one `j`
+                pid: Some(1),
+                reminder_name: None,
+                reminder_due_at_ms: None,
+                prompt: Some(overlong.clone()),
+            },
+        ]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused
+        assert_eq!(app.modal_logs_pagination.selected, 0);
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.modal_logs_pagination.selected, 1, "j must move the selection even though the pane isn't paginated");
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.prompt_detail.as_ref().map(|d| d.text.as_str()),
+            Some(overlong.as_str()),
+            "Enter must act on the entry j just moved to, not the default first entry"
+        );
+    }
+
+    #[test]
+    fn prompt_detail_closes_on_escape_and_returns_to_the_logs_tab() {
+        let mut app = App::new();
+        app.set_tab(Tab::Logs);
+        app.open_prompt_detail("Fix the flaky test".to_string());
+
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.prompt_detail, None);
+        assert_eq!(app.active_tab, Tab::Logs);
+    }
+
+    #[test]
+    fn q_still_quits_while_prompt_detail_is_open() {
+        let mut app = App::new();
+        app.open_prompt_detail("Fix the flaky test".to_string());
+
+        let action = press(&mut app, KeyCode::Char('q'));
+
+        assert_eq!(action, InputAction::Quit);
+    }
+
+    #[test]
+    fn j_k_g_shift_g_scroll_prompt_detail() {
+        let mut app = App::new();
+        app.open_prompt_detail("text".to_string());
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 2);
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 1);
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, u16::MAX);
+
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 0);
     }
 
     #[test]

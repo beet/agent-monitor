@@ -223,6 +223,23 @@ pub struct ReminderForm {
     pub field: ReminderFormField,
 }
 
+/// The full-prompt modal's in-progress state, when open - see the "Prompt
+/// entry full-text modal" requirement. Layers on top of whatever is
+/// currently showing (the Logs tab, or the details modal and its own
+/// selection) the same way `ReminderForm`/`confirm_delete_reminder` layer on
+/// top of `Modal::Details`, rather than being a `Modal` variant itself -
+/// it must be reachable whether or not a `Modal` is already open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptDetail {
+    pub text: String,
+    /// How many wrapped lines have been scrolled past. Not clamped here -
+    /// `App` doesn't know the modal's rendered width/height, so rendering
+    /// clamps this to the text's actual wrapped line count instead (see
+    /// `ui::render_prompt_detail_modal`); `jump_prompt_detail_to_end` relies
+    /// on this by setting it to `u16::MAX`.
+    pub scroll: u16,
+}
+
 /// The project rename form's in-progress state - see the "Project rename
 /// form" requirement. Reachable from the Agents tab with no modal open, or
 /// from inside the details modal; either way `cwd` is the project being
@@ -351,6 +368,8 @@ pub struct App {
     pub project_names: HashMap<PathBuf, String>,
     /// The project rename form, when open.
     pub rename_form: Option<RenameForm>,
+    /// The full-prompt modal, when open - see `PromptDetail`.
+    pub prompt_detail: Option<PromptDetail>,
 }
 
 impl App {
@@ -383,6 +402,7 @@ impl App {
             pending_new_reminder: None,
             project_names: HashMap::new(),
             rename_form: None,
+            prompt_detail: None,
         }
     }
 
@@ -656,6 +676,44 @@ impl App {
         self.modal = None;
         self.reminder_form = None;
         self.confirm_delete_reminder = None;
+    }
+
+    /// Opens the full-prompt modal showing `text` in full, scrolled to its
+    /// start - see the "Prompt entry full-text modal" requirement. Leaves
+    /// `modal` (and everything else) untouched, so closing it returns to
+    /// exactly whatever was showing before.
+    pub fn open_prompt_detail(&mut self, text: String) {
+        self.prompt_detail = Some(PromptDetail { text, scroll: 0 });
+    }
+
+    pub fn close_prompt_detail(&mut self) {
+        self.prompt_detail = None;
+    }
+
+    /// Scrolls the open full-prompt modal by `delta` lines (negative scrolls
+    /// up). A no-op if it isn't open. Not clamped to the text's actual
+    /// wrapped line count - see `PromptDetail::scroll`.
+    pub fn scroll_prompt_detail(&mut self, delta: isize) {
+        let Some(detail) = &mut self.prompt_detail else { return };
+        detail.scroll = if delta < 0 {
+            detail.scroll.saturating_sub(delta.unsigned_abs() as u16)
+        } else {
+            detail.scroll.saturating_add(delta as u16)
+        };
+    }
+
+    pub fn jump_prompt_detail_to_start(&mut self) {
+        if let Some(detail) = &mut self.prompt_detail {
+            detail.scroll = 0;
+        }
+    }
+
+    /// Jumps to the end - `u16::MAX`, relying on rendering to clamp it down
+    /// to the text's actual last page (see `PromptDetail::scroll`).
+    pub fn jump_prompt_detail_to_end(&mut self) {
+        if let Some(detail) = &mut self.prompt_detail {
+            detail.scroll = u16::MAX;
+        }
     }
 
     /// Toggles which of the details modal's Logs/Reminders panes currently
@@ -1912,6 +1970,75 @@ mod tests {
 
         app.close_modal();
         assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn prompt_detail_opens_and_closes() {
+        let mut app = App::new();
+
+        app.open_prompt_detail("Fix the flaky test".to_string());
+        assert_eq!(
+            app.prompt_detail,
+            Some(PromptDetail { text: "Fix the flaky test".to_string(), scroll: 0 })
+        );
+
+        app.close_prompt_detail();
+        assert_eq!(app.prompt_detail, None);
+    }
+
+    #[test]
+    fn opening_and_closing_prompt_detail_leaves_other_state_untouched() {
+        let mut app = App::new();
+        app.set_tab(Tab::Logs);
+        app.open_details_modal();
+        let modal_before = app.modal.clone();
+        let logs_selected_before = app.logs_pagination.selected;
+
+        app.open_prompt_detail("Fix the flaky test".to_string());
+        assert_eq!(app.modal, modal_before, "opening prompt_detail must not disturb an already-open modal");
+
+        app.close_prompt_detail();
+        assert_eq!(app.modal, modal_before, "closing prompt_detail must not disturb the modal underneath it");
+        assert_eq!(app.logs_pagination.selected, logs_selected_before);
+    }
+
+    #[test]
+    fn scroll_prompt_detail_moves_up_and_down_without_underflow() {
+        let mut app = App::new();
+        app.open_prompt_detail("text".to_string());
+
+        app.scroll_prompt_detail(-1);
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 0, "must not underflow below 0");
+
+        app.scroll_prompt_detail(3);
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 3);
+
+        app.scroll_prompt_detail(-1);
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 2);
+    }
+
+    #[test]
+    fn jump_prompt_detail_to_start_and_end() {
+        let mut app = App::new();
+        app.open_prompt_detail("text".to_string());
+        app.scroll_prompt_detail(5);
+
+        app.jump_prompt_detail_to_start();
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, 0);
+
+        app.jump_prompt_detail_to_end();
+        assert_eq!(app.prompt_detail.as_ref().unwrap().scroll, u16::MAX);
+    }
+
+    #[test]
+    fn scrolling_or_jumping_with_no_prompt_detail_open_is_a_no_op() {
+        let mut app = App::new();
+
+        app.scroll_prompt_detail(1);
+        app.jump_prompt_detail_to_start();
+        app.jump_prompt_detail_to_end();
+
+        assert_eq!(app.prompt_detail, None);
     }
 
     #[test]

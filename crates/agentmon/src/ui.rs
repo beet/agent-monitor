@@ -14,7 +14,7 @@ use std::path::Path;
 use agentmon_proto::{AgentInfo, AgentStatus, LogEntry, ReminderInfo, ReminderStatus, TestRunInfo, TestRunStatus};
 
 use crate::app::{
-    needs_pagination, App, ConnectionStatus, DirectoryGroup, LogSort, Modal, ModalFocus, PageSizes,
+    needs_pagination, App, ConnectionStatus, DirectoryGroup, LogSort, Modal, ModalFocus, PageSizes, PromptDetail,
     ReminderFormField, ReminderFormMode, ReminderSort, Tab,
 };
 
@@ -100,7 +100,43 @@ fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) -> PageSizes 
         render_rename_form(frame, form);
     }
 
+    // Drawn last, on top of everything else - the Logs tab, the details
+    // modal, or the rename form - since it can be opened from either of the
+    // first two. See the "Prompt entry full-text modal" requirement.
+    if let Some(detail) = &app.prompt_detail {
+        render_prompt_detail_modal(frame, detail);
+    }
+
     PageSizes { logs_tab, modal_logs, reminders_tab, modal_reminders }
+}
+
+/// Renders the full-prompt modal: `detail`'s text, word-wrapped to the
+/// modal's width, scrolled by `detail.scroll` wrapped lines (clamped here to
+/// the text's actual last page, since `App` doesn't know the modal's
+/// rendered width/height - see `PromptDetail::scroll`). Read-only, like
+/// `Modal::Help` - no selection, just `Esc` to close and `j`/`k`/`g`/`G` to
+/// scroll.
+fn render_prompt_detail_modal(frame: &mut Frame, detail: &PromptDetail) {
+    let area = centered_rect(80, 80, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title("Full Prompt  (Esc: close, j/k: scroll, g/G: top/bottom)")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(area);
+
+    let all_lines = wrap_text(&detail.text, inner.width as usize);
+    let max_scroll = all_lines.len().saturating_sub(inner.height as usize) as u16;
+    let scroll = detail.scroll.min(max_scroll);
+    let visible: Vec<Line> = all_lines
+        .into_iter()
+        .skip(scroll as usize)
+        .take(inner.height as usize)
+        .map(Line::from)
+        .collect();
+
+    frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
 /// Renders an explicit tab bar so the Agents/Logs split - and that `Tab`
@@ -441,11 +477,14 @@ fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status:
             };
             (format!("⏰ reminder {status}"), Style::new().fg(color))
         }
-        // The one category with no status-specific color: a prompt entry
-        // has exactly one status ("submitted"), so there is nothing for a
-        // color to distinguish it from - per the "Status is visually
-        // distinguishable" requirement's prompt-category marker.
-        agentmon_proto::LogCategory::Prompt => ("🗣️ prompt submitted".to_string(), Style::new()),
+        // The one category with no category/status word at all: a prompt
+        // entry's label is its snippet (appended by `log_entry_status_line`)
+        // directly after this marker - the entry's single, always-"submitted"
+        // status carries no information a word could usefully add, and the
+        // marker alone (plus the Logs tab's own CATEGORY column) already
+        // identifies it - per the "Status labels are prefixed by category
+        // outside dedicated panes" requirement's prompt-category exception.
+        agentmon_proto::LogCategory::Prompt => ("🗣️".to_string(), Style::new()),
     }
 }
 
@@ -514,17 +553,22 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
         };
         text.push_str(&formatted);
     }
+    // A prompt-category entry's snippet *is* its label - appended directly
+    // after the 🗣️ marker, with no separator or quotes, since there is no
+    // other status/category text for it to follow - per the "Logs tab shows
+    // an aggregated, paginated activity list" requirement. A prompt entry
+    // always carries one, since that's the event that produced it.
+    if entry.category == agentmon_proto::LogCategory::Prompt {
+        if let Some(prompt) = &entry.prompt {
+            text.push_str(&prompt_snippet(prompt));
+        }
+    }
     // A reminder of what this agent was asked to do, for an agent-category
     // entry recorded with a prompt snapshot - see the activity-log
     // capability's "Activity log captures notification-worthy events"
     // requirement. No snippet for entries recorded with none (e.g. an agent
-    // first tracked via `PreToolUse`, before any `UserPromptSubmit`). A
-    // prompt-category entry always carries one, since that's the event that
-    // produced it.
-    if matches!(
-        entry.category,
-        agentmon_proto::LogCategory::Agent | agentmon_proto::LogCategory::Prompt
-    ) {
+    // first tracked via `PreToolUse`, before any `UserPromptSubmit`).
+    if entry.category == agentmon_proto::LogCategory::Agent {
         if let Some(prompt) = &entry.prompt {
             text.push_str(&format!(" — \"{}\"", prompt_snippet(prompt)));
         }
@@ -537,9 +581,9 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
 /// are collapsed to spaces (a multi-line prompt must still read as one
 /// line), and anything beyond `PROMPT_SNIPPET_MAX_CHARS` is cut with a
 /// trailing `...` rather than overflowing the row.
-const PROMPT_SNIPPET_MAX_CHARS: usize = 50;
+pub(crate) const PROMPT_SNIPPET_MAX_CHARS: usize = 50;
 
-fn prompt_snippet(prompt: &str) -> String {
+pub(crate) fn prompt_snippet(prompt: &str) -> String {
     let flattened: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if flattened.chars().count() <= PROMPT_SNIPPET_MAX_CHARS {
         return flattened;
@@ -807,12 +851,15 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
         .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
         .block(logs_block);
 
-    // The highlight, like the scrollbar and heading hint, only appears once
-    // pagination is actually needed - a project whose activity fits on one
-    // page renders exactly as it did before this pane could scroll. The
-    // highlight additionally requires this pane to hold focus, now that the
-    // Reminders pane can hold it instead.
-    let selected = if paginated && matches!(app.modal_focus, ModalFocus::Logs) {
+    // Unlike the scrollbar and heading hint (which only appear once
+    // pagination is actually needed), the highlight is shown whenever this
+    // pane has an entry to select - even a project with too few entries to
+    // paginate needs a selected row, so `Enter` has something to act on
+    // (e.g. opening the full-prompt modal for a truncated prompt entry; see
+    // the "Prompt entry full-text modal" requirement). The highlight still
+    // requires this pane to hold focus, now that the Reminders pane can hold
+    // it instead.
+    let selected = if !project_logs.is_empty() && matches!(app.modal_focus, ModalFocus::Logs) {
         Some(app.modal_logs_pagination.display_selected(project_logs.len()))
     } else {
         None
@@ -868,7 +915,27 @@ fn render_last_prompt_pane(frame: &mut Frame, group: &Option<DirectoryGroup>, ar
 /// returned is truncated with a trailing `...` whenever wrapping produced
 /// more than `height` lines, so truncation is visible instead of silent.
 fn wrap_prompt(text: &str, width: usize, height: usize) -> Vec<String> {
-    if width == 0 || height == 0 {
+    if height == 0 {
+        return Vec::new();
+    }
+    let lines = wrap_text(text, width);
+
+    if lines.len() <= height {
+        return lines;
+    }
+    let mut visible: Vec<String> = lines.into_iter().take(height).collect();
+    if let Some(last) = visible.last_mut() {
+        *last = truncate_text_with_ellipsis(last, width);
+    }
+    visible
+}
+
+/// Word-wraps `text` to `width` display columns, treating embedded newlines
+/// as paragraph breaks, with no limit on the number of lines returned -
+/// shared by `wrap_prompt` (which additionally caps and truncates) and the
+/// full-prompt modal (which scrolls through every line instead of capping).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
         return Vec::new();
     }
     let mut lines: Vec<String> = Vec::new();
@@ -889,15 +956,7 @@ fn wrap_prompt(text: &str, width: usize, height: usize) -> Vec<String> {
         }
         lines.push(current);
     }
-
-    if lines.len() <= height {
-        return lines;
-    }
-    let mut visible: Vec<String> = lines.into_iter().take(height).collect();
-    if let Some(last) = visible.last_mut() {
-        *last = truncate_text_with_ellipsis(last, width);
-    }
-    visible
+    lines
 }
 
 /// Truncates `text` to fit within `max_width` display columns followed by a
@@ -3028,7 +3087,7 @@ mod tests {
     }
 
     #[test]
-    fn details_modal_logs_pane_shows_no_selection_scrollbar_or_hint_when_entries_fit_on_one_page() {
+    fn details_modal_logs_pane_shows_no_scrollbar_or_hint_when_entries_fit_on_one_page() {
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
@@ -3046,15 +3105,36 @@ mod tests {
         let text = buffer_text(&term);
         assert!(!text.contains('▲'), "no scrollbar expected when entries fit on one page, got:\n{text}");
         assert!(!text.contains("Page [d/u]"), "no pagination hint expected when entries fit on one page, got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_logs_pane_still_shows_a_selection_when_entries_fit_on_one_page() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![log_entry(
+            "/Users/beet/project",
+            agentmon_proto::LogCategory::Agent,
+            "done",
+            0,
+        )]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let mut any_highlighted = false;
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
-                assert_ne!(
-                    buffer[(x, y)].bg,
-                    SELECTED_ROW_BG,
-                    "no row should be highlighted in the Logs pane when it isn't paginated"
-                );
+                if buffer[(x, y)].bg == SELECTED_ROW_BG {
+                    any_highlighted = true;
+                }
             }
         }
+        assert!(
+            any_highlighted,
+            "the Logs pane's one entry must still be highlighted and selectable even though it isn't paginated, so Enter has something to act on"
+        );
     }
 
     #[test]
@@ -4623,7 +4703,10 @@ mod tests {
         let (text, style) =
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Prompt, "submitted");
 
-        assert_eq!(text, "🗣️ prompt submitted");
+        assert_eq!(
+            text, "🗣️",
+            "a prompt entry's marker carries no category or status word, unlike every other category"
+        );
         assert_eq!(
             style,
             Style::new(),
@@ -4632,7 +4715,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_entry_always_shows_its_submitted_text() {
+    fn a_prompt_entry_shows_its_snippet_unprefixed_and_unquoted() {
         let entry = LogEntry {
             prompt: Some("Fix the flaky test".to_string()),
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
@@ -4640,9 +4723,25 @@ mod tests {
 
         let (text, _style) = log_entry_status_line(&[], &entry);
 
+        assert_eq!(
+            text, "🗣️Fix the flaky test",
+            "expected the marker directly followed by the unquoted prompt text, with no \"prompt submitted\" wording"
+        );
+    }
+
+    #[test]
+    fn a_long_prompt_entry_is_truncated_with_no_quotes() {
+        let overlong = "a".repeat(PROMPT_SNIPPET_MAX_CHARS + 20);
+        let entry = LogEntry {
+            prompt: Some(overlong),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry);
+
         assert!(
-            text.contains("\"Fix the flaky test\""),
-            "expected the prompt entry's own submitted text, got: {text}"
+            text.ends_with("...") && !text.contains('"'),
+            "expected a truncated, unquoted snippet, got: {text}"
         );
     }
 
@@ -4964,5 +5063,56 @@ mod tests {
 
         let text = buffer_text(&term);
         assert!(text.contains("Rename Project"), "got:\n{text}");
+    }
+
+    #[test]
+    fn prompt_detail_modal_shows_the_full_text_and_its_hint() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        let overlong = "word ".repeat(PROMPT_SNIPPET_MAX_CHARS); // far longer than the Logs tab's snippet cap
+        app.open_prompt_detail(overlong.clone());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("word word word"), "expected the full prompt text, got:\n{text}");
+        assert!(text.contains("Esc"), "expected the close hint, got:\n{text}");
+    }
+
+    #[test]
+    fn prompt_detail_modal_renders_as_an_overlay_on_the_details_modal() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+        app.open_prompt_detail("Fix the flaky test".to_string());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Fix the flaky test"), "got:\n{text}");
+        // The details modal underneath is still part of the frame, not
+        // replaced - e.g. its Agents pane heading is still drawn.
+        assert!(text.contains("Agents"), "expected the details modal still drawn underneath, got:\n{text}");
+    }
+
+    #[test]
+    fn prompt_detail_modal_scrolls_past_its_first_page() {
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        let lines: Vec<String> = (0..50).map(|i| format!("line{i}")).collect();
+        app.open_prompt_detail(lines.join("\n"));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let first_page = buffer_text(&term);
+        assert!(first_page.contains("line0"), "expected the start visible before scrolling, got:\n{first_page}");
+
+        app.jump_prompt_detail_to_end();
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let last_page = buffer_text(&term);
+        assert!(last_page.contains("line49"), "expected the end visible after jumping to it, got:\n{last_page}");
+        assert!(!last_page.contains("line0\n"), "expected the start scrolled out of view, got:\n{last_page}");
     }
 }
