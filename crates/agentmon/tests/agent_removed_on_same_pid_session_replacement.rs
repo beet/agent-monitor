@@ -29,7 +29,7 @@ use ratatui::Terminal;
 
 struct NoopNotifier;
 impl Notifier for NoopNotifier {
-    fn notify(&self, _agent: &AgentInfo) {}
+    fn notify(&self, _agent: &AgentInfo, _project_name: &str) {}
 }
 
 fn unique_socket_path(tag: &str) -> PathBuf {

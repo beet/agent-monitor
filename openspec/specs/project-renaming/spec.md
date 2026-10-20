@@ -8,7 +8,7 @@ Lets the user attach a custom display name to a project (its working directory),
 
 ### Requirement: Custom project display name
 
-The daemon SHALL allow a client to assign a custom display name to a project, identified by its working directory. Once assigned, the custom name SHALL be used as that project's display name everywhere the daemon or a connected client refers to it, in place of the directory-derived default name, until the project is renamed again or the daemon restarts. Resubmitting a project's own current display name (whether its custom name or, if never renamed, its default) SHALL succeed as a no-op.
+The daemon SHALL allow a client to assign a custom display name to a project, identified by its working directory. Once assigned, the custom name SHALL be used as that project's display name everywhere the daemon or a connected client refers to it, in place of the directory-derived default name, until the project is renamed again or the daemon restarts. Resubmitting a project's own current display name (whether its custom name or, if never renamed, its default) SHALL succeed as a no-op. This includes desktop notifications the daemon sends about the project, not only client-rendered views.
 
 #### Scenario: A project with no custom name uses its directory-derived default
 
@@ -29,6 +29,11 @@ The daemon SHALL allow a client to assign a custom display name to a project, id
 
 - **WHEN** a client assigns a project the display name it already currently has
 - **THEN** the daemon accepts it without changing anything observable
+
+#### Scenario: Desktop notifications use the effective display name
+
+- **WHEN** the daemon sends a desktop notification about a project (an agent status change, a test-run start/pass/fail, or a reminder firing)
+- **THEN** the notification text names the project using its effective display name (its custom name if one has been assigned, otherwise its directory-derived default), not the raw working-directory path
 
 ### Requirement: Rename validation
 

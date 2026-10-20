@@ -120,7 +120,8 @@ impl Ingestor {
             });
         }
         if should_notify(outcome.previous_status, outcome.agent.status) {
-            self.notifier.notify(&outcome.agent);
+            let project_name = self.registry.project_name(&outcome.agent.cwd);
+            self.notifier.notify(&outcome.agent, &project_name);
             self.record_log(LogEntry {
                 working_dir: outcome.agent.cwd.clone(),
                 category: LogCategory::Agent,
@@ -142,7 +143,8 @@ impl Ingestor {
     /// session is heard on its own.
     pub fn ingest_test_run(&self, cwd: PathBuf, pid: u32, status: TestRunStatus) -> TestRunInfo {
         let test_run = self.registry.upsert_test_run(cwd, pid, status);
-        self.notifier.notify_test_run(&test_run.cwd, status);
+        let project_name = self.registry.project_name(&test_run.cwd);
+        self.notifier.notify_test_run(&project_name, status);
         self.record_log(LogEntry {
             working_dir: test_run.cwd.clone(),
             category: LogCategory::TestRun,
@@ -226,7 +228,8 @@ impl Ingestor {
     /// elapsed): sends its completion notification and logs a "finished"
     /// entry carrying its current name.
     pub fn ingest_reminder_completed(&self, reminder: &ReminderInfo) {
-        self.notifier.notify_reminder(&reminder.cwd, &reminder.name);
+        let project_name = self.registry.project_name(&reminder.cwd);
+        self.notifier.notify_reminder(&project_name, &reminder.name);
         self.record_log(LogEntry {
             working_dir: reminder.cwd.clone(),
             category: LogCategory::Reminder,
@@ -348,27 +351,27 @@ mod tests {
     #[derive(Default)]
     struct RecordingNotifier {
         calls: Mutex<Vec<AgentInfo>>,
-        test_run_calls: Mutex<Vec<(PathBuf, TestRunStatus)>>,
-        reminder_calls: Mutex<Vec<(PathBuf, String)>>,
+        test_run_calls: Mutex<Vec<(String, TestRunStatus)>>,
+        reminder_calls: Mutex<Vec<(String, String)>>,
     }
 
     impl Notifier for RecordingNotifier {
-        fn notify(&self, agent: &AgentInfo) {
+        fn notify(&self, agent: &AgentInfo, _project_name: &str) {
             self.calls.lock().unwrap().push(agent.clone());
         }
 
-        fn notify_test_run(&self, cwd: &std::path::Path, status: TestRunStatus) {
+        fn notify_test_run(&self, project_name: &str, status: TestRunStatus) {
             self.test_run_calls
                 .lock()
                 .unwrap()
-                .push((cwd.to_path_buf(), status));
+                .push((project_name.to_string(), status));
         }
 
-        fn notify_reminder(&self, cwd: &std::path::Path, name: &str) {
+        fn notify_reminder(&self, project_name: &str, name: &str) {
             self.reminder_calls
                 .lock()
                 .unwrap()
-                .push((cwd.to_path_buf(), name.to_string()));
+                .push((project_name.to_string(), name.to_string()));
         }
     }
 
@@ -543,7 +546,7 @@ mod tests {
 
         assert_eq!(
             notifier.test_run_calls.lock().unwrap().as_slice(),
-            [(PathBuf::from("/tmp/project"), TestRunStatus::Failed)],
+            [("project".to_string(), TestRunStatus::Failed)],
             "a tracked agent in the directory must not suppress the test-run notification"
         );
     }
@@ -558,7 +561,7 @@ mod tests {
 
         assert_eq!(
             notifier.test_run_calls.lock().unwrap().as_slice(),
-            [(PathBuf::from("/tmp/project"), TestRunStatus::Passed)]
+            [("project".to_string(), TestRunStatus::Passed)]
         );
     }
 
@@ -571,7 +574,7 @@ mod tests {
 
         assert_eq!(
             notifier.test_run_calls.lock().unwrap().as_slice(),
-            [(PathBuf::from("/tmp/project"), TestRunStatus::Running)]
+            [("project".to_string(), TestRunStatus::Running)]
         );
     }
 
@@ -592,10 +595,10 @@ mod tests {
         assert_eq!(
             calls.as_slice(),
             [
-                (PathBuf::from("/tmp/project"), TestRunStatus::Running),
-                (PathBuf::from("/tmp/project"), TestRunStatus::Failed),
-                (PathBuf::from("/tmp/project"), TestRunStatus::Running),
-                (PathBuf::from("/tmp/project"), TestRunStatus::Failed),
+                ("project".to_string(), TestRunStatus::Running),
+                ("project".to_string(), TestRunStatus::Failed),
+                ("project".to_string(), TestRunStatus::Running),
+                ("project".to_string(), TestRunStatus::Failed),
             ],
             "each lifecycle event must notify independently, got: {calls:?}"
         );

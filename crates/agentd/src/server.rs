@@ -304,19 +304,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingNotifier {
         calls: Mutex<Vec<AgentInfo>>,
-        reminder_calls: Mutex<Vec<(PathBuf, String)>>,
+        reminder_calls: Mutex<Vec<(String, String)>>,
     }
 
     impl Notifier for RecordingNotifier {
-        fn notify(&self, agent: &AgentInfo) {
+        fn notify(&self, agent: &AgentInfo, _project_name: &str) {
             self.calls.lock().unwrap().push(agent.clone());
         }
 
-        fn notify_reminder(&self, cwd: &std::path::Path, name: &str) {
+        fn notify_reminder(&self, project_name: &str, name: &str) {
             self.reminder_calls
                 .lock()
                 .unwrap()
-                .push((cwd.to_path_buf(), name.to_string()));
+                .push((project_name.to_string(), name.to_string()));
         }
     }
 
