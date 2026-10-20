@@ -1,0 +1,13 @@
+## 1. Logs tab column order and width
+
+- [x] 1.1 In `crates/agentmon/src/ui.rs`'s `render_logs_tab`, reorder the header `Row` to `["STATUS", "CATEGORY", "PROJECT", "TIME"]` and reorder the per-entry `Row::new([...])` fields to match (status cell first, then category, then project, then time), and verify `cargo test -p agentmon` builds and the header-order assertions (see task 1.4) pass.
+- [x] 1.2 Replace the `widths` array's static `Constraint::Fill(2)` / `Constraint::Fill(1)` pair for PROJECT/STATUS with content-based sizing for PROJECT (reusing the `content_need`/`str_width` helpers `render_agent_table` already uses, floored at the "PROJECT" header's width and capped at half of the width available to PROJECT and STATUS combined) and give STATUS the remaining width after CATEGORY, TIME, and PROJECT are accounted for; verify by rendering a narrow and a wide terminal buffer and asserting STATUS gets more width than it did before, and PROJECT never exceeds its cap.
+- [x] 1.3 Keep the existing `status_width` resolution (used to size prompt/snippet truncation) working against the STATUS column's new resolved width, verifying the existing narrow/wide STATUS-column snippet tests (around the `"expected a narrow terminal's STATUS column..."` assertions) still pass once updated for the new column order.
+- [x] 1.4 Update existing tests in `crates/agentmon/src/ui.rs` that assert the Logs tab's header text or column order (e.g. the test asserting `"PROJECT"` is present) to reflect the new `STATUS, CATEGORY, PROJECT, TIME` order, and add a test asserting STATUS renders as the first (leftmost) column.
+- [x] 1.5 Add a test exercising a long/custom project name (e.g. via a renamed project) alongside a short one, verifying the PROJECT column widens to fit the longer name up to its cap and that STATUS still gets the remaining width rather than a fixed ratio.
+- [x] 1.6 Add a test verifying that when every displayed project name is short, the PROJECT column shrinks to content and STATUS receives the freed-up width (i.e. STATUS's rendered width is not fixed at a hardcoded ratio of the table).
+
+## 2. Verification
+
+- [x] 2.1 Run the full `agentmon` test suite (`cargo test -p agentmon`) and confirm all Logs tab tests pass with the new column order and width rules.
+- [x] 2.2 Run the app via the `run` skill or manually (with an isolated `HOME`, per existing manual-testing practice) and visually confirm: STATUS is leftmost in the Logs tab, a renamed project with a long custom name widens PROJECT without starving STATUS below half the available width, and opening the details modal from a Logs-tab row still shows status/prompt text in the margin to its left.

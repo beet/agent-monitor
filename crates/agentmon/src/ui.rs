@@ -310,16 +310,10 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
 /// see the "Logs tab shows an aggregated, paginated activity list" and
 /// "Logs tab supports sorting and filtering" requirements.
 fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) -> usize {
-    let header = Row::new(["PROJECT", "CATEGORY", "STATUS", "TIME"]).style(Style::new().bold());
+    let header = Row::new(["STATUS", "CATEGORY", "PROJECT", "TIME"]).style(Style::new().bold());
 
     let entries = app.visible_logs();
-
-    let widths = [
-        Constraint::Fill(2),
-        Constraint::Length(10),
-        Constraint::Fill(1),
-        Constraint::Length(22),
-    ];
+    let project_texts: Vec<String> = entries.iter().map(|e| app.project_name(&e.working_dir)).collect();
 
     // Computed from the un-titled block so a page is however many data rows
     // (the header row aside) actually fit in the pane at the current
@@ -328,29 +322,59 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let inner = bare_block.inner(area);
     let page_size = inner.height.saturating_sub(1) as usize;
 
-    // Resolves the STATUS column's actual rendered width before building row
-    // text, so a prompt-category entry's snippet (and an agent-category
-    // entry's trailing last-prompt snippet) is sized against it instead of a
-    // fixed character count - mirrors `render_agent_table`'s reservation of
-    // the `"> "` highlight symbol's width (shown whenever `entries` is
-    // non-empty, same as this table's own selection below) and the column
-    // spacing ratatui's `Table` uses by default.
+    // Mirrors `render_agent_table`'s reservation of the `"> "` highlight
+    // symbol's width (shown whenever `entries` is non-empty, same as this
+    // table's own selection below) and the column spacing ratatui's `Table`
+    // uses by default.
     let selection_width: u16 = if entries.is_empty() { 0 } else { 2 };
     const COLUMN_SPACING: u16 = 1;
+    const CATEGORY_WIDTH: u16 = 10;
+    const TIME_WIDTH: u16 = 22;
     let columns_area = Rect {
         x: inner.x + selection_width,
         width: inner.width.saturating_sub(selection_width),
         ..inner
     };
-    let columns = Layout::horizontal(widths).spacing(COLUMN_SPACING).split(columns_area);
-    let status_width = columns[2].width as usize;
 
-    let rows = entries.iter().map(|entry| {
+    // PROJECT is sized to the widest currently-displayed project name
+    // (floored at its own header, same as `content_need` floors every
+    // dynamic column in `render_agent_table`) and capped at half of the
+    // width available to PROJECT and STATUS combined, so one unusually long
+    // custom project name can't squeeze STATUS down to nothing. STATUS then
+    // gets whatever's left over, so it - not PROJECT - gets priority for
+    // extra room and is the last of the two to have its content truncated,
+    // per the "Logs tab shows an aggregated, paginated activity list"
+    // requirement.
+    let available_for_dynamic = columns_area
+        .width
+        .saturating_sub(COLUMN_SPACING * 3)
+        .saturating_sub(CATEGORY_WIDTH)
+        .saturating_sub(TIME_WIDTH);
+    let project_cap = (available_for_dynamic / 2).max(1);
+    let project_need =
+        content_need(project_texts.iter().map(String::as_str).map(str_width), "PROJECT").min(project_cap);
+    let status_need = available_for_dynamic.saturating_sub(project_need);
+
+    let widths = [
+        Constraint::Length(status_need),
+        Constraint::Length(CATEGORY_WIDTH),
+        Constraint::Length(project_need),
+        Constraint::Length(TIME_WIDTH),
+    ];
+
+    // Resolves the STATUS column's actual rendered width before building row
+    // text, so a prompt-category entry's snippet (and an agent-category
+    // entry's trailing last-prompt snippet) is sized against it instead of a
+    // fixed character count.
+    let columns = Layout::horizontal(widths).spacing(COLUMN_SPACING).split(columns_area);
+    let status_width = columns[0].width as usize;
+
+    let rows = entries.iter().zip(project_texts.iter()).map(|(entry, project_text)| {
         let (status_text, status_style) = log_entry_status_line(&app.logs, entry, status_width);
         Row::new([
-            Cell::from(app.project_name(&entry.working_dir)),
-            Cell::from(log_category_label(entry.category)),
             Cell::from(Span::styled(status_text, status_style)),
+            Cell::from(log_category_label(entry.category)),
+            Cell::from(project_text.clone()),
             Cell::from(format_last_updated(entry.occurred_at_ms)),
         ])
     });
@@ -3017,6 +3041,118 @@ mod tests {
         assert!(
             wide_text.contains(&prompt),
             "expected a wide terminal's STATUS column to show the full, untruncated prompt, got:\n{wide_text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_header_orders_status_leftmost_then_category_then_project_then_time() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "done", 1_000)]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (status_x, status_y) = find_text(buffer, "STATUS").expect("STATUS header should render");
+        let (category_x, category_y) = find_text(buffer, "CATEGORY").expect("CATEGORY header should render");
+        let (project_x, project_y) = find_text(buffer, "PROJECT").expect("PROJECT header should render");
+        let (time_x, time_y) = find_text(buffer, "TIME").expect("TIME header should render");
+
+        assert_eq!(status_y, category_y, "all four headers should be on the same row");
+        assert_eq!(status_y, project_y, "all four headers should be on the same row");
+        assert_eq!(status_y, time_y, "all four headers should be on the same row");
+        assert!(status_x < category_x, "STATUS should render to the left of CATEGORY, got:\n{}", buffer_text(&term));
+        assert!(category_x < project_x, "CATEGORY should render to the left of PROJECT, got:\n{}", buffer_text(&term));
+        assert!(project_x < time_x, "PROJECT should render to the left of TIME, got:\n{}", buffer_text(&term));
+    }
+
+    #[test]
+    fn logs_tab_project_column_widens_for_a_long_custom_project_name() {
+        let mut term = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        let long_name = "this-is-a-very-long-custom-project-display-name";
+        app.apply_project_names_snapshot(vec![agentmon_proto::ProjectName {
+            cwd: PathBuf::from("/tmp/project"),
+            name: long_name.to_string(),
+        }]);
+        app.apply_log_snapshot(vec![log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains(long_name),
+            "expected the full custom project name to render on a wide terminal, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_short_project_names_leave_more_room_for_status() {
+        // Regression test: previously PROJECT reserved a fixed 2x share of
+        // the table regardless of how little space its (typically short)
+        // content actually needed, leaving STATUS - which often carries a
+        // longer status/duration/snippet - truncated sooner than necessary.
+        // With content-based sizing, a short project name frees that space
+        // up for STATUS to use instead.
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        let prompt = "short words";
+        app.apply_log_snapshot(vec![LogEntry {
+            prompt: Some(prompt.to_string()),
+            ..log_entry("/tmp/a", agentmon_proto::LogCategory::Prompt, "submitted", 0)
+        }]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            text.contains(prompt),
+            "expected the full prompt snippet to fit once the short project name freed up STATUS's space, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn logs_tab_unusually_long_project_name_does_not_starve_status() {
+        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        let long_name = "a".repeat(60);
+        app.apply_project_names_snapshot(vec![agentmon_proto::ProjectName {
+            cwd: PathBuf::from("/tmp/project"),
+            name: long_name.clone(),
+        }]);
+        app.apply_log_snapshot(vec![log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains(&long_name),
+            "an oversized project name should be clipped rather than rendered in full, got:\n{text}"
+        );
+        assert!(
+            text.contains("done"),
+            "STATUS should still render its content rather than being starved by the long project name, got:\n{text}"
+        );
+
+        let buffer = term.backend().buffer();
+        let (status_x, _) = find_text(buffer, "STATUS").expect("STATUS header should render");
+        let (category_x, _) = find_text(buffer, "CATEGORY").expect("CATEGORY header should render");
+        let (project_x, _) = find_text(buffer, "PROJECT").expect("PROJECT header should render");
+        let (time_x, _) = find_text(buffer, "TIME").expect("TIME header should render");
+        const COLUMN_SPACING: u16 = 1;
+        let status_width = category_x - status_x - COLUMN_SPACING;
+        let project_width = time_x - project_x - COLUMN_SPACING;
+        assert!(
+            project_width <= status_width,
+            "PROJECT (width {project_width}) should be capped at half of the combined width, no wider than STATUS (width {status_width})"
         );
     }
 
