@@ -4,7 +4,7 @@ use agentmon_proto::default_socket_path;
 use agentmon_report::debug_log::log;
 use agentmon_report::host_context::{detect_host_context, parent_pid};
 use agentmon_report::install_hooks::{default_settings_path, install_hooks};
-use agentmon_report::report::{read_and_build_event, send_event};
+use agentmon_report::report::{connect, read_and_build_event, send_on};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -54,6 +54,19 @@ fn run_report() {
     };
     log(&format!("host_context={host_context:?} pid={pid}"));
 
+    // Connects before reading stdin, not after: the daemon applies events in
+    // the order their connections are accepted, so this process must claim
+    // its place in that order before doing any payload-size-dependent work -
+    // see report::connect's doc comment.
+    let mut stream = match connect(&default_socket_path()) {
+        Ok(stream) => stream,
+        Err(err) => {
+            log(&format!("could not reach agentd: {err}"));
+            eprintln!("agentmon-report: could not reach agentd, skipping: {err}");
+            return;
+        }
+    };
+
     let event = match read_and_build_event(io::stdin(), host_context, pid) {
         Ok(Some(event)) => event,
         Ok(None) => {
@@ -73,7 +86,7 @@ fn run_report() {
         event.cwd.display()
     ));
 
-    match send_event(&default_socket_path(), &event) {
+    match send_on(&mut stream, &event) {
         Ok(()) => log("sent event to agentd"),
         Err(err) => {
             log(&format!("could not reach agentd: {err}"));

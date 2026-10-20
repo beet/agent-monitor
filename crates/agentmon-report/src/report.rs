@@ -51,12 +51,34 @@ pub fn read_and_build_event(
     Ok(build_event(&payload, host_context, pid))
 }
 
-/// Sends `event` to the daemon at `socket_path`. Bounded by `SEND_TIMEOUT` so
-/// a hung or unreachable daemon can never make a hook wait indefinitely.
-pub fn send_event(socket_path: &Path, event: &AgentEvent) -> std::io::Result<()> {
-    let mut stream = UnixStream::connect(socket_path)?;
+/// Opens a connection to the daemon at `socket_path`, bounded by
+/// `SEND_TIMEOUT`. Callers (`main.rs::run_report`) MUST call this before
+/// reading/parsing their hook payload from stdin, not after: the daemon
+/// applies `ReportEvent`s in the order their connections are accepted, and a
+/// `UserPromptSubmit` payload (carrying the full prompt text) takes
+/// measurably longer to read and parse than a `PreToolUse` payload's
+/// handful of fields - connecting only after that work would let the
+/// smaller, later-fired event's connection reach the daemon first, even
+/// though Claude Code invoked the larger payload's hook first. See the
+/// agent-daemon spec's "Local socket ingestion API" requirement.
+pub fn connect(socket_path: &Path) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(socket_path)?;
     stream.set_write_timeout(Some(SEND_TIMEOUT))?;
-    write_message(&mut stream, &ClientMessage::ReportEvent { event: event.clone() })
+    Ok(stream)
+}
+
+/// Sends `event` over an already-open connection (see `connect`).
+pub fn send_on(stream: &mut UnixStream, event: &AgentEvent) -> std::io::Result<()> {
+    write_message(stream, &ClientMessage::ReportEvent { event: event.clone() })
+}
+
+/// Connects to the daemon at `socket_path` and sends `event` in one call.
+/// Equivalent to `connect` followed by `send_on` - convenient when, unlike
+/// `run_report`, there is no slower payload-building step that needs to
+/// happen between opening the connection and sending on it.
+pub fn send_event(socket_path: &Path, event: &AgentEvent) -> std::io::Result<()> {
+    let mut stream = connect(socket_path)?;
+    send_on(&mut stream, event)
 }
 
 #[cfg(test)]
@@ -65,8 +87,9 @@ mod tests {
     use agentmon_proto::{read_message, AgentStatus};
     use std::io::BufReader;
     use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_socket_path(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -173,6 +196,67 @@ mod tests {
             }
             other => panic!("expected ReportEvent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_slow_payload_read_does_not_delay_opening_the_connection() {
+        let path = unique_socket_path("slow-payload");
+        let listener = UnixListener::bind(&path).expect("bind mock listener");
+
+        let accepted_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let accepted_at_clone = accepted_at.clone();
+        let listener_handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept connection");
+            *accepted_at_clone.lock().unwrap() = Some(Instant::now());
+        });
+
+        // Mirrors `run_report`'s order: connect first...
+        let _stream = connect(&path).expect("connect should succeed promptly");
+        let connected_at = Instant::now();
+
+        // ...then read/parse a deliberately slow payload (standing in for a
+        // large `UserPromptSubmit` prompt taking measurably longer to read
+        // than a small `PreToolUse` payload would).
+        struct SlowReader;
+        impl Read for SlowReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                thread::sleep(Duration::from_millis(200));
+                Ok(0)
+            }
+        }
+        let _ = read_and_build_event(SlowReader, HostContext::Terminal, 1);
+
+        listener_handle.join().expect("listener thread should not panic");
+        let accepted_at = accepted_at.lock().unwrap().unwrap();
+        assert!(
+            accepted_at.duration_since(connected_at) < Duration::from_millis(50),
+            "the daemon must accept the connection promptly, not after the slow payload read"
+        );
+    }
+
+    #[test]
+    fn a_connection_with_no_message_sent_closes_cleanly() {
+        let path = unique_socket_path("no-message-sent");
+        let listener = UnixListener::bind(&path).expect("bind mock listener");
+
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept connection");
+            let mut reader = BufReader::new(stream);
+            read_message::<_, ClientMessage>(&mut reader)
+        });
+
+        {
+            // Simulates a parse failure/no-trackable-event outcome after
+            // connecting (see `run_report`): the stream is dropped without
+            // ever calling `send_on`.
+            let _stream = connect(&path).expect("connect should succeed");
+        }
+
+        let result = handle.join().expect("listener thread should not panic");
+        assert!(
+            matches!(result, Ok(None)),
+            "a connection closed with no message sent must read as a clean EOF, not an error, got: {result:?}"
+        );
     }
 
     #[test]

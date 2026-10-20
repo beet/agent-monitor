@@ -979,7 +979,7 @@ mod tests {
         // always opens the project details modal, the same as any other
         // entry; only the details modal's own Logs pane diverts for a
         // truncated prompt entry.
-        let overlong = "a".repeat(crate::ui::PROMPT_SNIPPET_MAX_CHARS + 20);
+        let overlong = "a".repeat(200); // deliberately far longer than any realistic column width
         let mut app = App::new();
         app.set_tab(Tab::Logs);
         app.apply_log_snapshot(vec![LogEntry {
@@ -1007,7 +1007,7 @@ mod tests {
         use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
         use std::path::PathBuf;
 
-        let overlong = "b".repeat(crate::ui::PROMPT_SNIPPET_MAX_CHARS + 20);
+        let overlong = "b".repeat(200); // deliberately far longer than any realistic column width
         let mut app = App::new();
         app.apply_snapshot(
             vec![AgentInfo {
@@ -1152,7 +1152,7 @@ mod tests {
         // `Enter` acts on, per the "Project details modal" requirement's
         // "single-page Logs pane still allows selecting its one entry"
         // scenario (which generalizes to "any entry", not just the first).
-        let overlong = "c".repeat(crate::ui::PROMPT_SNIPPET_MAX_CHARS + 20);
+        let overlong = "c".repeat(200); // deliberately far longer than any realistic column width
         let mut app = App::new();
         app.apply_snapshot(
             vec![AgentInfo {

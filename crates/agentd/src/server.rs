@@ -1352,6 +1352,37 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_closed_immediately_with_no_message_does_not_block_a_later_reportevent() {
+        let (path, _notifier) = spawn_test_server("closed-connection");
+
+        // Accepted first (ticket 0), immediately closed without ever writing
+        // a message - simulates `agentmon-report` connecting, then failing
+        // to parse/build a trackable event, and dropping the connection (see
+        // the agent-daemon spec's "A connection that never sends a message
+        // is dropped without blocking others" scenario).
+        {
+            let _closed = UnixStream::connect(&path).expect("connect then immediately drop");
+        }
+
+        {
+            let mut reporter = UnixStream::connect(&path).expect("connect reporter");
+            write_message(
+                &mut reporter,
+                &ClientMessage::ReportEvent { event: sample_event(AgentStatus::Running) },
+            )
+            .expect("send event");
+        }
+
+        // Uses the short-timeout snapshot helper (not the one that outlasts
+        // `READ_TIMEOUT`) - a cleanly closed connection must release its
+        // ticket immediately, not only after the full read timeout elapses
+        // like a genuinely hung connection does.
+        let agents = read_snapshot_until_nonempty(&path);
+        assert_eq!(agents.len(), 1, "the ReportEvent must be applied promptly, got {agents:?}");
+        assert_eq!(agents[0].status, AgentStatus::Running);
+    }
+
+    #[test]
     fn a_connection_that_never_sends_a_message_does_not_block_a_later_reportevent() {
         let (path, _notifier) = spawn_test_server("hung-connection");
 

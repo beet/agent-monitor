@@ -313,15 +313,6 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let header = Row::new(["PROJECT", "CATEGORY", "STATUS", "TIME"]).style(Style::new().bold());
 
     let entries = app.visible_logs();
-    let rows = entries.iter().map(|entry| {
-        let (status_text, status_style) = log_entry_status_line(&app.logs, entry);
-        Row::new([
-            Cell::from(app.project_name(&entry.working_dir)),
-            Cell::from(log_category_label(entry.category)),
-            Cell::from(Span::styled(status_text, status_style)),
-            Cell::from(format_last_updated(entry.occurred_at_ms)),
-        ])
-    });
 
     let widths = [
         Constraint::Fill(2),
@@ -336,6 +327,33 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let bare_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
     let inner = bare_block.inner(area);
     let page_size = inner.height.saturating_sub(1) as usize;
+
+    // Resolves the STATUS column's actual rendered width before building row
+    // text, so a prompt-category entry's snippet (and an agent-category
+    // entry's trailing last-prompt snippet) is sized against it instead of a
+    // fixed character count - mirrors `render_agent_table`'s reservation of
+    // the `"> "` highlight symbol's width (shown whenever `entries` is
+    // non-empty, same as this table's own selection below) and the column
+    // spacing ratatui's `Table` uses by default.
+    let selection_width: u16 = if entries.is_empty() { 0 } else { 2 };
+    const COLUMN_SPACING: u16 = 1;
+    let columns_area = Rect {
+        x: inner.x + selection_width,
+        width: inner.width.saturating_sub(selection_width),
+        ..inner
+    };
+    let columns = Layout::horizontal(widths).spacing(COLUMN_SPACING).split(columns_area);
+    let status_width = columns[2].width as usize;
+
+    let rows = entries.iter().map(|entry| {
+        let (status_text, status_style) = log_entry_status_line(&app.logs, entry, status_width);
+        Row::new([
+            Cell::from(app.project_name(&entry.working_dir)),
+            Cell::from(log_category_label(entry.category)),
+            Cell::from(Span::styled(status_text, status_style)),
+            Cell::from(format_last_updated(entry.occurred_at_ms)),
+        ])
+    });
 
     let controls = logs_controls_hint(app, entries.len(), page_size);
     let title = match banner {
@@ -527,8 +545,11 @@ fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option
 /// visible the same way it already is on the Agents tab - see
 /// `log_completion_duration_ms`. The name comes before the ETA/duration
 /// (e.g. "reminder finished: Check the build 10m", "reminder started: Check
-/// the build, ETA: 10:45 AM"), reading as a single "what, when/how long" phrase.
-fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
+/// the build, ETA: 10:45 AM"), reading as a single "what, when/how long"
+/// phrase. `snippet_max_width` bounds a prompt-category entry's own snippet
+/// and an agent-category entry's trailing last-prompt snippet - see
+/// `prompt_snippet`.
+fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_width: usize) -> (String, Style) {
     let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
     // Carries the reminder's name as of this event, so a later-deleted
     // reminder's past entries keep showing it - per the "A deleted
@@ -553,24 +574,37 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
         };
         text.push_str(&formatted);
     }
-    // A prompt-category entry's snippet *is* its label - appended directly
-    // after the 🗣️ marker, with no separator or quotes, since there is no
-    // other status/category text for it to follow - per the "Logs tab shows
-    // an aggregated, paginated activity list" requirement. A prompt entry
-    // always carries one, since that's the event that produced it.
+    // A prompt-category entry's snippet *is* its label - appended after the
+    // 🗣️ marker with a single separating space (no quotes), since there is
+    // no other status/category text for it to follow - per the "Logs tab
+    // shows an aggregated, paginated activity list" requirement. A prompt
+    // entry always carries one, since that's the event that produced it.
+    // `snippet_max_width` is the whole label's budget, not the snippet
+    // alone, so the already-emitted marker's own display width (it's a
+    // double-width emoji) is subtracted first - otherwise the snippet could
+    // still end up wider than the column has room for, pushing its own
+    // trailing `...` past the edge where ratatui would silently clip it
+    // rather than the ellipsis ever being visible.
     if entry.category == agentmon_proto::LogCategory::Prompt {
         if let Some(prompt) = &entry.prompt {
-            text.push_str(&prompt_snippet(prompt));
+            use unicode_width::UnicodeWidthStr;
+            let budget = snippet_max_width.saturating_sub(text.width() + 1);
+            text.push_str(&format!(" {}", prompt_snippet(prompt, budget)));
         }
     }
     // A reminder of what this agent was asked to do, for an agent-category
     // entry recorded with a prompt snapshot - see the activity-log
     // capability's "Activity log captures notification-worthy events"
     // requirement. No snippet for entries recorded with none (e.g. an agent
-    // first tracked via `PreToolUse`, before any `UserPromptSubmit`).
+    // first tracked via `PreToolUse`, before any `UserPromptSubmit`). Same
+    // reasoning as the prompt-category branch above: the budget passed to
+    // `prompt_snippet` accounts for everything already in `text` plus this
+    // decoration's own width (` — "` before the snippet, `"` after it).
     if entry.category == agentmon_proto::LogCategory::Agent {
         if let Some(prompt) = &entry.prompt {
-            text.push_str(&format!(" — \"{}\"", prompt_snippet(prompt)));
+            use unicode_width::UnicodeWidthStr;
+            let budget = snippet_max_width.saturating_sub(text.width() + 5);
+            text.push_str(&format!(" — \"{}\"", prompt_snippet(prompt, budget)));
         }
     }
     (text, style)
@@ -579,16 +613,31 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry) -> (String, St
 /// Caps how much of a log entry's recorded prompt the Logs tab/pane shows
 /// inline, per the "truncated, single-line snippet" requirement: newlines
 /// are collapsed to spaces (a multi-line prompt must still read as one
-/// line), and anything beyond `PROMPT_SNIPPET_MAX_CHARS` is cut with a
-/// trailing `...` rather than overflowing the row.
-pub(crate) const PROMPT_SNIPPET_MAX_CHARS: usize = 50;
-
-pub(crate) fn prompt_snippet(prompt: &str) -> String {
+/// line), and anything beyond `max_width` display columns is cut with a
+/// trailing `...` rather than overflowing the row. `max_width` is the
+/// caller's actual rendered column/pane width (resolved the same way
+/// `truncate_line`'s callers resolve theirs), not a fixed character count,
+/// so a wider terminal shows more of the prompt; `0` means "not yet known,"
+/// treated as no limit, matching `truncate_line`'s own convention. Measured
+/// in display width, not char count, consistent with `truncate_line` - an
+/// emoji elsewhere in the row must not throw off this budget.
+pub(crate) fn prompt_snippet(prompt: &str, max_width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let flattened: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flattened.chars().count() <= PROMPT_SNIPPET_MAX_CHARS {
+    if max_width == 0 || flattened.width() <= max_width {
         return flattened;
     }
-    let mut snippet: String = flattened.chars().take(PROMPT_SNIPPET_MAX_CHARS).collect();
+    let budget = max_width.saturating_sub(3);
+    let mut snippet = String::new();
+    let mut remaining = budget;
+    for c in flattened.chars() {
+        let w = c.width().unwrap_or(0);
+        if w > remaining {
+            break;
+        }
+        snippet.push(c);
+        remaining -= w;
+    }
     snippet.push_str("...");
     snippet
 }
@@ -596,8 +645,8 @@ pub(crate) fn prompt_snippet(prompt: &str) -> String {
 /// Appends `entry`'s reporting process id to an already-built status line,
 /// for agent-category entries only - used by the details modal's Logs pane,
 /// which shows pid where the top-level Logs tab does not.
-fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry) -> (String, Style) {
-    let (mut text, style) = log_entry_status_line(all_logs, entry);
+fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_width: usize) -> (String, Style) {
+    let (mut text, style) = log_entry_status_line(all_logs, entry, snippet_max_width);
     if entry.category == agentmon_proto::LogCategory::Agent {
         if let Some(pid) = entry.pid {
             text.push_str(&format!("  pid {pid}"));
@@ -817,13 +866,31 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     let reminders_page_size = render_reminders_pane(frame, app, cwd, reminders_area);
 
     let project_logs = app.project_logs(cwd);
+    let logs_widths = [Constraint::Fill(1), Constraint::Length(22)];
+
+    // No header row in this pane (per the "Project details modal"
+    // requirement), so every visible row is content - unlike the Logs tab,
+    // whose header eats one row of its page size.
+    let bare_logs_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let logs_inner = bare_logs_block.inner(logs_area);
+    let logs_page_size = logs_inner.height as usize;
+
+    // Resolves the content column's actual rendered width before building
+    // row text, the same way the top-level Logs tab does, so a prompt or
+    // agent entry's snippet is sized against it instead of a fixed character
+    // count. No highlight-symbol reservation needed - unlike the Logs tab,
+    // this table never calls `.highlight_symbol(...)`, same as
+    // `render_reminders_pane`.
+    let logs_columns = Layout::horizontal(logs_widths).spacing(1).split(logs_inner);
+    let logs_status_width = logs_columns[0].width as usize;
+
     let logs_rows: Vec<Row> = if project_logs.is_empty() {
         vec![Row::new([Cell::from("No activity"), Cell::from("")])]
     } else {
         project_logs
             .iter()
             .map(|entry| {
-                let (status_text, style) = log_entry_line_with_pid(&app.logs, entry);
+                let (status_text, style) = log_entry_line_with_pid(&app.logs, entry, logs_status_width);
                 let prefix = log_entry_tree_prefix(entry.category);
                 Row::new([
                     Cell::from(Line::from(vec![
@@ -835,14 +902,6 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
             })
             .collect()
     };
-    let logs_widths = [Constraint::Fill(1), Constraint::Length(22)];
-
-    // No header row in this pane (per the "Project details modal"
-    // requirement), so every visible row is content - unlike the Logs tab,
-    // whose header eats one row of its page size.
-    let bare_logs_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
-    let logs_inner = bare_logs_block.inner(logs_area);
-    let logs_page_size = logs_inner.height as usize;
     let paginated = needs_pagination(project_logs.len(), logs_page_size);
     let logs_title = if paginated { "Logs  |  Page [d/u]  Top/Bottom [g/G]" } else { "Logs" };
     let logs_block = bare_logs_block.title(logs_title);
@@ -2923,6 +2982,45 @@ mod tests {
     }
 
     #[test]
+    fn a_wider_terminal_shows_more_of_a_prompt_entrys_snippet_in_the_logs_tab() {
+        // Flattened with single spaces - long enough to overflow a narrow
+        // terminal's STATUS column but comfortably fit a wide one.
+        let prompt = vec!["word"; 15].join(" ");
+        let build_app = |prompt: &str| {
+            let mut app = App::new();
+            app.apply_snapshot(Vec::new(), Vec::new());
+            app.set_tab(crate::app::Tab::Logs);
+            app.apply_log_snapshot(vec![LogEntry {
+                prompt: Some(prompt.to_string()),
+                ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
+            }]);
+            app
+        };
+
+        let mut narrow = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let narrow_app = build_app(&prompt);
+        narrow.draw(|frame| { render(frame, &narrow_app); }).unwrap();
+        let narrow_text = buffer_text(&narrow);
+        assert!(
+            narrow_text.contains("..."),
+            "expected a narrow terminal's STATUS column to truncate the prompt, got:\n{narrow_text}"
+        );
+        assert!(
+            !narrow_text.contains(&prompt),
+            "the narrow terminal must not fit the full prompt, got:\n{narrow_text}"
+        );
+
+        let mut wide = Terminal::new(TestBackend::new(400, 10)).unwrap();
+        let wide_app = build_app(&prompt);
+        wide.draw(|frame| { render(frame, &wide_app); }).unwrap();
+        let wide_text = buffer_text(&wide);
+        assert!(
+            wide_text.contains(&prompt),
+            "expected a wide terminal's STATUS column to show the full, untruncated prompt, got:\n{wide_text}"
+        );
+    }
+
+    #[test]
     fn the_agents_column_never_renders_a_started_label() {
         // "started" is a one-time log event, not an ongoing AgentStatus, so
         // it must never appear as a live status in the Agents tab/pane -
@@ -2976,6 +3074,43 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains('🤖'), "got:\n{text}");
         assert!(text.contains("agent started"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_wider_terminal_shows_more_of_a_prompt_entrys_snippet_in_the_details_modals_logs_pane() {
+        let prompt = vec!["word"; 15].join(" ");
+        let build_app = |prompt: &str| {
+            let mut app = App::new();
+            app.apply_snapshot(Vec::new(), Vec::new());
+            app.apply_log_snapshot(vec![LogEntry {
+                prompt: Some(prompt.to_string()),
+                ..log_entry("/Users/beet/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
+            }]);
+            app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+            app
+        };
+
+        let mut narrow = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        let narrow_app = build_app(&prompt);
+        narrow.draw(|frame| { render(frame, &narrow_app); }).unwrap();
+        let narrow_text = buffer_text(&narrow);
+        assert!(
+            narrow_text.contains("..."),
+            "expected a narrow modal's Logs pane to truncate the prompt, got:\n{narrow_text}"
+        );
+        assert!(
+            !narrow_text.contains(&prompt),
+            "the narrow modal must not fit the full prompt, got:\n{narrow_text}"
+        );
+
+        let mut wide = Terminal::new(TestBackend::new(400, 30)).unwrap();
+        let wide_app = build_app(&prompt);
+        wide.draw(|frame| { render(frame, &wide_app); }).unwrap();
+        let wide_text = buffer_text(&wide);
+        assert!(
+            wide_text.contains(&prompt),
+            "expected a wide modal's Logs pane to show the full, untruncated prompt, got:\n{wide_text}"
+        );
     }
 
     #[test]
@@ -4587,7 +4722,7 @@ mod tests {
             prompt: None,
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert!(text.contains('⏰'), "got: {text}");
         assert!(text.contains("Check the build"), "got: {text}");
@@ -4610,7 +4745,7 @@ mod tests {
     fn a_finished_reminder_shows_its_elapsed_duration() {
         let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("finished", "Check the build", 600_000)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1]);
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1], 0);
 
         assert!(text.contains("10m"), "expected the elapsed duration, got: {text}");
         assert!(!text.contains("10m00s"), "reminder durations should drop trailing 00s, got: {text}");
@@ -4620,7 +4755,7 @@ mod tests {
     fn a_stopped_reminder_shows_its_elapsed_duration() {
         let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("stopped", "Check the build", 83_000)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1]);
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1], 0);
 
         assert!(text.contains("1m23s"), "expected the elapsed duration, got: {text}");
     }
@@ -4629,7 +4764,7 @@ mod tests {
     fn a_started_reminder_shows_no_duration() {
         let all_logs = vec![reminder_log("started", "Check the build", 0)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[0]);
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[0], 0);
 
         assert_eq!(
             text, "⏰ reminder started: Check the build",
@@ -4650,7 +4785,7 @@ mod tests {
             prompt: None,
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert_eq!(
             text,
@@ -4666,7 +4801,7 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert!(
             text.contains("\"Fix the flaky test\""),
@@ -4678,7 +4813,7 @@ mod tests {
     fn an_agent_entry_with_no_recorded_prompt_shows_no_snippet() {
         let entry = log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0);
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert!(!text.contains('"'), "expected no prompt snippet, got: {text}");
     }
@@ -4693,7 +4828,7 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::TestRun, "failed", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert!(!text.contains('"'), "expected no prompt snippet on a non-agent entry, got: {text}");
     }
@@ -4715,29 +4850,30 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_entry_shows_its_snippet_unprefixed_and_unquoted() {
+    fn a_prompt_entry_shows_its_snippet_separated_by_a_space_and_unquoted() {
         let entry = LogEntry {
             prompt: Some("Fix the flaky test".to_string()),
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert_eq!(
-            text, "🗣️Fix the flaky test",
-            "expected the marker directly followed by the unquoted prompt text, with no \"prompt submitted\" wording"
+            text, "🗣️ Fix the flaky test",
+            "expected the marker, a single space, then the unquoted prompt text, with no \"prompt submitted\" wording"
         );
     }
 
     #[test]
     fn a_long_prompt_entry_is_truncated_with_no_quotes() {
-        let overlong = "a".repeat(PROMPT_SNIPPET_MAX_CHARS + 20);
+        const SNIPPET_MAX_WIDTH: usize = 50;
+        let overlong = "a".repeat(SNIPPET_MAX_WIDTH + 20);
         let entry = LogEntry {
             prompt: Some(overlong),
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
 
         assert!(
             text.ends_with("...") && !text.contains('"'),
@@ -4747,13 +4883,14 @@ mod tests {
 
     #[test]
     fn a_long_prompt_is_truncated_with_a_trailing_ellipsis() {
-        let overlong = "a".repeat(PROMPT_SNIPPET_MAX_CHARS + 20);
+        const SNIPPET_MAX_WIDTH: usize = 50;
+        let overlong = "a".repeat(SNIPPET_MAX_WIDTH + 20);
         let entry = LogEntry {
             prompt: Some(overlong),
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
 
         assert!(text.contains("...\""), "expected the snippet to end with an ellipsis, got: {text}");
     }
@@ -4765,7 +4902,7 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry);
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
 
         assert!(
             text.contains("\"Fix the flaky test in CI\""),
@@ -4777,7 +4914,7 @@ mod tests {
     fn a_stopped_or_finished_reminder_still_shows_duration_not_an_eta() {
         let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("stopped", "Check the build", 83_000)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1]);
+        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1], 0);
 
         assert!(text.contains("1m23s"), "expected the elapsed duration, got: {text}");
         assert!(!text.contains("ETA"), "a stopped entry should not show an ETA, got: {text}");
@@ -4795,8 +4932,8 @@ mod tests {
             reminder_log("finished", "First", 600_000),
         ];
 
-        let (first_text, _) = log_entry_status_line(&all_logs, &all_logs[3]);
-        let (second_text, _) = log_entry_status_line(&all_logs, &all_logs[2]);
+        let (first_text, _) = log_entry_status_line(&all_logs, &all_logs[3], 0);
+        let (second_text, _) = log_entry_status_line(&all_logs, &all_logs[2], 0);
 
         assert!(first_text.contains("10m"), "First ran for 10m (600_000ms from t=0), got: {first_text}");
         assert!(second_text.contains("1m"), "Second ran for 1m (60_000ms from t=10_000), got: {second_text}");
@@ -5070,7 +5207,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(Vec::new(), Vec::new());
-        let overlong = "word ".repeat(PROMPT_SNIPPET_MAX_CHARS); // far longer than the Logs tab's snippet cap
+        let overlong = "word ".repeat(50); // far longer than the modal's visible height
         app.open_prompt_detail(overlong.clone());
 
         term.draw(|frame| { render(frame, &app); }).unwrap();

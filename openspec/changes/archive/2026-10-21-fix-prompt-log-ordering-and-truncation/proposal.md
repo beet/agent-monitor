@@ -1,0 +1,24 @@
+## Why
+
+A previous change (`improve-prompt-log-entries`) tried to guarantee that a prompt-category log entry always sorts ahead of the agent-category "started" entry it precipitates, by having the daemon apply `ReportEvent` connections in accept order. In practice the "started" entry still consistently renders ahead of the "user prompt" entry: the daemon's accept order itself is wrong, because `agentmon-report` fully reads and parses its hook payload from stdin *before* it opens the socket connection, and a `UserPromptSubmit` payload (carrying the full prompt text) measurably takes longer to read/parse than a `PreToolUse` payload's handful of fields - so the smaller, later-fired event's connection routinely reaches the daemon's accept loop first, regardless of which hook Claude Code actually invoked first. The existing accept-order-preserving fix cannot correct an accept order that was already wrong going in.
+
+Separately, two rendering defects ship alongside this: a prompt-category log entry's 🗣️ marker is immediately followed by its snippet with no separating space, and every prompt snippet (on prompt-category entries and on the agent "started"/"done" entries that carry a last-prompt snapshot) is capped at a fixed 50-character constant regardless of how much width the Logs tab's STATUS column or the details modal's Logs pane actually has available, leaving most of a wide terminal's column unused instead of showing more of the prompt.
+
+## What Changes
+
+- **`agentmon-report` connects to the daemon before reading/parsing its hook payload.** `run_report` (`crates/agentmon-report/src/main.rs`) and `send_event`/`read_and_build_event` (`crates/agentmon-report/src/report.rs`) currently read all of stdin and parse it into an `AgentEvent` first, then open a `UnixStream` and send. Reordering this so the connection opens (claiming the daemon's accept-order ticket) immediately, before the slower stdin read/parse work, makes accept order track true hook-invocation order instead of payload-size-dependent read/parse latency - closing the gap the daemon-side ticketing from `improve-prompt-log-entries` could not reach on its own. A payload that turns out to be malformed or produces no trackable event closes the connection without sending anything, which the daemon already handles (a connection that closes before a message arrives is a no-op, same as today).
+- **A prompt-category log entry's marker is followed by a space before its snippet.** `🗣️<snippet>` becomes `🗣️ <snippet>`, in both the Logs tab and the details modal's Logs pane.
+- **Prompt snippets use the actual rendered column width instead of a fixed 50-character cap.** `PROMPT_SNIPPET_MAX_CHARS` is a constant applied before either renderer knows how wide its STATUS column actually is; this affects the dedicated prompt-category entry's snippet and the trailing snippet an agent "started"/"done" entry shows for its last-prompt snapshot, in both the Logs tab (STATUS column, `Constraint::Fill(1)`) and the details modal's Logs pane (`status_width`, already resolved via `Layout::horizontal(...).split(...)` for its own `truncate_line` call). The snippet should be sized to (and truncated against) that real width, the same way the Reminders pane and Agents tab columns already do via `truncate_line`, rather than an arbitrary fixed character count.
+
+## Capabilities
+
+### Modified Capabilities
+
+- `agent-daemon`: the "Local socket ingestion API" requirement's ordering guarantee is tightened to state that a reporting client's connection must be opened before it performs any payload-size-dependent work, since the daemon's accept-order ticketing can only preserve an order that is already correct.
+- `agent-monitor-tui`: the "Logs tab shows an aggregated, paginated activity list" and "Status labels are prefixed by category outside dedicated panes" requirements' prompt-entry scenarios change from "🗣️ followed directly by" the snippet to "🗣️, a space, then" the snippet; the same two requirements' snippet-truncation language (for prompt entries and for an agent entry's trailing last-prompt snippet) changes from an implicit fixed-length truncation to explicit truncation against the entry's actual rendered column/pane width.
+
+## Impact
+
+- `crates/agentmon-report/src/main.rs`, `crates/agentmon-report/src/report.rs` - connect-before-read ordering for `ReportEvent`.
+- `crates/agentmon/src/ui.rs` - `log_status_cell_text_and_style`'s `LogCategory::Prompt` arm (adds the space), `log_entry_status_line` (prompt and agent snippet assembly), `prompt_snippet` (takes a width instead of a fixed constant), `render_logs_tab` (resolve the STATUS column's actual width the same way the details modal already does, and pass it through).
+- No wire/protocol changes (`agentmon-proto`) - the event shape is unchanged, only when `agentmon-report` opens its connection relative to reading stdin.
