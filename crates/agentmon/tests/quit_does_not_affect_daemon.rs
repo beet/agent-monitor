@@ -59,6 +59,7 @@ fn quitting_a_tui_client_does_not_affect_the_daemon_or_its_tracked_agents() {
                 pid: std::process::id(),
                 status: AgentStatus::Running,
                 prompt: None,
+                fired_at_ms: 1_700_000_000_000,
             },
         },
     )

@@ -43,6 +43,10 @@ fn unique_socket_path(tag: &str) -> PathBuf {
     dir.join("s")
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
 fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
     let buffer = terminal.backend().buffer();
     let mut text = String::new();
@@ -79,6 +83,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
                 pid,
                 status: AgentStatus::Running,
                 prompt: None,
+                fired_at_ms: now_ms(),
             },
         },
     )
@@ -111,6 +116,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
                 pid,
                 status: AgentStatus::Running,
                 prompt: None,
+                fired_at_ms: now_ms(),
             },
         },
     )

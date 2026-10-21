@@ -189,10 +189,17 @@ impl Registry {
             }
         }
 
-        let now = now_ms();
+        // Every timestamp this upsert sets comes from the triggering event's
+        // own `fired_at_ms` - the time its reporting client captured the
+        // underlying hook firing - rather than this daemon's own
+        // processing-time clock, so recorded/displayed order reflects true
+        // hook-fire order regardless of connection accept or processing
+        // order. See the agent-daemon spec's "Local socket ingestion API"
+        // and "Agent registry" requirements.
+        let fired_at_ms = event.fired_at_ms;
         let status_since_ms = match &previous {
             Some(agent) if agent.status == event.status => agent.status_since_ms,
-            _ => now,
+            _ => fired_at_ms,
         };
         // Resets on every transition into "running" - including from "done" -
         // rather than only at entry creation or pid replacement, since one
@@ -200,9 +207,11 @@ impl Registry {
         // over the life of a session (unlike a test run's pid-scoped
         // `run_started_ms`, where a new pid *is* a new run).
         let run_started_ms = match &previous {
-            Some(agent) if agent.status != AgentStatus::Running && event.status == AgentStatus::Running => now,
+            Some(agent) if agent.status != AgentStatus::Running && event.status == AgentStatus::Running => {
+                fired_at_ms
+            }
             Some(agent) => agent.run_started_ms,
-            None => now,
+            None => fired_at_ms,
         };
         // An event only carries prompt text when it's derived from a
         // `UserPromptSubmit` hook event; every other event leaves the
@@ -220,7 +229,7 @@ impl Registry {
             host_context: event.host_context,
             pid: event.pid,
             status: event.status,
-            last_updated_ms: now,
+            last_updated_ms: fired_at_ms,
             status_since_ms,
             run_started_ms,
             last_prompt,
@@ -397,7 +406,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn sample_event(status: AgentStatus) -> AgentEvent {
+    fn sample_event(status: AgentStatus, fired_at_ms: u64) -> AgentEvent {
         AgentEvent {
             session_id: SessionId("session-1".to_string()),
             cwd: PathBuf::from("/tmp/project"),
@@ -405,6 +414,7 @@ mod tests {
             pid: 123,
             status,
             prompt: None,
+            fired_at_ms,
         }
     }
 
@@ -412,7 +422,7 @@ mod tests {
     fn first_event_registers_a_new_agent() {
         let registry = Registry::new();
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 1_000));
 
         assert!(outcome.is_new);
         assert_eq!(outcome.previous_status, None);
@@ -424,9 +434,9 @@ mod tests {
     #[test]
     fn subsequent_event_updates_the_existing_agent_in_place() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Done));
+        let outcome = registry.upsert(sample_event(AgentStatus::Done, 2_000));
 
         assert!(!outcome.is_new);
         assert_eq!(outcome.previous_status, Some(AgentStatus::Running));
@@ -438,13 +448,12 @@ mod tests {
     #[test]
     fn same_status_event_leaves_status_since_ms_unchanged() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         let status_since_ms = registry.snapshot()[0].status_since_ms;
-        thread::sleep(Duration::from_millis(10));
 
         // A `PostToolUse` event during the same running turn reports the
         // same status - it must not look like a fresh transition.
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 2_000));
 
         let snapshot = registry.snapshot();
         assert_eq!(
@@ -461,7 +470,7 @@ mod tests {
     fn a_new_agent_sets_run_started_ms_to_its_creation_time() {
         let registry = Registry::new();
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 1_000));
 
         assert_eq!(outcome.agent.run_started_ms, outcome.agent.last_updated_ms);
         assert_eq!(registry.snapshot()[0].run_started_ms, outcome.agent.run_started_ms);
@@ -470,11 +479,10 @@ mod tests {
     #[test]
     fn same_status_event_leaves_run_started_ms_unchanged() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         let run_started_ms = registry.snapshot()[0].run_started_ms;
-        thread::sleep(Duration::from_millis(10));
 
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 2_000));
 
         assert_eq!(
             registry.snapshot()[0].run_started_ms, run_started_ms,
@@ -485,11 +493,10 @@ mod tests {
     #[test]
     fn transitioning_away_from_running_leaves_run_started_ms_unchanged() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         let run_started_ms = registry.snapshot()[0].run_started_ms;
-        thread::sleep(Duration::from_millis(10));
 
-        registry.upsert(sample_event(AgentStatus::NeedsInput));
+        registry.upsert(sample_event(AgentStatus::NeedsInput, 2_000));
 
         assert_eq!(
             registry.snapshot()[0].run_started_ms, run_started_ms,
@@ -500,12 +507,11 @@ mod tests {
     #[test]
     fn transitioning_between_two_non_running_statuses_leaves_run_started_ms_unchanged() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::NeedsInput));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::NeedsInput, 2_000));
         let run_started_ms = registry.snapshot()[0].run_started_ms;
-        thread::sleep(Duration::from_millis(10));
 
-        registry.upsert(sample_event(AgentStatus::Declined));
+        registry.upsert(sample_event(AgentStatus::Declined, 3_000));
 
         assert_eq!(
             registry.snapshot()[0].run_started_ms, run_started_ms,
@@ -516,12 +522,11 @@ mod tests {
     #[test]
     fn a_transition_into_running_resets_run_started_ms() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         let first_run_started_ms = registry.snapshot()[0].run_started_ms;
-        thread::sleep(Duration::from_millis(10));
-        registry.upsert(sample_event(AgentStatus::NeedsInput));
+        registry.upsert(sample_event(AgentStatus::NeedsInput, 2_000));
 
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 3_000));
 
         assert!(
             registry.snapshot()[0].run_started_ms > first_run_started_ms,
@@ -536,12 +541,11 @@ mod tests {
         // reset on every re-entry into running - including from "done" -
         // rather than staying pinned to the session's very first turn.
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::Done));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::Done, 2_000));
         let first_turn_run_started_ms = registry.snapshot()[0].run_started_ms;
-        thread::sleep(Duration::from_millis(10));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 3_000));
 
         assert!(
             outcome.agent.run_started_ms > first_turn_run_started_ms,
@@ -556,15 +560,14 @@ mod tests {
         registry.upsert(AgentEvent {
             session_id: SessionId("session-1".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
         let first_run_started_ms = registry.snapshot()[0].run_started_ms;
-        thread::sleep(Duration::from_millis(10));
 
         registry.upsert(AgentEvent {
             session_id: SessionId("session-2".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 2_000)
         });
 
         assert!(
@@ -576,11 +579,10 @@ mod tests {
     #[test]
     fn status_transition_resets_status_since_ms() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         let running_status_since_ms = registry.snapshot()[0].status_since_ms;
-        thread::sleep(Duration::from_millis(10));
 
-        registry.upsert(sample_event(AgentStatus::Done));
+        registry.upsert(sample_event(AgentStatus::Done, 2_000));
 
         let snapshot = registry.snapshot();
         assert!(
@@ -592,14 +594,13 @@ mod tests {
     #[test]
     fn needs_input_event_is_dropped_when_session_already_done() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::Done));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::Done, 2_000));
         let done_snapshot = registry.snapshot();
         let done_last_updated_ms = done_snapshot[0].last_updated_ms;
         let done_status_since_ms = done_snapshot[0].status_since_ms;
-        thread::sleep(Duration::from_millis(10));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::NeedsInput));
+        let outcome = registry.upsert(sample_event(AgentStatus::NeedsInput, 3_000));
 
         assert_eq!(outcome.agent.status, AgentStatus::Done);
         assert_eq!(outcome.previous_status, Some(AgentStatus::Done));
@@ -619,10 +620,10 @@ mod tests {
     #[test]
     fn running_event_still_clears_a_done_session() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::Done));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::Done, 2_000));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 3_000));
 
         assert_eq!(outcome.agent.status, AgentStatus::Running);
         assert_eq!(outcome.previous_status, Some(AgentStatus::Done));
@@ -632,10 +633,10 @@ mod tests {
     #[test]
     fn running_event_clears_a_needs_input_session() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::NeedsInput));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::NeedsInput, 2_000));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 3_000));
 
         assert_eq!(outcome.agent.status, AgentStatus::Running);
         assert_eq!(outcome.previous_status, Some(AgentStatus::NeedsInput));
@@ -645,10 +646,10 @@ mod tests {
     #[test]
     fn running_event_clears_a_declined_session() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::Declined));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::Declined, 2_000));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 3_000));
 
         assert_eq!(outcome.agent.status, AgentStatus::Running);
         assert_eq!(outcome.previous_status, Some(AgentStatus::Declined));
@@ -658,10 +659,10 @@ mod tests {
     #[test]
     fn done_event_clears_a_declined_session() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::Declined));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::Declined, 2_000));
 
-        let outcome = registry.upsert(sample_event(AgentStatus::Done));
+        let outcome = registry.upsert(sample_event(AgentStatus::Done, 3_000));
 
         assert_eq!(outcome.agent.status, AgentStatus::Done);
         assert_eq!(outcome.previous_status, Some(AgentStatus::Declined));
@@ -671,13 +672,13 @@ mod tests {
     #[test]
     fn running_event_clears_a_needs_input_session_via_post_tool_use() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
-        registry.upsert(sample_event(AgentStatus::NeedsInput));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
+        registry.upsert(sample_event(AgentStatus::NeedsInput, 2_000));
 
         // Models a `PostToolUse` event, which reports the same `Running`
         // status as `PreToolUse` - the registry has no notion of which hook
         // produced the event, only the status it maps to.
-        let outcome = registry.upsert(sample_event(AgentStatus::Running));
+        let outcome = registry.upsert(sample_event(AgentStatus::Running, 3_000));
 
         assert_eq!(outcome.agent.status, AgentStatus::Running);
         assert_eq!(outcome.previous_status, Some(AgentStatus::NeedsInput));
@@ -690,7 +691,7 @@ mod tests {
 
         let outcome = registry.upsert(AgentEvent {
             prompt: Some("Fix the flaky test".to_string()),
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         assert_eq!(outcome.agent.last_prompt.as_deref(), Some("Fix the flaky test"));
@@ -701,12 +702,12 @@ mod tests {
         let registry = Registry::new();
         registry.upsert(AgentEvent {
             prompt: Some("Fix the flaky test".to_string()),
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         // Models a `PreToolUse`/`PostToolUse`/`Stop` event, none of which
         // carry prompt text.
-        let outcome = registry.upsert(sample_event(AgentStatus::Done));
+        let outcome = registry.upsert(sample_event(AgentStatus::Done, 2_000));
 
         assert_eq!(
             outcome.agent.last_prompt.as_deref(),
@@ -722,13 +723,13 @@ mod tests {
             session_id: SessionId("session-1".to_string()),
             pid: 123,
             prompt: Some("Fix the flaky test".to_string()),
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         let outcome = registry.upsert(AgentEvent {
             session_id: SessionId("session-2".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 2_000)
         });
 
         assert_eq!(
@@ -744,7 +745,7 @@ mod tests {
 
         let outcome = registry.upsert(AgentEvent {
             prompt: Some(overlong),
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         let stored = outcome.agent.last_prompt.unwrap();
@@ -758,7 +759,7 @@ mod tests {
 
         let outcome = registry.upsert(AgentEvent {
             prompt: Some("short prompt".to_string()),
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         assert_eq!(outcome.agent.last_prompt.as_deref(), Some("short prompt"));
@@ -767,7 +768,7 @@ mod tests {
     #[test]
     fn mark_stale_transitions_a_known_agent() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         let running_status_since_ms = registry.snapshot()[0].status_since_ms;
         let session_id = SessionId("session-1".to_string());
         thread::sleep(Duration::from_millis(10));
@@ -797,13 +798,13 @@ mod tests {
         registry.upsert(AgentEvent {
             session_id: SessionId("session-1".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         let outcome = registry.upsert(AgentEvent {
             session_id: SessionId("session-2".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 2_000)
         });
 
         assert_eq!(
@@ -827,12 +828,12 @@ mod tests {
         registry.upsert(AgentEvent {
             session_id: SessionId("session-1".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
         registry.upsert(AgentEvent {
             session_id: SessionId("session-2".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 2_000)
         });
 
         // A hook event for session-1, delayed enough that it arrives after
@@ -841,7 +842,7 @@ mod tests {
         let outcome = registry.upsert(AgentEvent {
             session_id: SessionId("session-1".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Done)
+            ..sample_event(AgentStatus::Done, 3_000)
         });
 
         assert_eq!(
@@ -876,20 +877,20 @@ mod tests {
         registry.upsert(AgentEvent {
             session_id: SessionId("session-a".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
         // session-b supersedes session-a on pid 123.
         registry.upsert(AgentEvent {
             session_id: SessionId("session-b".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 2_000)
         });
         // session-c supersedes session-b on the same pid - the pid has moved
         // on again since session-a was first retired.
         registry.upsert(AgentEvent {
             session_id: SessionId("session-c".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 3_000)
         });
 
         // A very late event for session-a, the original (twice-superseded)
@@ -897,7 +898,7 @@ mod tests {
         let outcome = registry.upsert(AgentEvent {
             session_id: SessionId("session-a".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Done)
+            ..sample_event(AgentStatus::Done, 4_000)
         });
 
         assert_eq!(
@@ -917,13 +918,13 @@ mod tests {
         registry.upsert(AgentEvent {
             session_id: SessionId("session-1".to_string()),
             pid: 123,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 1_000)
         });
 
         registry.upsert(AgentEvent {
             session_id: SessionId("session-2".to_string()),
             pid: 456,
-            ..sample_event(AgentStatus::Running)
+            ..sample_event(AgentStatus::Running, 2_000)
         });
 
         let mut snapshot = registry.snapshot();
@@ -1044,7 +1045,7 @@ mod tests {
     #[test]
     fn directory_groups_includes_a_directory_with_only_agents() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
 
         let groups = registry.directory_groups();
 
@@ -1069,7 +1070,7 @@ mod tests {
     #[test]
     fn directory_groups_includes_a_directory_with_both() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         registry.upsert_test_run(PathBuf::from("/tmp/project"), 999, TestRunStatus::Running);
 
         let groups = registry.directory_groups();
@@ -1132,7 +1133,7 @@ mod tests {
     #[test]
     fn known_cwds_includes_projects_with_a_tracked_agent_or_test_run() {
         let registry = Registry::new();
-        registry.upsert(sample_event(AgentStatus::Running));
+        registry.upsert(sample_event(AgentStatus::Running, 1_000));
         registry.upsert_test_run(PathBuf::from("/tmp/other-project"), 1, TestRunStatus::Running);
 
         let known = registry.known_cwds();

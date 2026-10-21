@@ -352,7 +352,13 @@ mod tests {
         (path, notifier)
     }
 
+    /// Stamps each call with its own monotonically increasing `fired_at_ms`,
+    /// standing in for each successive call being a distinct, later-firing
+    /// hook invocation - mirrors `ingest.rs`'s test helper of the same
+    /// shape.
     fn sample_event(status: AgentStatus) -> AgentEvent {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_FIRED_AT_MS: AtomicU64 = AtomicU64::new(1_000);
         AgentEvent {
             session_id: SessionId("session-1".to_string()),
             cwd: PathBuf::from("/tmp/project"),
@@ -360,6 +366,7 @@ mod tests {
             pid: 123,
             status,
             prompt: None,
+            fired_at_ms: NEXT_FIRED_AT_MS.fetch_add(1, Ordering::SeqCst),
         }
     }
 
@@ -1214,7 +1221,7 @@ mod tests {
         reader.get_ref().set_read_timeout(Some(timeout)).expect("set read timeout");
     }
 
-    fn race_event(session_id: &str, cwd: &str, pid: u32) -> AgentEvent {
+    fn race_event(session_id: &str, cwd: &str, pid: u32, fired_at_ms: u64) -> AgentEvent {
         AgentEvent {
             session_id: SessionId(session_id.to_string()),
             cwd: PathBuf::from(cwd),
@@ -1222,6 +1229,7 @@ mod tests {
             pid,
             status: AgentStatus::Running,
             prompt: None,
+            fired_at_ms,
         }
     }
 
@@ -1326,7 +1334,7 @@ mod tests {
             let mut reporter_b = UnixStream::connect(&path).expect("connect reporter B");
             write_message(
                 &mut reporter_b,
-                &ClientMessage::ReportEvent { event: race_event("race-b", "/tmp/race-b", 502) },
+                &ClientMessage::ReportEvent { event: race_event("race-b", "/tmp/race-b", 502, 2_000) },
             )
             .expect("send B's event");
         }
@@ -1334,7 +1342,7 @@ mod tests {
 
         write_message(
             &mut reporter_a,
-            &ClientMessage::ReportEvent { event: race_event("race-a", "/tmp/race-a", 501) },
+            &ClientMessage::ReportEvent { event: race_event("race-a", "/tmp/race-a", 501, 1_000) },
         )
         .expect("send A's event");
 
@@ -1348,6 +1356,89 @@ mod tests {
             started[0].pid,
             Some(501),
             "the earlier-accepted connection (A) must be applied before the later one (B), got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn a_later_accepted_events_fired_at_ms_still_records_true_hook_fire_order() {
+        // Reproduces the originally-reported bug: a `UserPromptSubmit`-like
+        // event fires first (fired_at_ms 1_000, carrying prompt text), but
+        // its reporting process loses the connect race against the
+        // `PreToolUse`-like event the prompt itself precipitates, which
+        // fires second (fired_at_ms 2_000) but wins the race and is
+        // accepted first. Unlike
+        // `a_connection_accepted_first_is_applied_first_even_if_its_read_finishes_later`,
+        // this asserts on each entry's *recorded timestamp*, not on array
+        // order - array order still follows accept order (unchanged by this
+        // fix), but each entry's own `fired_at_ms` must still reflect true
+        // hook-fire order regardless.
+        let (path, _notifier) = spawn_test_server("fired-at-ms-race");
+
+        // Accepted first (ticket 0) - and so applied first, per the
+        // EventSequencer's accept-order guarantee - despite firing *second*
+        // in true hook time (fired_at_ms 2_000). Its message is deliberately
+        // not sent yet, standing in for a reporting process that wins the
+        // connect race but is still mid-flight on the rest of its work.
+        let mut reporter_tool = UnixStream::connect(&path).expect("connect tool-use reporter");
+        thread::sleep(Duration::from_millis(50));
+
+        // Accepted second (ticket 1), despite firing *first* in true hook
+        // time (fired_at_ms 1_000) - standing in for `UserPromptSubmit`'s
+        // reporting process losing the connect race (e.g. to host-context
+        // detection jitter). Sends immediately, well before the tool-use
+        // reporter does.
+        {
+            let mut reporter_prompt = UnixStream::connect(&path).expect("connect prompt reporter");
+            write_message(
+                &mut reporter_prompt,
+                &ClientMessage::ReportEvent {
+                    event: AgentEvent {
+                        prompt: Some("Fix the flaky test".to_string()),
+                        ..race_event("race-fired", "/tmp/race-fired", 601, 1_000)
+                    },
+                },
+            )
+            .expect("send the earlier-fired, race-losing prompt event");
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        write_message(
+            &mut reporter_tool,
+            &ClientMessage::ReportEvent {
+                event: race_event("race-fired", "/tmp/race-fired", 601, 2_000),
+            },
+        )
+        .expect("send the later-fired, race-winning event");
+
+        let logs = read_log_snapshot_until_at_least(&path, 2);
+        let relevant: Vec<&agentmon_proto::LogEntry> = logs.iter().filter(|e| e.pid == Some(601)).collect();
+        assert_eq!(
+            relevant.len(),
+            2,
+            "expected both the started entry and the prompt entry, got {logs:?}"
+        );
+
+        let started = relevant
+            .iter()
+            .find(|e| e.category == agentmon_proto::LogCategory::Agent)
+            .expect("expected a started entry");
+        let prompt_entry = relevant
+            .iter()
+            .find(|e| e.category == agentmon_proto::LogCategory::Prompt)
+            .expect("expected a prompt entry");
+
+        assert_eq!(
+            started.occurred_at_ms, 2_000,
+            "the started entry must carry its own triggering event's fired_at_ms"
+        );
+        assert_eq!(
+            prompt_entry.occurred_at_ms, 1_000,
+            "the prompt entry must carry its own event's fired_at_ms, not the daemon's processing-time clock"
+        );
+        assert!(
+            prompt_entry.occurred_at_ms < started.occurred_at_ms,
+            "the prompt entry must be recorded with an earlier timestamp than the started entry it actually \
+             preceded, even though its connection lost the accept race and was applied second"
         );
     }
 

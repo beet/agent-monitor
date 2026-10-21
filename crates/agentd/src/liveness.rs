@@ -60,6 +60,7 @@ mod tests {
             pid,
             status: AgentStatus::Running,
             prompt: None,
+            fired_at_ms: 1_700_000_000_000,
         });
     }
 

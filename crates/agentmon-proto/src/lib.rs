@@ -94,6 +94,15 @@ pub struct AgentEvent {
     /// `UserPromptSubmit`-derived events carry this - every other hook
     /// event reports `None`.
     pub prompt: Option<String>,
+    /// Unix epoch milliseconds of when the underlying Claude Code hook
+    /// fired, as captured by the reporting client itself (as the first
+    /// instruction of its process) - not the time the daemon accepts or
+    /// processes this event. The daemon uses this, rather than its own
+    /// processing-time clock, for every timestamp this event causes, so
+    /// recorded/displayed order reflects true hook-fire order regardless of
+    /// which of two racing reporting processes the daemon happens to accept
+    /// or finish handling first.
+    pub fired_at_ms: u64,
 }
 
 /// The daemon's view of a tracked agent, as sent to clients.
@@ -336,12 +345,17 @@ mod tests {
             pid: 99,
             status: AgentStatus::NeedsInput,
             prompt: Some("Fix the flaky test".to_string()),
+            fired_at_ms: 1_700_000_000_000,
         };
 
         let json = serde_json::to_string(&event).unwrap();
         let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
 
         assert_eq!(event, decoded);
+        assert!(
+            json.contains("\"fired_at_ms\":1700000000000"),
+            "expected fired_at_ms field in JSON, got: {json}"
+        );
     }
 
     #[test]
@@ -733,6 +747,7 @@ mod tests {
                 pid: 7,
                 status: AgentStatus::Idle,
                 prompt: None,
+                fired_at_ms: 1_700_000_000_000,
             },
         };
 

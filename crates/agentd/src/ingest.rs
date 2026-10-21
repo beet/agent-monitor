@@ -70,6 +70,7 @@ impl Ingestor {
         let submitted_prompt = event.prompt.clone();
         let pid = event.pid;
         let cwd = event.cwd.clone();
+        let fired_at_ms = event.fired_at_ms;
         let outcome = self.registry.upsert(event);
         if outcome.stale_event_ignored {
             // A late event for an already-superseded session id: `agent` and
@@ -95,7 +96,7 @@ impl Ingestor {
                 occurred_at_ms: if run_starting {
                     outcome.agent.run_started_ms
                 } else {
-                    now_ms()
+                    fired_at_ms
                 },
                 pid: Some(pid),
                 reminder_name: None,
@@ -126,7 +127,7 @@ impl Ingestor {
                 working_dir: outcome.agent.cwd.clone(),
                 category: LogCategory::Agent,
                 status: agent_log_status(outcome.agent.status).to_string(),
-                occurred_at_ms: now_ms(),
+                occurred_at_ms: fired_at_ms,
                 pid: Some(outcome.agent.pid),
                 reminder_name: None,
                 reminder_due_at_ms: None,
@@ -375,7 +376,16 @@ mod tests {
         }
     }
 
+    /// Builds a sample event, stamping each call with its own
+    /// monotonically increasing `fired_at_ms` - standing in for each
+    /// successive call being a distinct, later-firing hook invocation, the
+    /// same way real hook events arrive in sequence. Tests that need
+    /// specific or out-of-order `fired_at_ms` values (e.g. simulating the
+    /// race this change fixes) override it explicitly via struct-update
+    /// syntax instead.
     fn event(status: AgentStatus) -> AgentEvent {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_FIRED_AT_MS: AtomicU64 = AtomicU64::new(1_000);
         AgentEvent {
             session_id: SessionId("session-1".to_string()),
             cwd: PathBuf::from("/tmp/project"),
@@ -383,6 +393,7 @@ mod tests {
             pid: 1,
             status,
             prompt: None,
+            fired_at_ms: NEXT_FIRED_AT_MS.fetch_add(1, Ordering::SeqCst),
         }
     }
 

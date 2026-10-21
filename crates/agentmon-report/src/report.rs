@@ -14,8 +14,16 @@ use crate::hook_payload::{parse_hook_payload, status_for_payload, HookPayload};
 const SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Builds the event to report, or `None` if this hook payload doesn't
-/// correspond to a tracked status change.
-pub fn build_event(payload: &HookPayload, host_context: HostContext, pid: u32) -> Option<AgentEvent> {
+/// correspond to a tracked status change. `fired_at_ms` is the time the
+/// caller captured at the very start of its process - see
+/// `read_and_build_event`'s doc comment - and is carried through unchanged,
+/// never recomputed here.
+pub fn build_event(
+    payload: &HookPayload,
+    host_context: HostContext,
+    pid: u32,
+    fired_at_ms: u64,
+) -> Option<AgentEvent> {
     let status = status_for_payload(payload)?;
     // Only a `UserPromptSubmit` payload carries prompt text - every other
     // hook event reports no prompt, regardless of whether `payload.prompt`
@@ -32,15 +40,22 @@ pub fn build_event(payload: &HookPayload, host_context: HostContext, pid: u32) -
         pid,
         status,
         prompt,
+        fired_at_ms,
     })
 }
 
 /// Reads a hook payload from `input`, and returns the event to report (if
-/// any), or the parse error.
+/// any), or the parse error. `fired_at_ms` SHOULD be captured by the caller
+/// as the very first instruction of its process - before host-context/
+/// parent-pid detection, connecting to the daemon, or reading this payload -
+/// so it reflects true hook-fire time rather than being skewed by any of
+/// this process's own slower, jitter-prone work. See the agent-daemon
+/// spec's "Local socket ingestion API" requirement.
 pub fn read_and_build_event(
     mut input: impl Read,
     host_context: HostContext,
     pid: u32,
+    fired_at_ms: u64,
 ) -> Result<Option<AgentEvent>, serde_json::Error> {
     let mut raw = String::new();
     // A stdin read error here is treated the same as empty input by the
@@ -48,7 +63,7 @@ pub fn read_and_build_event(
     let _ = input.read_to_string(&mut raw);
 
     let payload: HookPayload = parse_hook_payload(&raw)?;
-    Ok(build_event(&payload, host_context, pid))
+    Ok(build_event(&payload, host_context, pid, fired_at_ms))
 }
 
 /// Opens a connection to the daemon at `socket_path`, bounded by
@@ -111,12 +126,29 @@ mod tests {
         }"#;
         let payload = parse_hook_payload(raw).unwrap();
 
-        let event = build_event(&payload, HostContext::Terminal, 4242).unwrap();
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
 
         assert_eq!(event.session_id, SessionId("abc-123".to_string()));
         assert_eq!(event.cwd, PathBuf::from("/tmp/project"));
         assert_eq!(event.pid, 4242);
         assert_eq!(event.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn build_event_carries_the_caller_supplied_fired_at_ms_unchanged() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "Stop"
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_234_567_890).unwrap();
+
+        assert_eq!(
+            event.fired_at_ms, 1_234_567_890,
+            "fired_at_ms must be the caller-supplied value, not derived from SystemTime::now() inside build_event"
+        );
     }
 
     #[test]
@@ -129,7 +161,7 @@ mod tests {
         }"#;
         let payload = parse_hook_payload(raw).unwrap();
 
-        let event = build_event(&payload, HostContext::Terminal, 4242).unwrap();
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
 
         assert_eq!(event.prompt.as_deref(), Some("Fix the flaky test"));
     }
@@ -144,7 +176,7 @@ mod tests {
         }"#;
         let payload = parse_hook_payload(raw).unwrap();
 
-        let event = build_event(&payload, HostContext::Terminal, 4242).unwrap();
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
 
         assert_eq!(event.prompt, None);
     }
@@ -159,7 +191,7 @@ mod tests {
         }"#;
         let payload = parse_hook_payload(raw).unwrap();
 
-        assert!(build_event(&payload, HostContext::Terminal, 4242).is_none());
+        assert!(build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).is_none());
     }
 
     #[test]
@@ -181,7 +213,7 @@ mod tests {
             "hook_event_name": "Stop",
             "stop_reason": "end_turn"
         }"#;
-        let event = read_and_build_event(raw_payload.as_bytes(), HostContext::Nvim, 555)
+        let event = read_and_build_event(raw_payload.as_bytes(), HostContext::Nvim, 555, 1_700_000_000_000)
             .expect("parse hook payload")
             .expect("Stop payload should produce an event");
         send_event(&path, &event).expect("send event to mock listener");
@@ -224,7 +256,7 @@ mod tests {
                 Ok(0)
             }
         }
-        let _ = read_and_build_event(SlowReader, HostContext::Terminal, 1);
+        let _ = read_and_build_event(SlowReader, HostContext::Terminal, 1, 1_700_000_000_000);
 
         listener_handle.join().expect("listener thread should not panic");
         let accepted_at = accepted_at.lock().unwrap().unwrap();
@@ -270,6 +302,7 @@ mod tests {
             pid: 1,
             status: AgentStatus::Done,
             prompt: None,
+            fired_at_ms: 1_700_000_000_000,
         };
 
         let started = std::time::Instant::now();

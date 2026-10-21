@@ -103,6 +103,7 @@ classDiagram
         +u32 pid
         +AgentStatus status
         +Option~String~ prompt
+        +u64 fired_at_ms
     }
     class AgentInfo {
         +SessionId session_id

@@ -1,4 +1,5 @@
 use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmon_proto::default_socket_path;
 use agentmon_report::debug_log::log;
@@ -44,6 +45,15 @@ fn run_install_hooks() {
 }
 
 fn run_report() {
+    // Captured before anything else in this process - including the debug
+    // log write below - so it reflects true hook-fire time rather than
+    // being skewed by this process's own startup/detection work. See the
+    // agent-daemon spec's "Local socket ingestion API" requirement.
+    let fired_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
     log("invoked");
 
     let host_context = detect_host_context();
@@ -67,7 +77,7 @@ fn run_report() {
         }
     };
 
-    let event = match read_and_build_event(io::stdin(), host_context, pid) {
+    let event = match read_and_build_event(io::stdin(), host_context, pid, fired_at_ms) {
         Ok(Some(event)) => event,
         Ok(None) => {
             log("payload parsed but produced no status-bearing event");
