@@ -1,0 +1,33 @@
+## Context
+
+See proposal.md - Why. The reporting client (`agentmon-report`) currently takes a `UserPromptSubmit` hook payload's `prompt` field verbatim (`crates/agentmon-report/src/report.rs:31-32`, `payload.prompt.clone()`) and puts it straight into the `AgentEvent` sent to the daemon over the local socket. `crates/agentmon-proto` defines the wire type; `agentd`'s registry stores whatever prompt text an event carries as that agent's "last prompt" (per `openspec/specs/agent-daemon/spec.md`'s "Agent registry" requirement), and `agentmon`'s TUI (`ui.rs::prompt_snippet`) only flattens whitespace before truncating for display - no stage in this pipeline currently distinguishes harness-injected wrapper markup from literal human-typed text.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Stop harness-injected wrapper tags (`<command-message>`, `<system-reminder>`, `<task-notification>`, `<local-command-stdout>`) from ever reaching the daemon, the activity log, or the TUI as if they were human-typed prompt text.
+- Preserve a slash command's literal name and arguments (`<command-name>`, `<command-args>`) as prompt text, since that *is* what the user typed, just wrapped in markup.
+- Make a fully-synthetic turn (e.g. a bare task-notification wake-up with no user text) report no prompt at all, rather than an empty or tag-free-but-meaningless string.
+
+**Non-Goals:**
+- Parsing or validating arbitrary XML/HTML the user might legitimately paste into a real prompt - only the fixed set of tags Claude Code itself is known to inject.
+- Changing anything in `agentd`, `agentmon-proto`, or `agentmon` - they already handle "no prompt text" correctly and already render whatever text they're given verbatim; this change is entirely upstream of them.
+- Handling hook payloads from harnesses other than Claude Code.
+
+## Decisions
+
+**Strip at the reporting-client boundary, not in the daemon or TUI.** `agentmon-report` is a short-lived one-shot process invoked directly by a Claude Code hook; it is the only point in the pipeline that ever sees the raw, harness-authored payload text. Stripping here means the daemon, the activity log, and the TUI continue to treat "prompt text on an event" as an opaque, already-clean string, matching the existing spec language ("verbatim") and requiring no changes to any of their requirements. Alternative considered: strip in `agentd`'s registry instead, so a future second reporting client would get the behavior for free - rejected because `agentmon-report` is currently the only reporting client, the daemon has no reason to know about Claude Code's specific markup conventions, and pushing parsing into the daemon would mean a malformed strip pattern crashing shared, long-lived daemon code instead of an isolated one-shot process.
+
+**A fixed, closed tag list, not a generic "strip all XML-looking tags" approach.** Claude Code injects a known, small set of wrapper tags; a generic tag-stripper would also mangle a legitimate prompt where a user pastes real XML/HTML/JSX and wants it shown as typed. Recognizing only `command-message`, `command-name`, `command-args`, `system-reminder`, `task-notification`, and `local-command-stdout` (case-sensitive, matching Claude Code's own casing) keeps the behavior predictable and keeps everything else untouched.
+
+**Two different removal behaviors by tag, not one uniform rule.** `command-message` and `system-reminder`/`task-notification`/`local-command-stdout` never carry human-authored text (they're boilerplate instructions, contextual reminders, task-completion payloads, or captured shell output) - removed together with their contents. `command-name` and `command-args` carry the literal slash command and whatever the user typed after it - only their tag markup is removed, keeping the contents, so running a slash command still shows something meaningful (e.g. `/opsx:propose Agent prompts appearing as raw XML...`) instead of nothing. Alternative considered: drop `command-name`/`command-args` contents too, on the theory that a slash-command invocation isn't a "real" prompt either - rejected because the change's own motivating report (`/opsx:propose <description>`) shows the argument text is exactly the human-meaningful content the user wants preserved, and `agent-daemon`'s existing scenario coverage of "prompt-submission event records the last prompt" doesn't distinguish a slash command from a typed sentence.
+
+**Matching is done on the raw text with a small hand-written scanner, not a full XML parser.** The payload is not guaranteed to be well-formed XML (nesting is simple and fixed in practice, but there's no DTD/schema to validate against, and pulling in an XML parsing dependency for six known tag names is disproportionate). A scanner that finds each recognized opening tag, locates its matching closing tag (accounting for same-tag nesting depth, since `task-notification` payloads can nest further structure inside), and either drops or unwraps the span is sufficient and keeps the diff contained to `agentmon-report`.
+
+**Trim and emptiness check happens once, after all tags are processed.** Removing a tag can leave behind the whitespace that used to separate it from other content; the final trim-and-empty-check determines whether the event carries any prompt text at all, so a payload that was 100% wrapper markup (plus incidental whitespace) collapses to "no prompt."
+
+## Risks / Trade-offs
+
+- **Claude Code adds a new wrapper tag in the future** → it will pass through unrecognized and reappear verbatim, the same bug this change fixes today for the known set. Mitigation: the tag list lives in one place in `agentmon-report`, so extending it is a small, localized change; the project's `CLAUDE.md` convention of keeping generated artifacts in sync doesn't apply here since there's nothing to regenerate, but a code comment at the tag list should note where to add new ones.
+- **A user's real prompt happens to contain literal text matching one of these tag names** (e.g. they paste a message discussing `<system-reminder>` tags) → that span would be stripped even though it's human-authored. Mitigation: accepted risk, consistent with the proposal's scope - these tag names are chosen specifically because Claude Code reserves them for its own injected markup, making a legitimate false-positive collision rare.
+- **Hand-written scanner mishandles malformed/unterminated tags** (e.g. an opening tag with no matching close, perhaps from a payload truncated upstream) → mitigation: an unmatched opening tag is left untouched (treated as ordinary text) rather than causing a panic or swallowing the rest of the payload, so the fallback on any ambiguity is "show more text," not "show none" or "crash."

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use agentmon_proto::{write_message, AgentEvent, ClientMessage, HostContext, SessionId};
 
-use crate::hook_payload::{parse_hook_payload, status_for_payload, HookPayload};
+use crate::hook_payload::{parse_hook_payload, sanitized_prompt, status_for_payload, HookPayload};
 
 /// Hook subprocesses must never block or fail the calling hook (a `Stop`
 /// hook exiting with code 2 would block the user's turn from ending), so
@@ -27,9 +27,11 @@ pub fn build_event(
     let status = status_for_payload(payload)?;
     // Only a `UserPromptSubmit` payload carries prompt text - every other
     // hook event reports no prompt, regardless of whether `payload.prompt`
-    // happens to be set.
+    // happens to be set. Harness-injected wrapper tags (slash-command
+    // expansions, system-reminders, task-notifications) are stripped before
+    // the surviving text becomes the event's prompt - see `sanitized_prompt`.
     let prompt = if payload.hook_event_name == "UserPromptSubmit" {
-        payload.prompt.clone()
+        payload.prompt.as_deref().and_then(sanitized_prompt)
     } else {
         None
     };
@@ -164,6 +166,24 @@ mod tests {
         let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
 
         assert_eq!(event.prompt.as_deref(), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn build_event_strips_harness_wrapper_tags_from_the_prompt() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "<task-notification><task-id>b3sq8biwk</task-id></task-notification>"
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
+
+        assert_eq!(
+            event.prompt, None,
+            "a prompt that is entirely a harness wrapper tag must carry no prompt text, not raw tag soup"
+        );
     }
 
     #[test]
