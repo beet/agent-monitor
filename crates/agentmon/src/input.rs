@@ -283,6 +283,10 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
             app.toggle_modal_focus();
             return InputAction::Continue;
         }
+        if code == KeyCode::BackTab {
+            app.toggle_modal_focus_reverse();
+            return InputAction::Continue;
+        }
         // Creating a reminder doesn't depend on a highlighted selection
         // (unlike start/stop/edit/delete), so `R` works regardless of which
         // pane currently holds focus - matching its always-visible `New
@@ -298,8 +302,58 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
             app.open_rename_form_from_details_modal();
             return InputAction::Continue;
         }
+        // Per-pane focus shortcuts - jump directly to a pane regardless of
+        // which one currently holds focus, matching each pane's `[a]`/`[t]`/
+        // `[r]`/`[p]`/`[l]` title hint.
+        if let Some(focus) = match code {
+            KeyCode::Char('a') => Some(ModalFocus::Agents),
+            KeyCode::Char('t') => Some(ModalFocus::Tests),
+            KeyCode::Char('r') => Some(ModalFocus::Reminders),
+            KeyCode::Char('p') => Some(ModalFocus::LastPrompt),
+            KeyCode::Char('l') => Some(ModalFocus::Logs),
+            _ => None,
+        } {
+            app.set_modal_focus(focus);
+            return InputAction::Continue;
+        }
 
         match app.modal_focus {
+            ModalFocus::Agents => match code {
+                KeyCode::Char('j') | KeyCode::Down => app.move_modal_agents_selection(1, page_sizes.modal_agents),
+                KeyCode::Char('k') | KeyCode::Up => app.move_modal_agents_selection(-1, page_sizes.modal_agents),
+                KeyCode::Char('d') | KeyCode::PageDown => app.page_modal_agents(1, page_sizes.modal_agents),
+                KeyCode::Char('u') | KeyCode::PageUp => app.page_modal_agents(-1, page_sizes.modal_agents),
+                KeyCode::Char('g') => app.jump_modal_agents_to_start(page_sizes.modal_agents),
+                KeyCode::Char('G') => app.jump_modal_agents_to_end(page_sizes.modal_agents),
+                // No action on the highlighted row yet - reserved for future
+                // use, per the "Project details modal" requirement.
+                KeyCode::Enter => {}
+                _ => {}
+            },
+            ModalFocus::Tests => match code {
+                KeyCode::Char('j') | KeyCode::Down => app.move_modal_tests_selection(1, page_sizes.modal_tests),
+                KeyCode::Char('k') | KeyCode::Up => app.move_modal_tests_selection(-1, page_sizes.modal_tests),
+                KeyCode::Char('d') | KeyCode::PageDown => app.page_modal_tests(1, page_sizes.modal_tests),
+                KeyCode::Char('u') | KeyCode::PageUp => app.page_modal_tests(-1, page_sizes.modal_tests),
+                KeyCode::Char('g') => app.jump_modal_tests_to_start(page_sizes.modal_tests),
+                KeyCode::Char('G') => app.jump_modal_tests_to_end(page_sizes.modal_tests),
+                // No action on the highlighted row yet - reserved for future
+                // use, per the "Project details modal" requirement.
+                KeyCode::Enter => {}
+                _ => {}
+            },
+            ModalFocus::LastPrompt => {
+                // Non-interactive, like the Agents and Tests panes' content -
+                // no navigation keys - but `Enter` opens the full-prompt
+                // modal with this pane's current text, per the "Project
+                // details modal" requirement, unless no prompt has been
+                // captured yet.
+                if code == KeyCode::Enter {
+                    if let Some(text) = app.modal_last_prompt() {
+                        app.open_prompt_detail(text);
+                    }
+                }
+            }
             ModalFocus::Logs => match code {
                 KeyCode::Char('j') | KeyCode::Down => app.move_modal_logs_selection(1, page_sizes.modal_logs),
                 KeyCode::Char('k') | KeyCode::Up => app.move_modal_logs_selection(-1, page_sizes.modal_logs),
@@ -442,7 +496,14 @@ mod tests {
     /// A `PageSizes` big enough that none of the tests below that don't care
     /// about pagination windowing get clamped unexpectedly.
     fn page_sizes() -> PageSizes {
-        PageSizes { logs_tab: 10, modal_logs: 10, reminders_tab: 10, modal_reminders: 10 }
+        PageSizes {
+            logs_tab: 10,
+            modal_logs: 10,
+            reminders_tab: 10,
+            modal_reminders: 10,
+            modal_agents: 10,
+            modal_tests: 10,
+        }
     }
 
     fn press(app: &mut App, code: KeyCode) -> InputAction {
@@ -1581,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_toggles_modal_focus_between_logs_and_reminders() {
+    fn tab_cycles_modal_focus_through_all_five_panes_in_order() {
         use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
         use std::path::PathBuf;
 
@@ -1604,19 +1665,99 @@ mod tests {
         assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
 
         press(&mut app, KeyCode::Tab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Agents);
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Tests);
+
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.modal_focus, crate::app::ModalFocus::Reminders);
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::LastPrompt);
 
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
     }
 
     #[test]
-    fn tab_never_focuses_the_non_interactive_last_prompt_pane() {
-        // `ModalFocus` only has `Logs`/`Reminders` variants, so the Last
-        // Prompt pane (like the Agents/Tests panes) is structurally
-        // unreachable via `Tab` - this exercises several toggles to guard
-        // against a future third variant being added without updating the
-        // cycle.
+    fn back_tab_cycles_modal_focus_through_all_five_panes_in_reverse_order() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
+
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::LastPrompt);
+
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Reminders);
+
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Tests);
+
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Agents);
+
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
+    }
+
+    #[test]
+    fn back_tab_does_not_disturb_any_panes_selection_or_pagination_state() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            (1..=3)
+                .map(|i| AgentInfo {
+                    session_id: SessionId(format!("a{i}")),
+                    cwd: PathBuf::from("/tmp/a"),
+                    host_context: HostContext::Terminal,
+                    pid: i,
+                    status: AgentStatus::Running,
+                    last_updated_ms: 0,
+                    status_since_ms: 0,
+                    run_started_ms: 0,
+                    last_prompt: None,
+                })
+                .collect(),
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        app.move_modal_agents_selection(1, 10);
+        let agents_selected_before = app.modal_agents_pagination.selected;
+        let reminders_selected_before = app.modal_reminders_pagination.selected;
+        let logs_selected_before = app.modal_logs_pagination.selected;
+
+        press(&mut app, KeyCode::BackTab);
+
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
+        assert_eq!(app.modal_agents_pagination.selected, agents_selected_before);
+        assert_eq!(app.modal_reminders_pagination.selected, reminders_selected_before);
+        assert_eq!(app.modal_logs_pagination.selected, logs_selected_before);
+    }
+
+    #[test]
+    fn focus_shortcut_keys_jump_directly_to_their_pane() {
         use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
         use std::path::PathBuf;
 
@@ -1636,14 +1777,78 @@ mod tests {
             Vec::new(),
         );
         press(&mut app, KeyCode::Enter);
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
 
-        for _ in 0..5 {
-            press(&mut app, KeyCode::Tab);
-            assert!(
-                matches!(app.modal_focus, crate::app::ModalFocus::Logs | crate::app::ModalFocus::Reminders),
-                "Tab must only ever land on Logs or Reminders"
-            );
-        }
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Agents);
+
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Tests);
+
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Reminders);
+
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::LastPrompt);
+
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::Logs);
+    }
+
+    #[test]
+    fn enter_on_last_prompt_pane_opens_the_full_prompt_modal() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: Some("Fix the flaky test".to_string()),
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::LastPrompt);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.prompt_detail.as_ref().map(|d| d.text.as_str()), Some("Fix the flaky test"));
+    }
+
+    #[test]
+    fn enter_on_last_prompt_pane_placeholder_does_nothing() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.modal_focus, crate::app::ModalFocus::LastPrompt);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.prompt_detail.is_none());
     }
 
     #[test]
@@ -1732,7 +1937,7 @@ mod tests {
         );
         app.apply_reminder_update(reminder("r1", "/tmp/a", "A", agentmon_proto::ReminderStatus::NotYetStarted));
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab); // focus the Reminders pane
+        press(&mut app, KeyCode::Char('r')); // focus the Reminders pane
 
         let action = press(&mut app, KeyCode::Char('s'));
 
@@ -1794,7 +1999,7 @@ mod tests {
         );
         app.apply_reminder_update(reminder("r1", "/tmp/a", "A", agentmon_proto::ReminderStatus::NotYetStarted));
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('r'));
 
         press(&mut app, KeyCode::Delete);
 
@@ -1827,7 +2032,7 @@ mod tests {
         );
         app.apply_reminder_update(reminder("r1", "/tmp/a", "A", agentmon_proto::ReminderStatus::NotYetStarted));
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('r'));
 
         press(&mut app, KeyCode::Backspace);
 
@@ -1861,7 +2066,7 @@ mod tests {
                 .collect(),
         );
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('r'));
 
         handle_key(&mut app, key(KeyCode::Char('d')), PageSizes { modal_reminders: page_size, ..page_sizes() });
 
@@ -1891,7 +2096,7 @@ mod tests {
         );
         app.apply_reminder_update(reminder("r1", "/tmp/a", "A", agentmon_proto::ReminderStatus::NotYetStarted));
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Delete);
 
         press(&mut app, KeyCode::Esc);
@@ -1922,7 +2127,7 @@ mod tests {
         );
         app.apply_reminder_update(reminder("r1", "/tmp/a", "A", agentmon_proto::ReminderStatus::NotYetStarted));
         press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('r'));
         press(&mut app, KeyCode::Delete);
 
         let action = press(&mut app, KeyCode::Enter);
@@ -2414,7 +2619,7 @@ mod tests {
         assert_eq!(app.rename_form.as_ref().unwrap().cwd, std::path::PathBuf::from("/tmp/a"));
         app.close_rename_form();
 
-        press(&mut app, KeyCode::Tab); // switch focus to Reminders
+        press(&mut app, KeyCode::Char('r')); // switch focus to Reminders
         assert_eq!(app.modal_focus, ModalFocus::Reminders);
         let action = press(&mut app, KeyCode::Char('n'));
 

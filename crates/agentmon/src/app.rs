@@ -138,6 +138,8 @@ pub struct PageSizes {
     pub modal_logs: usize,
     pub reminders_tab: usize,
     pub modal_reminders: usize,
+    pub modal_agents: usize,
+    pub modal_tests: usize,
 }
 
 /// Which tab is currently shown - see the "Tab navigation between Agents and
@@ -180,13 +182,21 @@ pub enum Modal {
     QuitConfirm,
 }
 
-/// Which of the details modal's two interactive panes (Logs, Reminders)
-/// currently holds keyboard focus - see the "Project details modal"
-/// requirement's `Tab`-toggled focus.
+/// Which of the details modal's five panes currently holds keyboard focus -
+/// see the "Project details modal" requirement's `Tab`-cycled and
+/// shortcut-key focus.
+///
+/// Variant declaration order here is the single source of truth for the
+/// panes' layout order, the `Tab` cycle order (`toggle_modal_focus`), and the
+/// focus-shortcut hint order - all three derive from this list, so keep them
+/// in sync if it ever changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalFocus {
-    Logs,
+    Agents,
+    Tests,
     Reminders,
+    LastPrompt,
+    Logs,
 }
 
 /// Whether the open reminder form is creating a new reminder or editing an
@@ -342,13 +352,19 @@ pub struct App {
     pub reminders_sort: ReminderSort,
     pub reminders_filter_project: Option<String>,
     pub reminders_filter_status: Option<String>,
-    /// Which of the details modal's Logs/Reminders panes currently holds
-    /// keyboard focus.
+    /// Which of the details modal's five panes currently holds keyboard
+    /// focus.
     pub modal_focus: ModalFocus,
     /// The details modal's Reminders pane's own selection/scroll state,
     /// separate from the Reminders tab's - reset whenever
     /// `open_details_modal` runs.
     pub modal_reminders_pagination: Paginator,
+    /// The details modal's Agents pane's own selection/scroll state - reset
+    /// whenever `open_details_modal` runs.
+    pub modal_agents_pagination: Paginator,
+    /// The details modal's Tests pane's own selection/scroll state - reset
+    /// whenever `open_details_modal` runs.
+    pub modal_tests_pagination: Paginator,
     /// The reminder creation/editing form, when open.
     pub reminder_form: Option<ReminderForm>,
     /// The reminder the delete-confirmation dialog is asking about, when
@@ -397,6 +413,8 @@ impl App {
             reminders_filter_status: None,
             modal_focus: ModalFocus::Logs,
             modal_reminders_pagination: Paginator::default(),
+            modal_agents_pagination: Paginator::default(),
+            modal_tests_pagination: Paginator::default(),
             reminder_form: None,
             confirm_delete_reminder: None,
             pending_new_reminder: None,
@@ -640,6 +658,8 @@ impl App {
 
         self.modal_logs_pagination.reset();
         self.modal_reminders_pagination.reset();
+        self.modal_agents_pagination.reset();
+        self.modal_tests_pagination.reset();
 
         if self.active_tab == Tab::Reminders {
             self.modal_focus = ModalFocus::Reminders;
@@ -686,6 +706,23 @@ impl App {
         self.prompt_detail = Some(PromptDetail { text, scroll: 0 });
     }
 
+    /// The details modal's Last Prompt pane's current text - the last-prompt
+    /// text of whichever agent in the open modal's project most recently had
+    /// a status update (the tracked agent with the greatest last-updated
+    /// timestamp), or `None` if no details modal is open, the project has no
+    /// tracked agents, or its most-recently-updated agent has no last-prompt
+    /// text yet. Shared by `ui.rs`'s render of the pane and `input.rs`'s
+    /// `Enter`-on-the-pane handler, so both derive the same text from the
+    /// same source rather than duplicating this lookup.
+    pub fn modal_last_prompt(&self) -> Option<String> {
+        let Some(Modal::Details(cwd)) = &self.modal else { return None };
+        self.directory_groups()
+            .into_iter()
+            .find(|g| &g.cwd == cwd)
+            .and_then(|g| g.agents.into_iter().max_by_key(|a| a.last_updated_ms))
+            .and_then(|a| a.last_prompt)
+    }
+
     pub fn close_prompt_detail(&mut self) {
         self.prompt_detail = None;
     }
@@ -716,13 +753,37 @@ impl App {
         }
     }
 
-    /// Toggles which of the details modal's Logs/Reminders panes currently
-    /// holds keyboard focus - the `Tab` key while the modal is open.
+    /// Cycles keyboard focus forward through the details modal's five panes,
+    /// in `ModalFocus`'s declared order - the `Tab` key while the modal is
+    /// open.
     pub fn toggle_modal_focus(&mut self) {
         self.modal_focus = match self.modal_focus {
-            ModalFocus::Logs => ModalFocus::Reminders,
-            ModalFocus::Reminders => ModalFocus::Logs,
+            ModalFocus::Agents => ModalFocus::Tests,
+            ModalFocus::Tests => ModalFocus::Reminders,
+            ModalFocus::Reminders => ModalFocus::LastPrompt,
+            ModalFocus::LastPrompt => ModalFocus::Logs,
+            ModalFocus::Logs => ModalFocus::Agents,
         };
+    }
+
+    /// Cycles keyboard focus backward through the details modal's five
+    /// panes, in the reverse of `ModalFocus`'s declared order - the
+    /// `Shift+Tab` (`BackTab`) key while the modal is open.
+    pub fn toggle_modal_focus_reverse(&mut self) {
+        self.modal_focus = match self.modal_focus {
+            ModalFocus::Agents => ModalFocus::Logs,
+            ModalFocus::Tests => ModalFocus::Agents,
+            ModalFocus::Reminders => ModalFocus::Tests,
+            ModalFocus::LastPrompt => ModalFocus::Reminders,
+            ModalFocus::Logs => ModalFocus::LastPrompt,
+        };
+    }
+
+    /// Moves keyboard focus directly to `focus` - the details modal's
+    /// per-pane shortcut keys (`a`/`t`/`r`/`p`/`l`), regardless of which pane
+    /// previously held it.
+    pub fn set_modal_focus(&mut self, focus: ModalFocus) {
+        self.modal_focus = focus;
     }
 
     /// The activity log's entries after applying the current filter and
@@ -966,6 +1027,33 @@ impl App {
         }
     }
 
+    /// The number of agents shown in the details modal's Agents pane for
+    /// whichever project it's currently open on - 0 if no details modal is
+    /// open.
+    fn modal_agents_len(&self) -> usize {
+        match &self.modal {
+            Some(Modal::Details(cwd)) => {
+                self.directory_groups().into_iter().find(|g| &g.cwd == cwd).map_or(0, |g| g.agents.len())
+            }
+            _ => 0,
+        }
+    }
+
+    /// The number of rows shown in the details modal's Tests pane for
+    /// whichever project it's currently open on - 0 or 1, since the pane
+    /// shows only that project's last test run, if any. 0 if no details
+    /// modal is open.
+    fn modal_tests_len(&self) -> usize {
+        match &self.modal {
+            Some(Modal::Details(cwd)) => self
+                .directory_groups()
+                .into_iter()
+                .find(|g| &g.cwd == cwd)
+                .is_some_and(|g| !g.test_runs.is_empty()) as usize,
+            _ => 0,
+        }
+    }
+
     fn clamp_reminders_selected(&mut self) {
         let len = self.visible_reminders().len();
         self.reminders_pagination.clamp_selected(len);
@@ -1022,6 +1110,62 @@ impl App {
     pub fn jump_modal_reminders_to_end(&mut self, page_size: usize) {
         let len = self.modal_reminders_len();
         self.modal_reminders_pagination.jump_to_end(len, page_size);
+    }
+
+    /// Moves the details modal's Agents pane's own selection by `delta`
+    /// lines - see `move_modal_logs_selection`, scoped to the Agents pane.
+    pub fn move_modal_agents_selection(&mut self, delta: isize, page_size: usize) {
+        let len = self.modal_agents_len();
+        self.modal_agents_pagination.move_by(delta, len, page_size);
+    }
+
+    /// Moves the details modal's Agents pane's own selection by a full page -
+    /// see `page_modal_logs`.
+    pub fn page_modal_agents(&mut self, direction: isize, page_size: usize) {
+        let len = self.modal_agents_len();
+        self.modal_agents_pagination.page(direction, len, page_size);
+    }
+
+    /// Jumps the details modal's Agents pane's own selection to its first
+    /// entry.
+    pub fn jump_modal_agents_to_start(&mut self, page_size: usize) {
+        let len = self.modal_agents_len();
+        self.modal_agents_pagination.jump_to_start(len, page_size);
+    }
+
+    /// Jumps the details modal's Agents pane's own selection to its last
+    /// entry.
+    pub fn jump_modal_agents_to_end(&mut self, page_size: usize) {
+        let len = self.modal_agents_len();
+        self.modal_agents_pagination.jump_to_end(len, page_size);
+    }
+
+    /// Moves the details modal's Tests pane's own selection by `delta`
+    /// lines - see `move_modal_logs_selection`, scoped to the Tests pane.
+    pub fn move_modal_tests_selection(&mut self, delta: isize, page_size: usize) {
+        let len = self.modal_tests_len();
+        self.modal_tests_pagination.move_by(delta, len, page_size);
+    }
+
+    /// Moves the details modal's Tests pane's own selection by a full page -
+    /// see `page_modal_logs`.
+    pub fn page_modal_tests(&mut self, direction: isize, page_size: usize) {
+        let len = self.modal_tests_len();
+        self.modal_tests_pagination.page(direction, len, page_size);
+    }
+
+    /// Jumps the details modal's Tests pane's own selection to its first
+    /// entry.
+    pub fn jump_modal_tests_to_start(&mut self, page_size: usize) {
+        let len = self.modal_tests_len();
+        self.modal_tests_pagination.jump_to_start(len, page_size);
+    }
+
+    /// Jumps the details modal's Tests pane's own selection to its last
+    /// entry.
+    pub fn jump_modal_tests_to_end(&mut self, page_size: usize) {
+        let len = self.modal_tests_len();
+        self.modal_tests_pagination.jump_to_end(len, page_size);
     }
 
     pub fn cycle_reminders_sort(&mut self) {
@@ -2686,17 +2830,60 @@ mod tests {
     }
 
     #[test]
-    fn toggle_modal_focus_switches_between_logs_and_reminders() {
+    fn toggle_modal_focus_cycles_through_all_five_panes_in_order() {
         let mut app = App::new();
         app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
         app.open_details_modal();
         assert_eq!(app.modal_focus, ModalFocus::Logs);
 
         app.toggle_modal_focus();
+        assert_eq!(app.modal_focus, ModalFocus::Agents);
+
+        app.toggle_modal_focus();
+        assert_eq!(app.modal_focus, ModalFocus::Tests);
+
+        app.toggle_modal_focus();
         assert_eq!(app.modal_focus, ModalFocus::Reminders);
 
         app.toggle_modal_focus();
+        assert_eq!(app.modal_focus, ModalFocus::LastPrompt);
+
+        app.toggle_modal_focus();
         assert_eq!(app.modal_focus, ModalFocus::Logs);
+    }
+
+    #[test]
+    fn toggle_modal_focus_reverse_cycles_through_all_five_panes_in_reverse_order() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        assert_eq!(app.modal_focus, ModalFocus::Logs);
+
+        app.toggle_modal_focus_reverse();
+        assert_eq!(app.modal_focus, ModalFocus::LastPrompt);
+
+        app.toggle_modal_focus_reverse();
+        assert_eq!(app.modal_focus, ModalFocus::Reminders);
+
+        app.toggle_modal_focus_reverse();
+        assert_eq!(app.modal_focus, ModalFocus::Tests);
+
+        app.toggle_modal_focus_reverse();
+        assert_eq!(app.modal_focus, ModalFocus::Agents);
+
+        app.toggle_modal_focus_reverse();
+        assert_eq!(app.modal_focus, ModalFocus::Logs);
+    }
+
+    #[test]
+    fn set_modal_focus_moves_directly_to_the_given_pane() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+        assert_eq!(app.modal_focus, ModalFocus::Logs);
+
+        app.set_modal_focus(ModalFocus::Reminders);
+        assert_eq!(app.modal_focus, ModalFocus::Reminders);
     }
 
     #[test]

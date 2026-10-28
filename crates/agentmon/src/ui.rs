@@ -87,9 +87,9 @@ fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) -> PageSizes 
         Tab::Reminders => reminders_tab = render_reminders_tab(frame, app, chunks[1], banner),
     }
 
-    let (modal_logs, modal_reminders) = match &app.modal {
+    let (modal_logs, modal_reminders, modal_agents, modal_tests) = match &app.modal {
         Some(modal) => render_modal(frame, app, modal),
-        None => (0, 0),
+        None => (0, 0, 0, 0),
     };
 
     // Unlike the reminder form, the rename form is reachable with no
@@ -107,7 +107,7 @@ fn render_body(frame: &mut Frame, app: &App, banner: Option<&str>) -> PageSizes 
         render_prompt_detail_modal(frame, detail);
     }
 
-    PageSizes { logs_tab, modal_logs, reminders_tab, modal_reminders }
+    PageSizes { logs_tab, modal_logs, reminders_tab, modal_reminders, modal_agents, modal_tests }
 }
 
 /// Renders the full-prompt modal: `detail`'s text, word-wrapped to the
@@ -755,15 +755,15 @@ fn logs_filter_state(app: &App) -> String {
 
 /// Draws `modal` centered on top of whatever tab is currently shown. Returns
 /// `(modal_logs_page_size, modal_reminders_page_size)`.
-fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) -> (usize, usize) {
+fn render_modal(frame: &mut Frame, app: &App, modal: &Modal) -> (usize, usize, usize, usize) {
     let page_sizes = match modal {
         Modal::Help => {
             render_help_modal(frame);
-            (0, 0)
+            (0, 0, 0, 0)
         }
         Modal::QuitConfirm => {
             render_quit_confirm_modal(frame);
-            (0, 0)
+            (0, 0, 0, 0)
         }
         Modal::Details(cwd) => render_details_modal(frame, app, cwd),
     };
@@ -806,29 +806,57 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// "Project details modal" requirement.
 const LAST_PROMPT_PANE_HEIGHT: u16 = 4;
 
+/// Border style for one of the details modal's five panes: the default
+/// border color when it holds keyboard focus, a visually dimmer color
+/// otherwise - see the "Project details modal" requirement's focus-color
+/// indicator.
+fn pane_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+    } else {
+        Style::new().fg(Color::DarkGray)
+    }
+}
+
 /// Renders the selected project's details modal: five panes covering its
 /// registered agents, its last test run (if any), its reminders, the most
 /// recently active agent's last prompt, and its recent activity log
 /// entries, per the "Project details modal" requirement. Returns
-/// `(logs_page_size, reminders_page_size)` (see `render` / `PageSizes`).
-fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usize) {
+/// `(logs_page_size, reminders_page_size, agents_page_size, tests_page_size)`
+/// (see `render` / `PageSizes`).
+fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usize, usize, usize) {
     let area = centered_rect(80, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
         .title(format!("Details - {}  Rename [n]", app.project_name(cwd)))
+        .title_bottom("<tab> focus pane")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Agents, Tests, and Reminders share the top third, side by side; a
-    // thin Last Prompt strip comes next; Logs - typically the
-    // longest-running list - gets whatever remains beneath that.
+    let group = app.directory_groups().into_iter().find(|g| g.cwd == cwd);
+
+    // The Agents, Tests, and Reminders panes share one height: collapsed to
+    // a single content line (plus a blank line beneath it) by default, and
+    // growing with whichever of the three currently needs the most room, up
+    // to a cap of one third of the modal - per the "Project details modal"
+    // requirement. A pane whose content exceeds that cap paginates instead
+    // of growing further. The Last Prompt strip stays fixed-height, and Logs
+    // - typically the longest-running list - gets whatever remains beneath
+    // that.
+    let agents_len = group.as_ref().map_or(0, |g| g.agents.len());
+    let tests_len = group.as_ref().map_or(0, |g| usize::from(!g.test_runs.is_empty()));
+    let reminders_len = app.project_reminders(cwd).len();
+    let top_row_cap = (inner.height / 3).max(2);
+    let max_content_lines = agents_len.max(tests_len).max(reminders_len);
+    let top_row_height = if max_content_lines <= 1 { 2 } else { (max_content_lines as u16).min(top_row_cap) };
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Ratio(1, 3),
+            Constraint::Length(top_row_height + 2),
             Constraint::Length(LAST_PROMPT_PANE_HEIGHT),
             Constraint::Min(0),
         ])
@@ -840,53 +868,9 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     let (agents_area, tests_area, reminders_area) = (top[0], top[1], top[2]);
     let (last_prompt_area, logs_area) = (rows[1], rows[2]);
 
-    let group = app.directory_groups().into_iter().find(|g| g.cwd == cwd);
-    let now = now_ms();
-
-    let agents_lines: Vec<Line> = match &group {
-        Some(g) if !g.agents.is_empty() => g
-            .agents
-            .iter()
-            .map(|a| {
-                let (text, style) = status_cell_text_and_style(a, now, false);
-                Line::from(vec![
-                    Span::styled(text, style),
-                    Span::raw(format!("  pid {}", a.pid)),
-                ])
-            })
-            .collect(),
-        _ => vec![Line::from("No agents")],
-    };
-    frame.render_widget(
-        Paragraph::new(agents_lines).block(
-            Block::default()
-                .title("Agents")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        ),
-        agents_area,
-    );
-
-    let tests_lines: Vec<Line> = match group.as_ref().and_then(|g| g.test_runs.first()) {
-        Some(test_run) => {
-            let (label, style) = test_run_status_cell_text_and_style(test_run.status, false);
-            let text = format!("{label} {}", format_test_run_duration(test_run, now));
-            vec![Line::from(Span::styled(text, style))]
-        }
-        None => vec![Line::from("No test run")],
-    };
-    frame.render_widget(
-        Paragraph::new(tests_lines).block(
-            Block::default()
-                .title("Tests")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        ),
-        tests_area,
-    );
-
-    render_last_prompt_pane(frame, &group, last_prompt_area);
-
+    let agents_page_size = render_agents_pane(frame, app, &group, agents_area);
+    let tests_page_size = render_tests_pane(frame, app, &group, tests_area);
+    render_last_prompt_pane(frame, app, last_prompt_area);
     let reminders_page_size = render_reminders_pane(frame, app, cwd, reminders_area);
 
     let project_logs = app.project_logs(cwd);
@@ -895,7 +879,11 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     // No header row in this pane (per the "Project details modal"
     // requirement), so every visible row is content - unlike the Logs tab,
     // whose header eats one row of its page size.
-    let bare_logs_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let logs_focused = matches!(app.modal_focus, ModalFocus::Logs);
+    let bare_logs_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(logs_focused));
     let logs_inner = bare_logs_block.inner(logs_area);
     let logs_page_size = logs_inner.height as usize;
 
@@ -927,7 +915,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
             .collect()
     };
     let paginated = needs_pagination(project_logs.len(), logs_page_size);
-    let logs_title = if paginated { "Logs  |  Page [d/u]  Top/Bottom [g/G]" } else { "Logs" };
+    let logs_title = if paginated { "Logs [l]  |  Page [d/u]  Top/Bottom [g/G]" } else { "Logs [l]" };
     let logs_block = bare_logs_block.title(logs_title);
 
     let logs_table = Table::new(logs_rows, logs_widths)
@@ -940,9 +928,9 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
     // paginate needs a selected row, so `Enter` has something to act on
     // (e.g. opening the full-prompt modal for a truncated prompt entry; see
     // the "Prompt entry full-text modal" requirement). The highlight still
-    // requires this pane to hold focus, now that the Reminders pane can hold
-    // it instead.
-    let selected = if !project_logs.is_empty() && matches!(app.modal_focus, ModalFocus::Logs) {
+    // requires this pane to hold focus, now that four of the five panes can
+    // hold it.
+    let selected = if !project_logs.is_empty() && logs_focused {
         Some(app.modal_logs_pagination.display_selected(project_logs.len()))
     } else {
         None
@@ -955,7 +943,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
         render_pagination_scrollbar(frame, logs_area, project_logs.len(), logs_top, logs_page_size);
     }
 
-    (logs_page_size, reminders_page_size)
+    (logs_page_size, reminders_page_size, agents_page_size, tests_page_size)
 }
 
 /// Shown in the Last Prompt pane when the project has no tracked agent, or
@@ -965,30 +953,125 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
 const NO_PROMPT_CAPTURED_PLACEHOLDER: &str = "No prompt captured yet";
 
 /// Renders the details modal's Last Prompt pane: the last-prompt text of
-/// whichever agent in this project most recently had a status update - the
-/// tracked agent with the greatest last-updated timestamp - so it tracks
-/// "the agent that just finished or needs input" as attention moves between
-/// agents in a multi-agent project. Non-interactive, like the Agents and
-/// Tests panes: no selection, no scrolling. See the "Project details modal"
-/// requirement.
-fn render_last_prompt_pane(frame: &mut Frame, group: &Option<DirectoryGroup>, area: Rect) {
+/// whichever agent in this project most recently had a status update - see
+/// `App::modal_last_prompt` - so it tracks "the agent that just finished or
+/// needs input" as attention moves between agents in a multi-agent project.
+/// Unlike the Agents, Tests, Reminders, and Logs panes, it has no selection
+/// or scrolling - content beyond its fixed height is truncated instead. It
+/// can still hold keyboard focus, and `Enter` opens the full-prompt modal
+/// with this same text (see `App::modal_last_prompt` and its use in
+/// `input.rs`). See the "Project details modal" requirement.
+fn render_last_prompt_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = matches!(app.modal_focus, ModalFocus::LastPrompt);
     let block = Block::default()
-        .title("Last Prompt")
+        .title("Last Prompt [p]")
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(focused));
     let inner = block.inner(area);
 
-    let text = group
-        .as_ref()
-        .and_then(|g| g.agents.iter().max_by_key(|a| a.last_updated_ms))
-        .and_then(|a| a.last_prompt.as_deref())
-        .unwrap_or(NO_PROMPT_CAPTURED_PLACEHOLDER);
+    let text = app.modal_last_prompt().unwrap_or_else(|| NO_PROMPT_CAPTURED_PLACEHOLDER.to_string());
 
-    let lines: Vec<Line> = wrap_prompt(text, inner.width as usize, inner.height as usize)
+    let lines: Vec<Line> = wrap_prompt(&text, inner.width as usize, inner.height as usize)
         .into_iter()
         .map(Line::from)
         .collect();
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Renders the details modal's Agents pane: every agent registered for the
+/// project, paginated once they overflow the pane's current (dynamically
+/// sized) height - see the "Project details modal" requirement. Unlike the
+/// Logs pane, its title never shows a pagination hint, whether or not it is
+/// currently paginated - a scrollbar is its only pagination indicator.
+/// Returns its `page_size`.
+fn render_agents_pane(frame: &mut Frame, app: &App, group: &Option<DirectoryGroup>, area: Rect) -> usize {
+    let now = now_ms();
+    let agents: &[AgentInfo] = group.as_ref().map_or(&[], |g| g.agents.as_slice());
+
+    let focused = matches!(app.modal_focus, ModalFocus::Agents);
+    let bare_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(focused));
+    let inner = bare_block.inner(area);
+    let page_size = inner.height as usize;
+
+    let rows: Vec<Row> = if agents.is_empty() {
+        vec![Row::new([Cell::from("No agents")])]
+    } else {
+        agents
+            .iter()
+            .map(|a| {
+                let (text, style) = status_cell_text_and_style(a, now, false);
+                Row::new([Cell::from(Line::from(vec![
+                    Span::styled(text, style),
+                    Span::raw(format!("  pid {}", a.pid)),
+                ]))])
+            })
+            .collect()
+    };
+
+    let block = bare_block.title("Agents [a]");
+    let table = Table::new(rows, [Constraint::Fill(1)])
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
+        .block(block);
+
+    let selected =
+        if focused && !agents.is_empty() { Some(app.modal_agents_pagination.display_selected(agents.len())) } else { None };
+    let top = app.modal_agents_pagination.display_top(agents.len(), page_size);
+    let mut state = TableState::default().with_selected(selected).with_offset(top);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if needs_pagination(agents.len(), page_size) {
+        render_pagination_scrollbar(frame, area, agents.len(), top, page_size);
+    }
+
+    page_size
+}
+
+/// Renders the details modal's Tests pane: that project's last test run, if
+/// any - see the "Project details modal" requirement. Built on the same
+/// paginated-pane machinery as the Agents pane for consistency, even though
+/// it holds at most one row today; like the Agents pane, its title never
+/// shows a pagination hint.
+fn render_tests_pane(frame: &mut Frame, app: &App, group: &Option<DirectoryGroup>, area: Rect) -> usize {
+    let now = now_ms();
+    let test_run = group.as_ref().and_then(|g| g.test_runs.first());
+
+    let focused = matches!(app.modal_focus, ModalFocus::Tests);
+    let bare_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(focused));
+    let inner = bare_block.inner(area);
+    let page_size = inner.height as usize;
+
+    let row_count = usize::from(test_run.is_some());
+    let rows: Vec<Row> = match test_run {
+        Some(test_run) => {
+            let (label, style) = test_run_status_cell_text_and_style(test_run.status, false);
+            let text = format!("{label} {}", format_test_run_duration(test_run, now));
+            vec![Row::new([Cell::from(Line::from(Span::styled(text, style)))])]
+        }
+        None => vec![Row::new([Cell::from("No test run")])],
+    };
+
+    let block = bare_block.title("Tests [t]");
+    let table = Table::new(rows, [Constraint::Fill(1)])
+        .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
+        .block(block);
+
+    let selected = if focused && row_count > 0 { Some(app.modal_tests_pagination.display_selected(row_count)) } else { None };
+    let top = app.modal_tests_pagination.display_top(row_count, page_size);
+    let mut state = TableState::default().with_selected(selected).with_offset(top);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if needs_pagination(row_count, page_size) {
+        render_pagination_scrollbar(frame, area, row_count, top, page_size);
+    }
+
+    page_size
 }
 
 /// Word-wraps `text` to `width` display columns, treating embedded newlines
@@ -1072,10 +1155,14 @@ fn truncate_text_with_ellipsis(text: &str, max_width: usize) -> String {
 fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -> usize {
     let now = now_ms();
     let reminders = app.project_reminders(cwd);
+    let focused = matches!(app.modal_focus, ModalFocus::Reminders);
 
     let widths = [Constraint::Fill(2), Constraint::Length(9), Constraint::Fill(2)];
 
-    let bare_block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded);
+    let bare_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(pane_border_style(focused));
     let inner = bare_block.inner(area);
     let page_size = inner.height as usize;
 
@@ -1108,13 +1195,12 @@ fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -
             .collect()
     };
 
-    let block = bare_block.title("Reminders  |  New [R]");
+    let block = bare_block.title("Reminders [r]  |  New [R]");
 
     let table = Table::new(rows, widths)
         .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
         .block(block);
 
-    let focused = matches!(app.modal_focus, ModalFocus::Reminders);
     let selected = if focused && !reminders.is_empty() {
         Some(app.modal_reminders_pagination.display_selected(reminders.len()))
     } else {
