@@ -249,6 +249,8 @@ The TUI SHALL detect when its connection to the daemon drops and attempt to reco
 ### Requirement: Tab navigation between Agents and Logs
 The TUI SHALL organize its display into three tabs: **Agents** (the existing project table), **Logs** (an aggregated activity log view), and **Reminders** (an aggregated, cross-project reminder list). The user SHALL be able to cycle between tabs with the `Tab` key, and jump directly to a tab with `A`/`a` (Agents), `L`/`l` (Logs), or `R`/`r` (Reminders).
 
+The tab bar SHALL show each tab's label prefixed with the same emoji marker used for that category elsewhere in the TUI: 🤖 for Agents, 🪵 for Logs, and ⏰ for Reminders - the same markers the project details modal's Agents and Logs panes and Reminders pane use. This prefix is purely visual and SHALL NOT change a tab's keyboard shortcut, its position in the cycling order, or any other tab-bar content.
+
 #### Scenario: Cycling tabs
 - **WHEN** the user presses `Tab`
 - **THEN** the TUI switches to the next tab in the Agents -> Logs -> Reminders -> Agents cycle
@@ -256,6 +258,10 @@ The TUI SHALL organize its display into three tabs: **Agents** (the existing pro
 #### Scenario: Jumping directly to a tab
 - **WHEN** the user presses `A`/`a`, `L`/`l`, or `R`/`r`
 - **THEN** the TUI switches to the Agents, Logs, or Reminders tab respectively, even if that tab is already active
+
+#### Scenario: Each tab's label is prefixed with a category emoji
+- **WHEN** the TUI renders its tab bar
+- **THEN** the Agents, Logs, and Reminders tab labels each begin with 🤖, 🪵, and ⏰ respectively, ahead of the tab's name and its shortcut hint
 
 ### Requirement: Agents tab supports row selection
 The Agents tab SHALL support moving a selection cursor over its project rows using the `j`/`down` (next row) and `k`/`up` (previous row) keys, so a specific project can be chosen for its details view. The selection SHALL be visually distinguished from unselected rows.
@@ -276,6 +282,8 @@ The Agents, Tests, and Reminders panes SHALL be arranged side by side (by width)
 Agent and test-run statuses in the Agents and Tests panes, reminder statuses in the Reminders pane, and log entry statuses in the Logs pane, SHALL use the same emoji markers, color styling, and duration as their counterparts in the Agents tab, Reminders tab, and Logs tab respectively, so status is visually consistent wherever it appears; the Agents, Tests, and Reminders panes SHALL omit the category-word prefix used in the Agents, Reminders, and Logs tabs, since each pane itself already establishes the category (e.g. "🤖 done", "❌ failed", "✅ done, 10m"); the modal's Logs pane SHALL include the category-word prefix, consistent with the top-level Logs tab it mirrors. The user SHALL be able to close the modal with `Esc`, returning to whichever tab was active without altering the underlying agent, test-run, or reminder state.
 
 The Agents, Tests, and Reminders panes SHALL each be paginated per the "Paginated lists support keyboard navigation" requirement once they hold more content than fits within their current (possibly capped) height. Unlike the Logs pane, none of these three SHALL ever show a pagination keyboard-shortcut hint in its title, whether or not they are currently paginated; a scrollbar is their only pagination indicator. The Reminders pane's title SHALL always show a hint for creating a new reminder (`New [R]`) instead; the Agents and Tests panes' titles show only their pane name and focus-shortcut hint.
+
+Each pane's title SHALL additionally be prefixed with an emoji identifying its category, ahead of the pane name itself: 🤖 for Agents, 🧪 for Tests, ⏰ for Reminders, and 🗣️ for Last Prompt, each reusing the same marker already shown for that category's status elsewhere in the TUI (per the "Status is visually distinguishable" requirement's emoji markers and the 🗣️ marker used for prompt-category log entries); the Logs pane, which has no pre-existing status marker of its own, SHALL use 🪵. This prefix is purely visual and SHALL NOT change a title's existing focus-shortcut hint, pagination hint, or (for the Reminders pane) its `New [R]` hint, nor affect any keyboard behavior.
 
 Each of the modal's five panes SHALL show a single-key focus shortcut hint in its title: `a` for Agents, `t` for Tests, `r` for Reminders, `p` for Last Prompt, and `l` for Logs. Pressing that key while the modal is open SHALL move keyboard focus directly to the corresponding pane, regardless of which pane currently holds it. Exactly one of the modal's five panes holds keyboard focus at a time; the `Tab` key cycles focus forward through all five, in the order Agents, Tests, Reminders, Last Prompt, Logs, wrapping back to Agents after Logs, while `Shift+Tab` cycles focus through that same order in reverse, wrapping from Agents back to Logs. Opening the modal from the Agents tab or the Logs tab SHALL default focus to the Logs pane, unchanged from before this requirement's focus model was extended to all five panes, while opening it from the Reminders tab SHALL default focus to the Reminders pane with the reminder that was selected in the Reminders tab highlighted.
 
@@ -319,7 +327,11 @@ The Last Prompt pane SHALL show the last-prompt text of whichever agent register
 
 #### Scenario: The Agents and Tests panes never show a pagination hint in their titles
 - **WHEN** the details modal's Agents or Tests pane holds more content than fits on a single page
-- **THEN** that pane renders a scrollbar, but its title shows only its pane name and focus-shortcut hint, never a pagination keyboard-shortcut hint
+- **THEN** that pane renders a scrollbar, but its title shows only its emoji prefix, pane name, and focus-shortcut hint, never a pagination keyboard-shortcut hint
+
+#### Scenario: Each pane's title is prefixed with a category emoji
+- **WHEN** the details modal is open
+- **THEN** the Agents, Tests, Reminders, Last Prompt, and Logs panes' titles each begin with 🤖, 🧪, ⏰, 🗣️, and 🪵 respectively, ahead of the pane's name and its other title content
 
 #### Scenario: Each pane's title shows its focus-shortcut hint
 - **WHEN** the details modal is open
@@ -415,7 +427,7 @@ The Last Prompt pane SHALL show the last-prompt text of whichever agent register
 
 #### Scenario: The Logs pane's title gains a pagination hint once its entries overflow a page
 - **WHEN** the details modal's Logs pane holds more entries than fit on a single page
-- **THEN** its "Logs" pane title shows a hint for the pagination keys, alongside its `[l]` focus-shortcut hint
+- **THEN** its "🪵 Logs" pane title shows a hint for the pagination keys, alongside its `[l]` focus-shortcut hint
 
 #### Scenario: No selection, scrollbar, or hint when the Logs pane's entries all fit on one page
 - **WHEN** the details modal opens for a project whose activity log entries all fit within the Logs pane's single page
@@ -431,7 +443,7 @@ The Last Prompt pane SHALL show the last-prompt text of whichever agent register
 
 #### Scenario: The Reminders pane's title always shows the create hint
 - **WHEN** the details modal's Reminders pane renders its title, whether or not its reminders overflow a single page
-- **THEN** the title shows its `[r]` focus-shortcut hint and the `New [R]` hint, and never a pagination keyboard-shortcut hint
+- **THEN** the title shows its emoji prefix, its `[r]` focus-shortcut hint, and the `New [R]` hint, and never a pagination keyboard-shortcut hint
 
 #### Scenario: An unfocused Reminders pane ignores its selection-dependent action keys
 - **WHEN** the Logs pane holds focus and the user presses `Enter`, `s`, `e`, `Delete`, or `Backspace`
@@ -506,6 +518,8 @@ When the details modal's Logs pane holds focus and the user presses `Enter` on i
 
 ### Requirement: Logs tab shows an aggregated, paginated activity list
 The Logs tab SHALL display the activity log entries received from the daemon, aggregated across all projects (including prompt-category entries), as a paginated list ordered by recency (most recent first) by default; when a prompt-category entry and the agent-category "started" entry it precipitated share the same event-occurred time, the prompt entry SHALL sort ahead of (be shown as more recent than) that started entry, consistent with the order the daemon recorded them in. Each entry SHALL show at least its status, event category, project, and event time, in that left-to-right column order - STATUS leftmost, then CATEGORY, then PROJECT, then event time as the last (rightmost) column, consistent with the Agents tab's UPDATED column - so the narrow margin still visible around the details modal's centered overlay shows status/prompt text rather than a project name. Each entry's status SHALL use the same emoji marker and color styling as that status uses in the Agents tab, so status is visually distinguishable the same way it already is there. The PROJECT column's width SHALL be sized to the widest project display name among the currently displayed entries (never narrower than its own "PROJECT" header), taking a user-assigned custom project name into account the same as a directory-derived default name, rather than a fixed proportional share of the table width. Once PROJECT, CATEGORY, and TIME have what they need, the STATUS column SHALL receive the remaining available width, so STATUS - not PROJECT - gets priority for any extra room and is the last of the two to have its content truncated. To keep an unusually long project name from squeezing STATUS down to an unusable width, PROJECT SHALL be capped at half of the combined width available to PROJECT and STATUS; content that doesn't fit within PROJECT's resulting width is clipped without an ellipsis, consistent with how the Agents tab's PROJECT column already handles an oversized name. A test-run entry whose status is "passed" or "failed", an agent entry whose status is "done", or a reminder entry whose status is "finished" or "stopped", SHALL additionally show the elapsed duration of that run/task/reminder, computed from the most recent preceding "started" entry of the same category logged for the same project - for a reminder entry, additionally matched to the "started" entry recording the same reminder name, since a project can have more than one reminder interleaved in the log and an agent/test-run has no equivalent identity to disambiguate by. A reminder entry whose status is "started" SHALL additionally show its recorded ETA (the reminder's local-time due time, `h:MM AM/PM`, as recorded on that entry - see the activity-log capability), rather than the elapsed duration shown for other completed entries, since a just-started reminder has no elapsed run to show. An agent entry ("started", "done", or "needs input") that was recorded with a last-prompt snapshot SHALL additionally show a snippet of that prompt text after its existing content, as a single line truncated with a trailing `...` rather than overflowing the row; an agent entry recorded with no last-prompt snapshot SHALL show no such snippet. A prompt-category entry's entire label, beyond its 🗣️ marker, SHALL be its recorded prompt text rendered as a single-line snippet, separated from the marker by a single space, truncated with a trailing `...` rather than overflowing the row - unlike an agent entry's snippet (appended after other status content), a prompt entry's snippet is its only content, and unlike an agent entry's snapshot, a prompt entry's snippet is never absent. Both kinds of snippet SHALL be sized against the STATUS column's actual rendered width at the current terminal size, the same way the Agents tab's AGENTS and REMINDERS columns and the details modal's Reminders pane size their own truncation against their real rendered width, rather than against a fixed character count chosen independently of how much room the column actually has - so a wider terminal shows more of the prompt instead of leaving the column's unused width blank. Whenever the list holds more entries than fit on a single page, the Logs tab SHALL display a Ratatui vertical `Scrollbar` widget along its right edge, positioned so the scrollbar's thumb reaches the very bottom of its track when the list's last page is being shown (and the very top when its first page is being shown), and its heading SHALL append a pagination keyboard-shortcut hint alongside its existing sort and filter hints; neither the scrollbar nor the pagination hint SHALL be shown when every (filtered) entry already fits on a single page.
+
+The Logs tab's heading SHALL additionally be prefixed with 🪵, the same marker used for the Logs pane in the project details modal and the Logs tab in the tab bar, ahead of its sort, filter, and pagination hints. This prefix is purely visual and SHALL NOT change the heading's existing hints or any keyboard behavior.
 
 #### Scenario: Logs tab lists recent activity across projects
 - **WHEN** the user switches to the Logs tab
@@ -611,6 +625,10 @@ The Logs tab SHALL display the activity log entries received from the daemon, ag
 - **WHEN** the terminal is wide enough that the Logs tab's STATUS column (or the details modal's Logs pane) renders wider than it would at a narrower terminal size, and a prompt-category or last-prompt-snapshot entry's full text exceeds what fit at the narrower size
 - **THEN** the rendered snippet shows more of that entry's text than it did at the narrower size, up to the column's new width, rather than staying capped at the same fixed length regardless of the column's actual width
 
+#### Scenario: The Logs tab's heading is prefixed with a category emoji
+- **WHEN** the user switches to the Logs tab
+- **THEN** its heading begins with 🪵, ahead of its sort and filter hints
+
 ### Requirement: Logs tab supports sorting and filtering
 The Logs tab SHALL support sorting its entries by recency (the default), by Project, or by Status, and filtering the displayed entries by Project or by Status.
 
@@ -628,6 +646,8 @@ The Logs tab SHALL support sorting its entries by recency (the default), by Proj
 
 ### Requirement: Reminders tab shows an aggregated, paginated reminder list
 The Reminders tab SHALL display every project's reminders, aggregated across all projects, as a paginated list ordered by recency (the last time each reminder completed a run - stopped or naturally finished - most recent first) by default. Each row SHALL show the reminder's Project, Name, Duration (in minutes), Status, and Updated columns. The Status column SHALL be blank when the reminder has no started/stopped/finished log event yet (it is still not-yet-started). While a reminder is running, the Status column SHALL show its live elapsed duration and its estimated time of completion, formatted like "Running 1m23s, ETA: 12:34 PM", prefixed with the ⏳ marker, and kept current by the TUI's own periodic redraw, consistent with a running agent's or test run's duration. Once a reminder is done (stopped or finished), the Status column SHALL show its elapsed duration formatted like "Done 10m", prefixed with the ✅ marker. The Updated column SHALL show the time of the reminder's most recent started, stopped, or finished log event, or, if it has none, the time the reminder was created. Whenever the list holds more reminders than fit on a single page, the Reminders tab SHALL display a Ratatui vertical `Scrollbar` widget along its right edge, positioned so the scrollbar's thumb reaches the very bottom of its track when the list's last page is being shown (and the very top when its first page is being shown), and its heading SHALL append a pagination keyboard-shortcut hint alongside its existing sort and filter hints; neither the scrollbar nor the pagination hint SHALL be shown when every (filtered) reminder already fits on a single page.
+
+The Reminders tab's heading SHALL additionally be prefixed with ⏰, the same marker used for the Reminders pane in the project details modal and the Reminders tab in the tab bar, ahead of its sort, filter, and pagination hints. This prefix is purely visual and SHALL NOT change the heading's existing hints or any keyboard behavior.
 
 #### Scenario: Reminders tab lists reminders across projects
 - **WHEN** the user switches to the Reminders tab
@@ -656,6 +676,10 @@ The Reminders tab SHALL display every project's reminders, aggregated across all
 #### Scenario: No scrollbar when everything fits on one page
 - **WHEN** the Reminders tab's (filtered) reminders all fit within a single page
 - **THEN** no scrollbar is rendered
+
+#### Scenario: The Reminders tab's heading is prefixed with a category emoji
+- **WHEN** the user switches to the Reminders tab
+- **THEN** its heading begins with ⏰, ahead of its sort and filter hints
 
 ### Requirement: Reminders tab supports sorting and filtering
 The Reminders tab SHALL support sorting its reminders by recency (the default, per the last completed run), by Project, or by Status, and filtering the displayed reminders by Project or by Status, mirroring the Logs tab's sort/filter controls. Because `s` is reserved on the Reminders tab for starting/stopping the highlighted reminder, the status filter SHALL cycle on `f` instead of `s`; the sort-cycle key (`o`), the project-filter-cycle key (`p`), and the clear-filters key (`c`) SHALL remain the same as the Logs tab's.
@@ -751,9 +775,11 @@ When the Agents tab has no tracked agents or test runs, and when the Logs tab's 
 ### Requirement: Agents tab splits agent and test-run status into separate columns
 The Agents tab SHALL display a project's agent status(es) and its test-run status in two separate columns, **Agents** and **Tests**, instead of one combined STATUS column. The Agents column SHALL show that project's tracked agent(s)' status(es); the Tests column SHALL show that project's test run status, if any, or remain empty if the project has no tracked test run.
 
+The `AGENTS` and `TESTS` column headers SHALL each be prefixed with the same emoji marker used for that category elsewhere in the TUI: 🤖 for `AGENTS` and 🧪 for `TESTS`.
+
 #### Scenario: The Agents tab header shows separate columns
 - **WHEN** the Agents tab renders its header row
-- **THEN** it shows "AGENTS" and "TESTS" as separate column headers rather than a single "STATUS" header
+- **THEN** it shows "🤖 AGENTS" and "🧪 TESTS" as separate column headers rather than a single "STATUS" header
 
 #### Scenario: A project with only agents leaves the Tests column empty
 - **WHEN** a project has tracked agent(s) but no tracked test run
@@ -765,6 +791,8 @@ The Agents tab SHALL display a project's agent status(es) and its test-run statu
 
 ### Requirement: Agents tab shows a Reminders column
 The Agents tab SHALL display a fourth column, **Reminders**, alongside PROJECT, Agents, Tests, and UPDATED. A project with a running reminder SHALL show a status emoji per the "Status is visually distinguishable" requirement, then that reminder's name (bold), then its live elapsed duration and ETA, formatted like "⏳ **Check the thing** 1m23s, ETA 12:34 PM" - without the category-word prefix the Agents and Tests columns carry, per the "Status labels are prefixed by category outside dedicated panes" requirement's exception for this column. A project whose most recent reminder activity is a stop or a natural finish, with no reminder currently running, SHALL show its emoji, name, and outcome and duration, formatted like "✅ **Check the thing** completed/stopped, 10m". A project with two or more reminders with activity to show SHALL present them separated by a bullet, ordered by recency, the same convention the Agents column already uses for multiple agents. A project with no reminders SHALL leave the Reminders column empty. If either the Agents column's or the Reminders column's content exceeds its available column width, the TUI SHALL truncate it with a trailing `...` rather than wrapping or overflowing into adjacent columns.
+
+The `REMINDERS` column header SHALL be prefixed with ⏰, the same marker used for that category elsewhere in the TUI.
 
 #### Scenario: A project with a running reminder
 - **WHEN** the Agents tab renders a project row with a running reminder
@@ -785,6 +813,10 @@ The Agents tab SHALL display a fourth column, **Reminders**, alongside PROJECT, 
 #### Scenario: Overflowing content is truncated with an ellipsis
 - **WHEN** the Agents column's or the Reminders column's content would exceed its available column width
 - **THEN** the TUI truncates that cell's content with a trailing `...` instead of wrapping or overflowing
+
+#### Scenario: The Reminders column header is prefixed with a category emoji
+- **WHEN** the Agents tab renders its header row
+- **THEN** the `REMINDERS` column header begins with ⏰
 
 ### Requirement: Agents tab supports incremental search by project name
 The Agents tab SHALL support filtering its project rows by a search string matched as a case-insensitive substring against each row's project name (the name derived from its working directory, as already shown in the PROJECT column). Pressing `/` while the Agents tab is active SHALL enter search-editing mode, replacing the tab's title with a live text-entry prompt showing the search string typed so far and a cursor positioned at its end. While editing, the prompt SHALL track a cursor position within the search string and support the following line-editing keys, each acting relative to that position: `Left`/`Right` move the cursor one character; `Home`/`End` move it to the start/end of the string; `Ctrl+Left`/`Ctrl+Right` move it by one word; `Delete` removes the character after the cursor; `Backspace` removes the character before it; `Ctrl+W` removes the word before the cursor; `Ctrl+K` removes from the cursor to the end of the string; `Ctrl+U` clears the string. Every movement key SHALL be clamped so the cursor never moves before the first character or after the last. Each printable character typed SHALL be inserted at the cursor position (not necessarily the end) and the cursor SHALL advance past it. After every such change the Agents tab's displayed rows SHALL update immediately to show only rows whose project name matches the current search string, or every row if the search string is empty. Rows that match the search string SHALL retain the same relative order (most recent update first) they would have with no filter applied. This search filter SHALL apply only to the Agents tab; the Logs and Reminders tabs' own filters are unaffected and unaffected by it.
@@ -875,6 +907,8 @@ Pressing `Enter` while in search-editing mode SHALL commit the current search st
 ### Requirement: Agents tab title reflects search state
 The Agents tab's title SHALL show a `Filter [/]` keyboard shortcut hint whenever search-editing mode is not active, matching the hint convention already used by the Logs and Reminders tabs' own sort/filter controls, which stay visible whether or not a filter is currently applied. When a search filter is applied (and search-editing mode is not active), the title SHALL display the applied filter text immediately after that hint, bold and in a color distinct from the title's normal text, so an active filter remains obvious at a glance without hiding how to change it.
 
+The Agents tab's title SHALL additionally be prefixed with 🤖, the same marker used for the Agents pane in the project details modal and the Agents tab in the tab bar, ahead of its name and every other title content - the live search prompt while editing, the `Filter [/]` hint and any applied filter text otherwise, and the `Rename [n]` hint. This prefix is purely visual and SHALL NOT change the title's existing hints, its live search-editing behavior, or any keyboard behavior.
+
 #### Scenario: Hint shown with no applied filter
 - **WHEN** the Agents tab is active, not in search-editing mode, and no filter is applied
 - **THEN** the tab's title includes a `Filter [/]` keyboard shortcut hint
@@ -886,6 +920,10 @@ The Agents tab's title SHALL show a `Filter [/]` keyboard shortcut hint whenever
 #### Scenario: Applied filter is visually distinguished
 - **WHEN** the Agents tab has an applied search filter and is not in search-editing mode
 - **THEN** the filter text shown in the title is bold and a distinct color from the title's normal text
+
+#### Scenario: The Agents tab's title is prefixed with a category emoji
+- **WHEN** the Agents tab renders its title, whether idle, search-editing, or showing an applied filter
+- **THEN** the title begins with 🤖, ahead of its name and any other title content
 
 ### Requirement: Status labels are prefixed by category outside dedicated panes
 In the Agents tab and the Logs tab, each status label SHALL be prefixed with a category word - "agent" for an agent status, "tests" for a test-run status, or "reminder" for a reminder-category log entry - immediately after its emoji marker and before the status word (e.g. "🤖 agent done", "🧪 tests started", "⏰ reminder finished"), so a label read in a cross-category view is unambiguous about which kind of status it names. A prompt-category log entry is the one exception to this cross-category rule in the Logs tab and the details modal's Logs pane: it SHALL NOT include a category word or a status word at all - its label is its 🗣️ marker, then a single space, then its prompt snippet, per the "Logs tab shows an aggregated, paginated activity list" requirement - since the entry's single, always-"submitted" status carries no information the category word or a status word could usefully add, and the Logs tab's own CATEGORY column (or, in the details modal's Logs pane, the marker itself) already identifies it. The Agents tab's Reminders column is the one exception to this cross-category rule: it SHALL NOT include the category-word prefix, since the column's narrow width prioritizes the reminder's own name (the primary content of that cell) and the REMINDERS column header already establishes the category. In the details modal, the Agents pane, Tests pane, and Reminders pane SHALL NOT include this category-word prefix, since the pane itself already establishes the category (e.g. "🤖 done", "❌ failed"); the modal's Logs pane SHALL include the category-word prefix for agent, test-run, and reminder entries, consistent with the top-level Logs tab it mirrors. The top-level Reminders tab's Status column SHALL likewise NOT include this category-word prefix, since the tab already dedicates its entire view to reminders, consistent with how the modal's Agents and Tests panes omit it.

@@ -162,11 +162,11 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
     let tabs_line = Line::from(vec![
-        Span::styled("Agents [a]", tab_style(Tab::Agents)),
+        Span::styled("🤖 Agents [a]", tab_style(Tab::Agents)),
         Span::raw(" | "),
-        Span::styled("Logs [l]", tab_style(Tab::Logs)),
+        Span::styled("🪵 Logs [l]", tab_style(Tab::Logs)),
         Span::raw(" | "),
-        Span::styled("Reminders [r]", tab_style(Tab::Reminders)),
+        Span::styled("⏰ Reminders [r]", tab_style(Tab::Reminders)),
         Span::styled("  (tab)", Style::new().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(tabs_line), columns[0]);
@@ -186,7 +186,8 @@ fn render_message(frame: &mut Frame, message: &str) {
 }
 
 fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str>) {
-    let header = Row::new(["PROJECT", "AGENTS", "TESTS", "REMINDERS", "UPDATED"]).style(Style::new().bold());
+    let header =
+        Row::new(["PROJECT", "🤖 AGENTS", "🧪 TESTS", "⏰ REMINDERS", "UPDATED"]).style(Style::new().bold());
 
     let block = Block::default()
         .title(agents_tab_title(app, banner))
@@ -229,9 +230,9 @@ fn render_agent_table(frame: &mut Frame, app: &App, area: Rect, banner: Option<&
     // whatever a capped column can't fully show.
     let cap = (available_for_dynamic / 2).max(1);
     let project_need = content_need(project_texts.iter().map(String::as_str).map(str_width), "PROJECT").min(cap);
-    let agents_need = content_need(agents_lines.iter().map(line_width), "AGENTS").min(cap);
-    let tests_need = content_need(tests_lines.iter().map(line_width), "TESTS").min(cap);
-    let reminders_need = content_need(reminders_lines.iter().map(line_width), "REMINDERS").min(cap);
+    let agents_need = content_need(agents_lines.iter().map(line_width), "🤖 AGENTS").min(cap);
+    let tests_need = content_need(tests_lines.iter().map(line_width), "🧪 TESTS").min(cap);
+    let reminders_need = content_need(reminders_lines.iter().map(line_width), "⏰ REMINDERS").min(cap);
 
     // Any space left over once every column has what it needs is split
     // 2:3:2 between PROJECT/AGENTS/TESTS - the same relative weights this
@@ -381,8 +382,8 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
 
     let controls = logs_controls_hint(app, entries.len(), page_size);
     let title = match banner {
-        Some(banner) => format!("Logs - {banner}  |  {controls}"),
-        None => format!("Logs - {controls}"),
+        Some(banner) => format!("🪵 Logs - {banner}  |  {controls}"),
+        None => format!("🪵 Logs - {controls}"),
     };
     let block = bare_block.title(title);
 
@@ -702,18 +703,18 @@ fn agents_tab_title(app: &App, banner: Option<&str>) -> Line<'static> {
         let at = after_chars.next().map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
         let after: String = after_chars.collect();
         vec![
-            Span::raw(format!("Agents /{before}")),
+            Span::raw(format!("🤖 Agents /{before}")),
             Span::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
             Span::raw(after),
         ]
     } else if let Some(filter) = &app.agents_search_applied {
         vec![
-            Span::raw("Agents  Filter [/]: "),
+            Span::raw("🤖 Agents  Filter [/]: "),
             Span::styled(filter.clone(), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw("  Rename [n]"),
         ]
     } else {
-        vec![Span::raw("Agents  Filter [/]  Rename [n]")]
+        vec![Span::raw("🤖 Agents  Filter [/]  Rename [n]")]
     };
     if let Some(banner) = banner {
         spans.push(Span::raw(format!(" - {banner}")));
@@ -915,7 +916,7 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
             .collect()
     };
     let paginated = needs_pagination(project_logs.len(), logs_page_size);
-    let logs_title = if paginated { "Logs [l]  |  Page [d/u]  Top/Bottom [g/G]" } else { "Logs [l]" };
+    let logs_title = if paginated { "🪵 Logs [l]  |  Page [d/u]  Top/Bottom [g/G]" } else { "🪵 Logs [l]" };
     let logs_block = bare_logs_block.title(logs_title);
 
     let logs_table = Table::new(logs_rows, logs_widths)
@@ -964,7 +965,7 @@ const NO_PROMPT_CAPTURED_PLACEHOLDER: &str = "No prompt captured yet";
 fn render_last_prompt_pane(frame: &mut Frame, app: &App, area: Rect) {
     let focused = matches!(app.modal_focus, ModalFocus::LastPrompt);
     let block = Block::default()
-        .title("Last Prompt [p]")
+        .title("🗣️ Last Prompt [p]")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(pane_border_style(focused));
@@ -1012,7 +1013,7 @@ fn render_agents_pane(frame: &mut Frame, app: &App, group: &Option<DirectoryGrou
             .collect()
     };
 
-    let block = bare_block.title("Agents [a]");
+    let block = bare_block.title("🤖 Agents [a]");
     let table = Table::new(rows, [Constraint::Fill(1)])
         .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
         .block(block);
@@ -1057,7 +1058,7 @@ fn render_tests_pane(frame: &mut Frame, app: &App, group: &Option<DirectoryGroup
         None => vec![Row::new([Cell::from("No test run")])],
     };
 
-    let block = bare_block.title("Tests [t]");
+    let block = bare_block.title("🧪 Tests [t]");
     let table = Table::new(rows, [Constraint::Fill(1)])
         .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
         .block(block);
@@ -1195,7 +1196,7 @@ fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -
             .collect()
     };
 
-    let block = bare_block.title("Reminders [r]  |  New [R]");
+    let block = bare_block.title("⏰ Reminders [r]  |  New [R]");
 
     let table = Table::new(rows, widths)
         .row_highlight_style(Style::new().bg(SELECTED_ROW_BG).fg(SELECTED_ROW_FG))
@@ -1498,8 +1499,8 @@ fn render_reminders_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option
 
     let controls = reminders_controls_hint(app, entries.len(), page_size);
     let title = match banner {
-        Some(banner) => format!("Reminders - {banner}  |  {controls}"),
-        None => format!("Reminders - {controls}"),
+        Some(banner) => format!("⏰ Reminders - {banner}  |  {controls}"),
+        None => format!("⏰ Reminders - {controls}"),
     };
     let block = bare_block.title(title);
 
@@ -3800,6 +3801,35 @@ mod tests {
     }
 
     #[test]
+    fn details_modal_pane_titles_are_each_prefixed_with_a_category_emoji() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        // Each emoji is checked separately from its pane's name, rather than
+        // as a single combined substring, because these are double-width
+        // glyphs: the rendered buffer's continuation cell for a wide
+        // character keeps its default blank symbol rather than being
+        // cleared to "", so `buffer_text` shows an extra space after the
+        // emoji that isn't present in the title string itself or in an
+        // actual terminal's rendering.
+        let text = buffer_text(&term);
+        assert!(text.contains('🤖'), "got:\n{text}");
+        assert!(text.contains('🧪'), "got:\n{text}");
+        assert!(text.contains('⏰'), "got:\n{text}");
+        assert!(text.contains('🗣'), "got:\n{text}");
+        assert!(text.contains('🪵'), "got:\n{text}");
+        assert!(text.contains("Agents"), "got:\n{text}");
+        assert!(text.contains("Tests"), "got:\n{text}");
+        assert!(text.contains("Reminders"), "got:\n{text}");
+        assert!(text.contains("Last Prompt"), "got:\n{text}");
+        assert!(text.contains("Logs"), "got:\n{text}");
+    }
+
+    #[test]
     fn details_modal_title_shows_a_rename_hint_after_the_project_name() {
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut app = App::new();
@@ -4371,6 +4401,12 @@ mod tests {
         assert!(text.contains("Logs [l]"), "got:\n{text}");
         assert!(text.contains("(tab)"), "got:\n{text}");
         assert!(text.contains("agentmon"), "got:\n{text}");
+        // Checked separately from the adjacent tab-name text, not as one
+        // combined substring, because these are double-width glyphs - see
+        // `details_modal_pane_titles_are_each_prefixed_with_a_category_emoji`.
+        assert!(text.contains('🤖'), "got:\n{text}");
+        assert!(text.contains('🪵'), "got:\n{text}");
+        assert!(text.contains('⏰'), "got:\n{text}");
     }
 
     #[test]
@@ -4418,6 +4454,49 @@ mod tests {
         assert_ne!(buffer[(buffer.area.width - 1, 0)].symbol(), "┐", "no top-right corner expected");
         assert_ne!(buffer[(0, 0)].symbol(), "│", "no left border expected");
         assert_ne!(buffer[(buffer.area.width - 1, 0)].symbol(), "│", "no right border expected");
+    }
+
+    #[test]
+    fn the_agents_tab_header_columns_are_each_prefixed_with_a_category_emoji() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains('🤖'), "got:\n{text}");
+        assert!(text.contains('🧪'), "got:\n{text}");
+        assert!(text.contains('⏰'), "got:\n{text}");
+        assert!(text.contains("AGENTS"), "got:\n{text}");
+        assert!(text.contains("TESTS"), "got:\n{text}");
+        assert!(text.contains("REMINDERS"), "got:\n{text}");
+        assert!(text.contains("PROJECT"), "got:\n{text}");
+        assert!(text.contains("UPDATED"), "got:\n{text}");
+    }
+
+    #[test]
+    fn each_tabs_own_title_is_prefixed_with_a_category_emoji() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('🤖'), "Agents tab title, got:\n{text}");
+        assert!(text.contains("Filter [/]"), "got:\n{text}");
+
+        app.set_tab(Tab::Logs);
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('🪵'), "Logs tab title, got:\n{text}");
+        assert!(text.contains("Logs -"), "got:\n{text}");
+
+        app.set_tab(Tab::Reminders);
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains('⏰'), "Reminders tab title, got:\n{text}");
+        assert!(text.contains("Reminders -"), "got:\n{text}");
     }
 
     #[test]
