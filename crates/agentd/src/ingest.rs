@@ -61,7 +61,10 @@ impl Ingestor {
     /// notification, also records a "started" entry whenever the transition
     /// moves status into "running" from something else (or registers a
     /// brand-new entry already "running") - see the activity-log spec's
-    /// "Activity log captures notification-worthy events" requirement.
+    /// "Activity log captures notification-worthy events" requirement. When
+    /// the same event also carries a submitted prompt, the "started" entry
+    /// is recorded before the "prompt" entry, so the started entry takes
+    /// precedence in recency order over the prompt that precipitated it.
     ///
     /// Also returns any session ids the registry retired while applying this
     /// event (see `UpsertOutcome::retired_session_ids`), so the caller can
@@ -82,13 +85,29 @@ impl Ingestor {
             return (outcome.agent, outcome.retired_session_ids);
         }
         let run_starting = is_run_start(outcome.previous_status, outcome.agent.status);
-        if let Some(prompt) = submitted_prompt {
-            // Recorded before the "started" entry below (when one is also
+        if run_starting {
+            // Recorded before the "prompt" entry below (when one is also
             // produced by this same event), and sharing its exact timestamp,
             // so the stable recency sort both the daemon's `ActivityLog` and
-            // the TUI use keeps the prompt entry ahead of it - see the
-            // activity-log spec's "A prompt that also starts a run logs
-            // before the started entry".
+            // the TUI use keeps the started entry ahead of it - see the
+            // activity-log spec's "The started entry it precipitates is
+            // recorded ahead of the prompt entry". Uses `run_started_ms`
+            // (rather than a fresh `now_ms()` call) so this entry's
+            // timestamp exactly matches the value the registry just
+            // set/reset it to - the same value a "done" entry's Logs-tab
+            // duration will later be measured from.
+            self.record_log(LogEntry {
+                working_dir: outcome.agent.cwd.clone(),
+                category: LogCategory::Agent,
+                status: "started".to_string(),
+                occurred_at_ms: outcome.agent.run_started_ms,
+                pid: Some(outcome.agent.pid),
+                reminder_name: None,
+                reminder_due_at_ms: None,
+                prompt: outcome.agent.last_prompt.clone(),
+            });
+        }
+        if let Some(prompt) = submitted_prompt {
             self.record_log(LogEntry {
                 working_dir: cwd,
                 category: LogCategory::Prompt,
@@ -102,22 +121,6 @@ impl Ingestor {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: Some(prompt),
-            });
-        }
-        if run_starting {
-            // Uses `run_started_ms` (rather than a fresh `now_ms()` call) so
-            // this entry's timestamp exactly matches the value the registry
-            // just set/reset it to - the same value a "done" entry's
-            // Logs-tab duration will later be measured from.
-            self.record_log(LogEntry {
-                working_dir: outcome.agent.cwd.clone(),
-                category: LogCategory::Agent,
-                status: "started".to_string(),
-                occurred_at_ms: outcome.agent.run_started_ms,
-                pid: Some(outcome.agent.pid),
-                reminder_name: None,
-                reminder_due_at_ms: None,
-                prompt: outcome.agent.last_prompt.clone(),
             });
         }
         if should_notify(outcome.previous_status, outcome.agent.status) {
@@ -832,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_that_starts_a_run_is_recorded_before_the_started_entry() {
+    fn a_prompt_that_starts_a_run_is_recorded_after_the_started_entry() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier);
 
@@ -845,11 +848,11 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert_eq!(
             logs[0].category,
-            LogCategory::Prompt,
-            "the prompt entry must be recorded before the started entry it precipitates"
+            LogCategory::Agent,
+            "the started entry must be recorded before the prompt entry that precipitated it"
         );
-        assert_eq!(logs[1].category, LogCategory::Agent);
-        assert_eq!(logs[1].status, "started");
+        assert_eq!(logs[0].status, "started");
+        assert_eq!(logs[1].category, LogCategory::Prompt);
     }
 
     #[test]

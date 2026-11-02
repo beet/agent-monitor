@@ -2230,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn a_same_timestamp_prompt_entry_sorts_ahead_of_the_started_entry_it_precipitated() {
+    fn a_same_timestamp_started_entry_sorts_ahead_of_the_prompt_entry_it_precipitated() {
         let mut app = App::new();
         let prompt_entry = LogEntry {
             working_dir: PathBuf::from("/tmp/a"),
@@ -2242,16 +2242,16 @@ mod tests {
             reminder_due_at_ms: None,
             prompt: Some("Fix the flaky test".to_string()),
         };
-        // Recorded in daemon order (prompt before started), matching how
+        // Recorded in daemon order (started before prompt), matching how
         // `Ingestor::ingest_event` appends them - the stable recency sort
         // must preserve that relative order for entries sharing a timestamp.
-        app.apply_log_snapshot(vec![prompt_entry, log_in("/tmp/a", "started", 5)]);
+        app.apply_log_snapshot(vec![log_in("/tmp/a", "started", 5), prompt_entry]);
 
         let visible = app.visible_logs();
 
-        assert_eq!(visible[0].category, agentmon_proto::LogCategory::Prompt);
-        assert_eq!(visible[1].category, agentmon_proto::LogCategory::Agent);
-        assert_eq!(visible[1].status, "started");
+        assert_eq!(visible[0].category, agentmon_proto::LogCategory::Agent);
+        assert_eq!(visible[0].status, "started");
+        assert_eq!(visible[1].category, agentmon_proto::LogCategory::Prompt);
     }
 
     #[test]
