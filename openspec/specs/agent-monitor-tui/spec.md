@@ -266,6 +266,8 @@ The tab bar SHALL show each tab's label prefixed with the same emoji marker used
 ### Requirement: Agents tab supports row selection
 The Agents tab SHALL support moving a selection cursor over its project rows using the `j`/`down` (next row) and `k`/`up` (previous row) keys, so a specific project can be chosen for its details view. The selection SHALL be visually distinguished from unselected rows.
 
+While the details modal is open, the Agents tab's selection SHALL continue to identify the same project the modal is showing, even if a background update (a new agent, an agent status change, an agent's removal, or a test-run update) changes the recency-sort order of the Agents tab's rows while the modal is open. If that re-sort moves the modal's project to a different row, the selection SHALL move with it rather than staying at the same row index, so closing the modal leaves the highlight on the project the user was just viewing. If the modal's project is no longer present among the Agents tab's visible rows (for example, it has no more tracked members, or is excluded by an applied search filter), the selection SHALL fall back to being clamped to the visible rows' length, as it is when no modal is open.
+
 #### Scenario: Moving the selection down
 - **WHEN** the user presses `j` or the down arrow while the Agents tab is active
 - **THEN** the selection cursor moves to the next project row, if one exists
@@ -273,6 +275,18 @@ The Agents tab SHALL support moving a selection cursor over its project rows usi
 #### Scenario: Moving the selection up
 - **WHEN** the user presses `k` or the up arrow while the Agents tab is active
 - **THEN** the selection cursor moves to the previous project row, if one exists
+
+#### Scenario: A background update reorders the list while the details modal is open
+- **WHEN** the details modal is open for a project, and a background update (to a different project's agent or test run) changes the Agents tab's recency-sort order such that the modal's project would move to a different row index
+- **THEN** the Agents tab's selection moves to that new row index, so it still identifies the modal's project
+
+#### Scenario: Closing the modal after a reorder leaves the right row highlighted
+- **WHEN** the details modal is open for a project, a background update reorders the Agents tab while it is open, and the user then closes the modal
+- **THEN** the Agents tab shows that same project's row as selected, not whichever row now occupies the index that was selected before the modal opened
+
+#### Scenario: The modal's project drops out of the visible list while the modal is open
+- **WHEN** the details modal is open for a project, and that project is no longer present among the Agents tab's visible (filtered) rows while the modal is open
+- **THEN** the Agents tab's selection is clamped to the length of the visible rows, the same as when no modal is open
 
 ### Requirement: Project details modal
 The TUI SHALL open a details modal overlay for a project when the user presses `Enter` on a selected row in the Agents tab (a project row), the Logs tab (an activity log entry, using that entry's project), or the Reminders tab (a reminder row, using that reminder's project) - the same modal, reached from any of the three tabs, regardless of that entry's category or the truncation of its displayed snippet (a prompt-category entry included - see the "Prompt entry full-text modal" requirement for how that entry's full text is reached instead, from within this modal's own Logs pane). The modal SHALL show five panes: an Agents pane listing every agent registered for that project with its status and process id, a Tests pane showing that project's last test run if any, a Reminders pane listing that project's reminders with each row showing that reminder's name, its duration (in minutes) immediately after the name, and its status - truncated with a trailing `...` rather than overflowing the pane's right border if it doesn't fit, the same ellipsis-truncation behavior the Agents tab's AGENTS and REMINDERS columns use - a Last Prompt pane (described below), and a Logs pane showing that project's activity log entries, most recent first, with each entry's event time rendered in a fixed-width column at the far right of the pane - aligned at the same horizontal position on every row regardless of that row's category/status text length, consistent with how the Agents tab's UPDATED column stays fixed regardless of its other cells' content - and each agent-category entry additionally showing the reporting agent's process id and, when one was recorded for that entry, a truncated one-line snippet of its last-prompt snapshot. In the Logs pane, each test-run-category entry SHALL be prefixed with a tree branch marker (`├─ `) immediately before its status emoji, so it reads as nested beneath the agent activity it ran under, while agent-category and reminder-category entries SHALL render with no such prefix, forming the unindented trunk of the list; this prefix is purely visual and SHALL NOT change entry ordering, the existing category-word prefix, or the fixed-width right-aligned timestamp column. The Logs pane SHALL NOT display column headers.

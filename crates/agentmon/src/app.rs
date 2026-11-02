@@ -594,9 +594,23 @@ impl App {
         self.agents_selected = clamp_index(self.agents_selected, delta, len);
     }
 
+    /// Clamps `agents_selected` to the current visible rows, per "Agents tab
+    /// supports row selection". While the details modal is open, the
+    /// selection is re-resolved to wherever the modal's project now sits in
+    /// a freshly-sorted list, rather than just clamped by length - otherwise
+    /// a background update to a different project can reorder the list out
+    /// from under the modal and leave the highlight on the wrong row once
+    /// the modal closes. Falls back to length-based clamping if the modal's
+    /// project is no longer present among the visible rows.
     fn clamp_agents_selected(&mut self) {
-        let len = self.visible_agent_groups().len();
-        self.agents_selected = clamp_index(self.agents_selected, 0, len);
+        let groups = self.visible_agent_groups();
+        if let Some(Modal::Details(cwd)) = &self.modal {
+            if let Some(index) = groups.iter().position(|g| &g.cwd == cwd) {
+                self.agents_selected = index;
+                return;
+            }
+        }
+        self.agents_selected = clamp_index(self.agents_selected, 0, groups.len());
     }
 
     /// Enters the Agents tab's `/`-search-editing mode, seeding the edit
@@ -1870,6 +1884,85 @@ mod tests {
         app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
 
         assert_eq!(app.agents_selected, 0, "selection must clamp once a row disappears");
+    }
+
+    #[test]
+    fn modal_selection_tracks_its_project_when_a_background_update_reorders_the_list() {
+        let mut app = App::new();
+        // /tmp/a starts out most-recently-updated, so it's selected and
+        // shown in the modal; /tmp/b starts behind it. See
+        // `submit_rename_form_rejects_a_duplicate_name_and_keeps_the_form_open`
+        // for why distinct `last_updated_ms` values are needed for a
+        // deterministic sort order.
+        app.apply_snapshot(
+            vec![
+                AgentInfo { last_updated_ms: 1, ..agent_in("/tmp/a", "a", AgentStatus::Running) },
+                AgentInfo { last_updated_ms: 0, ..agent_in("/tmp/b", "b", AgentStatus::Running) },
+            ],
+            Vec::new(),
+        );
+        app.agents_selected = 0;
+        app.open_details_modal();
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+
+        // A later update to /tmp/b's agent bumps it ahead of /tmp/a in recency order.
+        app.apply_update(AgentInfo { last_updated_ms: 2, ..agent_in("/tmp/b", "b", AgentStatus::Running) });
+
+        assert_eq!(
+            app.visible_agent_groups()[app.agents_selected].cwd,
+            PathBuf::from("/tmp/a"),
+            "selection must follow the modal's project, not stay at its old index"
+        );
+    }
+
+    #[test]
+    fn closing_modal_after_a_reorder_leaves_its_project_selected() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo { last_updated_ms: 1, ..agent_in("/tmp/a", "a", AgentStatus::Running) },
+                AgentInfo { last_updated_ms: 0, ..agent_in("/tmp/b", "b", AgentStatus::Running) },
+            ],
+            Vec::new(),
+        );
+        app.agents_selected = 0;
+        app.open_details_modal();
+
+        app.apply_update(AgentInfo { last_updated_ms: 2, ..agent_in("/tmp/b", "b", AgentStatus::Running) });
+        app.close_modal();
+
+        assert_eq!(
+            app.visible_agent_groups()[app.agents_selected].cwd,
+            PathBuf::from("/tmp/a"),
+            "closing the modal must leave the highlight on the project it was showing"
+        );
+    }
+
+    #[test]
+    fn modal_selection_falls_back_to_length_clamp_once_its_project_leaves_the_visible_list() {
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![
+                AgentInfo { last_updated_ms: 1, ..agent_in("/tmp/a", "a", AgentStatus::Running) },
+                AgentInfo { last_updated_ms: 0, ..agent_in("/tmp/b", "b", AgentStatus::Running) },
+            ],
+            Vec::new(),
+        );
+        app.agents_selected = 0;
+        app.open_details_modal();
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+
+        // /tmp/a has no other members, so removing its only agent drops it
+        // from `visible_agent_groups` entirely while the modal (still
+        // showing its now-stale content) stays open.
+        app.remove_agent(&SessionId("a".to_string()));
+
+        assert_eq!(
+            app.visible_agent_groups().len(),
+            1,
+            "/tmp/a must have left the visible rows"
+        );
+        assert_eq!(app.agents_selected, 0, "must clamp by length once the modal's project has no visible row");
     }
 
     #[test]
