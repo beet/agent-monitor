@@ -231,6 +231,10 @@ pub struct ReminderForm {
     /// Raw digit-only text buffer; parsed to `u32` on submit.
     pub duration_minutes: Input,
     pub field: ReminderFormField,
+    /// Set by client-side validation when `Enter` is pressed with a
+    /// non-positive duration; cleared on any subsequent edit. Mirrors
+    /// `RenameForm::error`.
+    pub error: Option<String>,
 }
 
 /// The full-prompt modal's in-progress state, when open - see the "Prompt
@@ -1248,6 +1252,7 @@ impl App {
             name: Input::default(),
             duration_minutes: Input::default(),
             field: ReminderFormField::Name,
+            error: None,
         });
     }
 
@@ -1270,6 +1275,7 @@ impl App {
             name: Input::new(reminder.name),
             duration_minutes: Input::new(reminder.duration_minutes.to_string()),
             field: ReminderFormField::Name,
+            error: None,
         });
     }
 
@@ -1333,12 +1339,24 @@ impl App {
 
     /// Closes the open reminder form and returns the `ClientMessage` to send
     /// (create or edit) - the `Enter` key while the form is open. `None` if
-    /// no form is open. A new reminder is remembered as `pending_new_reminder`
-    /// so `apply_reminder_update` can recognize the daemon's confirmation of
-    /// it and highlight/auto-start it - see that method's doc comment.
+    /// no form is open, or if the Duration field is empty or parses to `0` -
+    /// a reminder's duration must always be positive, so an invalid value
+    /// sets an inline error and keeps the form open instead of sending
+    /// anything, mirroring `submit_rename_form`'s blank-name rejection. A new
+    /// reminder is remembered as `pending_new_reminder` so
+    /// `apply_reminder_update` can recognize the daemon's confirmation of it
+    /// and highlight/auto-start it - see that method's doc comment.
     pub fn submit_reminder_form(&mut self) -> Option<ClientMessage> {
-        let form = self.reminder_form.take()?;
-        let duration_minutes: u32 = form.duration_minutes.value().parse().unwrap_or(0);
+        let form = self.reminder_form.as_ref()?;
+        let duration_minutes: u32 = match form.duration_minutes.value().parse() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                self.reminder_form.as_mut().unwrap().error = Some("Duration must be greater than 0".to_string());
+                return None;
+            }
+        };
+
+        let form = self.reminder_form.take().unwrap();
         Some(match form.mode {
             ReminderFormMode::Create => {
                 self.pending_new_reminder = Some((form.cwd.clone(), form.name.value().to_string()));
@@ -3016,6 +3034,8 @@ mod tests {
         app.open_details_modal();
         app.open_reminder_create_form();
         app.reminder_form_input_char('X');
+        app.toggle_reminder_form_field();
+        app.reminder_form_input_char('5');
         app.submit_reminder_form();
         // A pre-existing, unrelated reminder in the same project shouldn't
         // interfere with selecting the new one below.
@@ -3066,9 +3086,13 @@ mod tests {
         app.open_details_modal();
         app.open_reminder_create_form();
         app.reminder_form_input_char('A');
+        app.toggle_reminder_form_field();
+        app.reminder_form_input_char('5');
         app.submit_reminder_form();
         app.open_reminder_create_form();
         app.reminder_form_input_char('B');
+        app.toggle_reminder_form_field();
+        app.reminder_form_input_char('5');
         app.submit_reminder_form();
 
         // The (late) confirmation for "A" arrives after "B" was already

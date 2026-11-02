@@ -1142,9 +1142,10 @@ mod tests {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
         let created = ingestor
-            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 0)
+            .ingest_create_reminder(PathBuf::from("/tmp/project"), "Check the build".to_string(), 1)
             .unwrap();
         ingestor.ingest_start_reminder(&created.id);
+        ingestor.reminders().backdate_run_started_for_test(&created.id, 1);
         let completed = ingestor.reminders().sweep_completed();
         assert_eq!(completed.len(), 1);
 

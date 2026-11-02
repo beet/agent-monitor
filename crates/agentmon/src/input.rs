@@ -461,15 +461,18 @@ fn handle_reminder_form_key(app: &mut App, key: KeyEvent) -> InputAction {
         }
         _ => {
             if let Some(form) = &mut app.reminder_form {
-                match form.field {
-                    ReminderFormField::Name => {
-                        form.name.handle_event(&Event::Key(key));
-                    }
+                let changed = match form.field {
+                    ReminderFormField::Name => form.name.handle_event(&Event::Key(key)).is_some_and(|r| r.value),
                     ReminderFormField::Duration => {
                         if should_forward_to_duration_field(&key) {
-                            form.duration_minutes.handle_event(&Event::Key(key));
+                            form.duration_minutes.handle_event(&Event::Key(key)).is_some_and(|r| r.value)
+                        } else {
+                            false
                         }
                     }
+                };
+                if changed {
+                    form.error = None;
                 }
             }
             InputAction::Continue
@@ -2329,6 +2332,8 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('R'));
         press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('5'));
 
         let action = press(&mut app, KeyCode::Enter);
 
@@ -2337,8 +2342,59 @@ mod tests {
             InputAction::SendReminderCommand(agentmon_proto::ClientMessage::CreateReminder {
                 cwd: PathBuf::from("/tmp/a"),
                 name: "X".to_string(),
-                duration_minutes: 0,
+                duration_minutes: 5,
             })
+        );
+        assert!(app.reminder_form.is_none());
+    }
+
+    #[test]
+    fn reminder_form_enter_with_an_empty_duration_shows_an_inline_error_and_keeps_the_form_open() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("a".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Char('X'));
+
+        let action = press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            InputAction::Continue,
+            "an empty duration must not send a CreateReminder command"
+        );
+        let form = app.reminder_form.as_ref().expect("form must stay open");
+        assert_eq!(form.error, Some("Duration must be greater than 0".to_string()));
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('5'));
+        let action = press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            action,
+            InputAction::SendReminderCommand(agentmon_proto::ClientMessage::CreateReminder {
+                cwd: PathBuf::from("/tmp/a"),
+                name: "X".to_string(),
+                duration_minutes: 5,
+            }),
+            "a subsequent valid submission must succeed and clear the error"
         );
         assert!(app.reminder_form.is_none());
     }

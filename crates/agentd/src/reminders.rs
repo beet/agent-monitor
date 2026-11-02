@@ -33,8 +33,13 @@ impl ReminderRegistry {
 
     /// Registers a new reminder as not-yet-started. Returns `None` without
     /// creating anything if `cwd` already holds `MAX_REMINDERS_PER_PROJECT`
-    /// reminders.
+    /// reminders, or if `duration_minutes` is zero - a reminder's duration
+    /// must always be positive.
     pub fn create(&self, cwd: PathBuf, name: String, duration_minutes: u32) -> Option<ReminderInfo> {
+        if duration_minutes == 0 {
+            return None;
+        }
+
         let mut state = self.state.lock().unwrap();
         let existing_for_project = state.reminders.values().filter(|r| r.cwd == cwd).count();
         if existing_for_project >= MAX_REMINDERS_PER_PROJECT {
@@ -59,8 +64,14 @@ impl ReminderRegistry {
     }
 
     /// Changes a reminder's name and/or duration, regardless of its current
-    /// status. Returns `None` if `id` is unknown.
+    /// status. Returns `None` if `id` is unknown, or if `duration_minutes` is
+    /// zero - a reminder's duration must always be positive - leaving the
+    /// reminder unchanged in that case.
     pub fn update(&self, id: &ReminderId, name: String, duration_minutes: u32) -> Option<ReminderInfo> {
+        if duration_minutes == 0 {
+            return None;
+        }
+
         let mut state = self.state.lock().unwrap();
         let reminder = state.reminders.get_mut(id)?;
         reminder.name = name;
@@ -110,6 +121,17 @@ impl ReminderRegistry {
 
     pub fn snapshot(&self) -> Vec<ReminderInfo> {
         self.state.lock().unwrap().reminders.values().cloned().collect()
+    }
+
+    /// Test-only: backdates a running reminder's `run_started_ms` by
+    /// `minutes_ago`, so a sweep sees its duration as already elapsed
+    /// without needing a 0-minute duration (rejected at creation) or a real
+    /// sleep. Panics if `id` is unknown.
+    #[cfg(test)]
+    pub(crate) fn backdate_run_started_for_test(&self, id: &ReminderId, minutes_ago: u64) {
+        let mut state = self.state.lock().unwrap();
+        let reminder = state.reminders.get_mut(id).unwrap();
+        reminder.run_started_ms = Some(now_ms() - minutes_ago * 60_000);
     }
 
     /// Transitions to `Done` every running reminder whose elapsed time (now -
@@ -311,8 +333,9 @@ mod tests {
     #[test]
     fn sweep_transitions_a_reminder_whose_duration_has_elapsed() {
         let registry = ReminderRegistry::new();
-        let created = registry.create(project(), "Check the build".to_string(), 0).unwrap();
+        let created = registry.create(project(), "Check the build".to_string(), 1).unwrap();
         registry.start(&created.id);
+        registry.backdate_run_started_for_test(&created.id, 1);
 
         let changed = registry.sweep_completed();
 
@@ -321,16 +344,17 @@ mod tests {
         let done = registry.get(&created.id).unwrap();
         assert_eq!(
             done.last_updated_ms - done.run_started_ms.unwrap(),
-            0,
-            "a 0-minute reminder's elapsed time must equal its duration exactly"
+            60_000,
+            "a 1-minute reminder's elapsed time must equal its duration exactly"
         );
     }
 
     #[test]
     fn sweep_does_not_repeat_an_already_done_reminder() {
         let registry = ReminderRegistry::new();
-        let created = registry.create(project(), "Check the build".to_string(), 0).unwrap();
+        let created = registry.create(project(), "Check the build".to_string(), 1).unwrap();
         registry.start(&created.id);
+        registry.backdate_run_started_for_test(&created.id, 1);
 
         let first_sweep = registry.sweep_completed();
         assert_eq!(first_sweep.len(), 1);
@@ -340,6 +364,30 @@ mod tests {
             second_sweep.is_empty(),
             "an already-done reminder must not be reported again"
         );
+    }
+
+    #[test]
+    fn creating_a_reminder_with_zero_duration_is_rejected() {
+        let registry = ReminderRegistry::new();
+        registry.create(project(), "existing".to_string(), 5).unwrap();
+
+        let rejected = registry.create(project(), "Check the build".to_string(), 0);
+
+        assert!(rejected.is_none(), "a 0-minute duration must be rejected at creation");
+        assert_eq!(registry.snapshot().len(), 1, "the project's existing reminder must be unchanged");
+    }
+
+    #[test]
+    fn updating_a_reminders_duration_to_zero_is_rejected() {
+        let registry = ReminderRegistry::new();
+        let created = registry.create(project(), "Check the build".to_string(), 10).unwrap();
+
+        let rejected = registry.update(&created.id, "Check the build".to_string(), 0);
+
+        assert!(rejected.is_none(), "editing a reminder's duration to 0 must be rejected");
+        let unchanged = registry.get(&created.id).unwrap();
+        assert_eq!(unchanged.name, "Check the build");
+        assert_eq!(unchanged.duration_minutes, 10);
     }
 
     #[test]

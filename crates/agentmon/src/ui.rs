@@ -1813,7 +1813,7 @@ fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
             Style::new()
         }
     };
-    let text = vec![
+    let mut text = vec![
         Line::from(vec![
             Span::styled("Name:     ", field_style(ReminderFormField::Name)),
             Span::raw(form.name.value().to_string()),
@@ -1823,11 +1823,21 @@ fn render_reminder_form(frame: &mut Frame, form: &crate::app::ReminderForm) {
             Span::raw(format!("{}m", form.duration_minutes.value())),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "Tab: switch field   Enter: save   Esc: cancel",
-            Style::new().fg(Color::DarkGray),
-        )),
     ];
+    // An inline error - e.g. a non-positive duration rejected on submit -
+    // rendered the same bold-red way `render_rename_form` shows its own
+    // validation error.
+    if let Some(error) = &form.error {
+        text.push(Line::from(Span::styled(
+            error.clone(),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        text.push(Line::from(""));
+    }
+    text.push(Line::from(Span::styled(
+        "Tab: switch field   Enter: save   Esc: cancel",
+        Style::new().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(Paragraph::new(text).block(block), area);
 
@@ -5328,6 +5338,26 @@ mod tests {
         assert!(text.contains("Name:"), "got:\n{text}");
         assert!(text.contains("Duration:"), "got:\n{text}");
         assert!(text.contains("Enter: save"), "got:\n{text}");
+    }
+
+    #[test]
+    fn reminder_form_shows_an_inline_error_on_a_non_positive_duration_submission() {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        app.open_details_modal();
+        app.open_reminder_create_form();
+        app.reminder_form_input_char('X');
+        app.submit_reminder_form();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("Duration must be greater than 0"), "got:\n{text}");
+        let (x, y) = find_text(term.backend().buffer(), "Duration must be greater than 0")
+            .expect("expected the error line");
+        let cell = term.backend().buffer().cell((x, y)).unwrap();
+        assert_eq!(cell.style().fg, Some(Color::Red), "the error text should be red");
     }
 
     #[test]

@@ -221,9 +221,10 @@ fn handle_connection(
         Some(ClientMessage::CreateReminder { cwd, name, duration_minutes }) => {
             match ingestor.ingest_create_reminder(cwd, name, duration_minutes) {
                 Some(reminder) => broadcaster.publish(Update::Reminder(reminder)),
-                // Per-project cap reached - dropped, matching how a
-                // malformed payload is handled (see design.md).
-                None => eprintln!("agentd: rejecting reminder creation, per-project cap reached"),
+                // Per-project cap reached, or a non-positive duration -
+                // dropped, matching how a malformed payload is handled (see
+                // design.md).
+                None => eprintln!("agentd: rejecting reminder creation, cap reached or invalid duration"),
             }
         }
         Some(ClientMessage::UpdateReminder { id, name, duration_minutes }) => {
@@ -344,12 +345,26 @@ mod tests {
     /// used by tests that need the reminder-completion sweep to actually run
     /// promptly.
     fn spawn_test_server_with_interval(tag: &str, interval: Duration) -> (PathBuf, Arc<RecordingNotifier>) {
+        let (path, notifier, _reminders) = spawn_test_server_with_interval_and_reminders(tag, interval);
+        (path, notifier)
+    }
+
+    /// Like `spawn_test_server_with_interval`, but also returns a handle to
+    /// the server's `ReminderRegistry` - needed by tests that must backdate
+    /// a reminder's `run_started_ms` (see
+    /// `ReminderRegistry::backdate_run_started_for_test`) rather than wait
+    /// out a real duration.
+    fn spawn_test_server_with_interval_and_reminders(
+        tag: &str,
+        interval: Duration,
+    ) -> (PathBuf, Arc<RecordingNotifier>, crate::reminders::ReminderRegistry) {
         let path = unique_socket_path(tag);
         let listener = bind_socket(&path).expect("bind should succeed");
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier.clone());
+        let reminders = ingestor.reminders().clone();
         thread::spawn(move || serve(listener, ingestor, interval));
-        (path, notifier)
+        (path, notifier, reminders)
     }
 
     /// Stamps each call with its own monotonically increasing `fired_at_ms`,
@@ -1053,10 +1068,14 @@ mod tests {
     #[test]
     fn a_reminder_completes_on_its_own_and_notifies_without_any_client_stopping_it() {
         // A short sweep interval so the reminder-completion sweep runs
-        // promptly, and a 0-minute duration so the reminder is already due
-        // the moment it starts.
-        let (path, notifier) =
-            spawn_test_server_with_interval("reminder-auto-complete", Duration::from_millis(20));
+        // promptly. The reminder is created with a positive duration (0 is
+        // now rejected at creation) and its run start is backdated past that
+        // duration, so the sweep sees it as already due without an actual
+        // wait.
+        let (path, notifier, reminders) = spawn_test_server_with_interval_and_reminders(
+            "reminder-auto-complete",
+            Duration::from_millis(20),
+        );
 
         let subscriber = UnixStream::connect(&path).expect("connect as subscriber");
         let mut writer = subscriber.try_clone().expect("clone stream");
@@ -1073,7 +1092,7 @@ mod tests {
                 &ClientMessage::CreateReminder {
                     cwd: PathBuf::from("/tmp/project"),
                     name: "Check the build".to_string(),
-                    duration_minutes: 0,
+                    duration_minutes: 1,
                 },
             )
             .expect("send create reminder");
@@ -1092,6 +1111,19 @@ mod tests {
             write_message(&mut reporter, &ClientMessage::StartReminder { id: created.id.clone() })
                 .expect("send start reminder");
         }
+        // Wait for the Running update before backdating, so the sweep (which
+        // only acts on a reminder once it's Running) doesn't race the start.
+        loop {
+            let message: ServerMessage = read_message(&mut reader)
+                .expect("read message")
+                .expect("connection should not close before message");
+            if let ServerMessage::ReminderUpdate { reminder } = message {
+                if reminder.status == agentmon_proto::ReminderStatus::Running {
+                    break;
+                }
+            }
+        }
+        reminders.backdate_run_started_for_test(&created.id, 1);
 
         // No client ever sends a StopReminder - the sweep alone must
         // transition it to Done.
