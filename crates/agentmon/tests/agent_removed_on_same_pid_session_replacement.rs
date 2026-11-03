@@ -84,6 +84,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
                 status: AgentStatus::Running,
                 prompt: None,
                 fired_at_ms: now_ms(),
+                response: None,
             },
         },
     )
@@ -117,6 +118,7 @@ fn a_same_pid_session_replacement_leaves_exactly_one_agent_and_one_details_modal
                 status: AgentStatus::Running,
                 prompt: None,
                 fired_at_ms: now_ms(),
+                response: None,
             },
         },
     )

@@ -382,6 +382,7 @@ mod tests {
             status,
             prompt: None,
             fired_at_ms: NEXT_FIRED_AT_MS.fetch_add(1, Ordering::SeqCst),
+            response: None,
         }
     }
 
@@ -1262,6 +1263,7 @@ mod tests {
             status: AgentStatus::Running,
             prompt: None,
             fired_at_ms,
+            response: None,
         }
     }
 

@@ -94,6 +94,11 @@ pub struct AgentEvent {
     /// `UserPromptSubmit`-derived events carry this - every other hook
     /// event reports `None`.
     pub prompt: Option<String>,
+    /// The text of the agent's final response for this turn. Only a
+    /// `Stop`-derived event carries this - every other hook event reports
+    /// `None`. Sourced from Claude Code's own `last_assistant_message` hook
+    /// field, not from reading the transcript file.
+    pub response: Option<String>,
     /// Unix epoch milliseconds of when the underlying Claude Code hook
     /// fired, as captured by the reporting client itself (as the first
     /// instruction of its process) - not the time the daemon accepts or
@@ -178,6 +183,12 @@ pub struct LogEntry {
     /// populated for prompt-category entries, since the event that produces
     /// one always carries a submitted prompt.
     pub prompt: Option<String>,
+    /// The triggering event's response text, for a "done" agent-category
+    /// entry only - read directly off that event, not carried forward the
+    /// way `prompt`'s snapshot is, since a response has no persistent
+    /// registry-side state to carry. `None` for every other entry, and for
+    /// a "done" entry whose triggering event carried no response.
+    pub response: Option<String>,
 }
 
 /// Identifies a reminder across client commands and daemon updates.
@@ -343,8 +354,9 @@ mod tests {
             cwd: PathBuf::from("/tmp/project"),
             host_context: HostContext::Terminal,
             pid: 99,
-            status: AgentStatus::NeedsInput,
+            status: AgentStatus::Done,
             prompt: Some("Fix the flaky test".to_string()),
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
             fired_at_ms: 1_700_000_000_000,
         };
 
@@ -356,6 +368,30 @@ mod tests {
             json.contains("\"fired_at_ms\":1700000000000"),
             "expected fired_at_ms field in JSON, got: {json}"
         );
+        assert!(
+            json.contains("\"response\":\"Fixed the flaky test by awaiting the promise.\""),
+            "expected response field in JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn agent_event_with_no_response_round_trips_through_json() {
+        let event = AgentEvent {
+            session_id: SessionId("session-123".to_string()),
+            cwd: PathBuf::from("/tmp/project"),
+            host_context: HostContext::Terminal,
+            pid: 99,
+            status: AgentStatus::NeedsInput,
+            prompt: Some("Fix the flaky test".to_string()),
+            response: None,
+            fired_at_ms: 1_700_000_000_000,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(event, decoded);
+        assert_eq!(decoded.response, None);
     }
 
     #[test]
@@ -404,6 +440,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }
     }
 
@@ -651,6 +688,34 @@ mod tests {
     }
 
     #[test]
+    fn log_entry_with_a_response_round_trips_through_json() {
+        let entry = LogEntry {
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            ..sample_log_entry()
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, decoded);
+        assert!(
+            json.contains("\"response\":\"Fixed the flaky test by awaiting the promise.\""),
+            "expected response field in JSON, got: {json}"
+        );
+    }
+
+    #[test]
+    fn log_entry_with_no_response_round_trips_through_json() {
+        let entry = sample_log_entry();
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(entry, decoded);
+        assert_eq!(decoded.response, None);
+    }
+
+    #[test]
     fn log_category_serializes_as_snake_case() {
         assert_eq!(
             serde_json::to_string(&LogCategory::Agent).unwrap(),
@@ -748,6 +813,7 @@ mod tests {
                 status: AgentStatus::Idle,
                 prompt: None,
                 fired_at_ms: 1_700_000_000_000,
+                response: None,
             },
         };
 

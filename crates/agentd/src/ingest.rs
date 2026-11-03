@@ -71,6 +71,7 @@ impl Ingestor {
     /// broadcast their removal to already-connected clients.
     pub fn ingest_event(&self, event: AgentEvent) -> (AgentInfo, Vec<SessionId>) {
         let submitted_prompt = event.prompt.clone();
+        let submitted_response = event.response.clone();
         let pid = event.pid;
         let cwd = event.cwd.clone();
         let fired_at_ms = event.fired_at_ms;
@@ -105,6 +106,7 @@ impl Ingestor {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: outcome.agent.last_prompt.clone(),
+                response: None,
             });
         }
         if let Some(prompt) = submitted_prompt {
@@ -121,6 +123,7 @@ impl Ingestor {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: Some(prompt),
+                response: None,
             });
         }
         if should_notify(outcome.previous_status, outcome.agent.status) {
@@ -135,6 +138,12 @@ impl Ingestor {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: outcome.agent.last_prompt.clone(),
+                // Only ever `Some` when this transition's triggering event
+                // was a `Stop`-derived "done" (the only status that ever
+                // carries a response) - read directly from the event, not
+                // from any carried-forward registry state, per the
+                // activity-log spec's "done" entry requirement.
+                response: submitted_response.clone(),
             });
         }
         (outcome.agent, outcome.retired_session_ids)
@@ -158,6 +167,7 @@ impl Ingestor {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         });
         test_run
     }
@@ -207,6 +217,7 @@ impl Ingestor {
             reminder_name: Some(reminder.name.clone()),
             reminder_due_at_ms: Some(run_started_ms + reminder.duration_minutes as u64 * 60_000),
             prompt: None,
+            response: None,
         });
         Some(reminder)
     }
@@ -224,6 +235,7 @@ impl Ingestor {
             reminder_name: Some(reminder.name.clone()),
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         });
         Some(reminder)
     }
@@ -243,6 +255,7 @@ impl Ingestor {
             reminder_name: Some(reminder.name.clone()),
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         });
     }
 
@@ -397,6 +410,7 @@ mod tests {
             status,
             prompt: None,
             fired_at_ms: NEXT_FIRED_AT_MS.fetch_add(1, Ordering::SeqCst),
+            response: None,
         }
     }
 
@@ -639,6 +653,38 @@ mod tests {
     }
 
     #[test]
+    fn a_done_event_carrying_a_response_records_it_on_the_done_entry() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(AgentEvent {
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            ..event(AgentStatus::Done)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        let done_entry = logs.iter().find(|e| e.status == "done").unwrap();
+        assert_eq!(
+            done_entry.response.as_deref(),
+            Some("Fixed the flaky test by awaiting the promise.")
+        );
+    }
+
+    #[test]
+    fn a_done_event_carrying_no_response_records_none() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(event(AgentStatus::Done));
+
+        let logs = ingestor.activity_log().snapshot();
+        let done_entry = logs.iter().find(|e| e.status == "done").unwrap();
+        assert_eq!(done_entry.response, None);
+    }
+
+    #[test]
     fn needs_input_transition_appends_a_log_entry() {
         let notifier = Arc::new(RecordingNotifier::default());
         let ingestor = Ingestor::new(Registry::new(), notifier);
@@ -793,6 +839,33 @@ mod tests {
             "the started entry's snapshot must not be altered by a later prompt"
         );
         assert_eq!(done_entry.prompt.as_deref(), Some("Second prompt"));
+    }
+
+    #[test]
+    fn a_later_events_response_does_not_alter_an_already_recorded_entrys_snapshot() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let ingestor = Ingestor::new(Registry::new(), notifier);
+
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(AgentEvent {
+            response: Some("First response".to_string()),
+            ..event(AgentStatus::Done)
+        });
+        ingestor.ingest_event(event(AgentStatus::Running));
+        ingestor.ingest_event(AgentEvent {
+            response: Some("Second response".to_string()),
+            ..event(AgentStatus::Done)
+        });
+
+        let logs = ingestor.activity_log().snapshot();
+        let done_entries: Vec<_> = logs.iter().filter(|e| e.status == "done").collect();
+        assert_eq!(done_entries.len(), 2);
+        assert_eq!(
+            done_entries[0].response.as_deref(),
+            Some("First response"),
+            "the first done entry's snapshot must not be altered by a later event's response"
+        );
+        assert_eq!(done_entries[1].response.as_deref(), Some("Second response"));
     }
 
     #[test]

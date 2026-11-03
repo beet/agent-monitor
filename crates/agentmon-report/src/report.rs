@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use agentmon_proto::{write_message, AgentEvent, ClientMessage, HostContext, SessionId};
 
-use crate::hook_payload::{parse_hook_payload, sanitized_prompt, status_for_payload, HookPayload};
+use crate::hook_payload::{parse_hook_payload, sanitized_prompt, sanitized_response, status_for_payload, HookPayload};
 
 /// Hook subprocesses must never block or fail the calling hook (a `Stop`
 /// hook exiting with code 2 would block the user's turn from ending), so
@@ -35,6 +35,14 @@ pub fn build_event(
     } else {
         None
     };
+    // Only a `Stop` payload carries the final response text - every other
+    // hook event reports none, regardless of whether `payload.
+    // last_assistant_message` happens to be set.
+    let response = if payload.hook_event_name == "Stop" {
+        payload.last_assistant_message.as_deref().and_then(sanitized_response)
+    } else {
+        None
+    };
     Some(AgentEvent {
         session_id: SessionId(payload.session_id.clone()),
         cwd: PathBuf::from(&payload.cwd),
@@ -42,6 +50,7 @@ pub fn build_event(
         pid,
         status,
         prompt,
+        response,
         fired_at_ms,
     })
 }
@@ -202,6 +211,57 @@ mod tests {
     }
 
     #[test]
+    fn build_event_carries_the_response_for_stop() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Fixed the flaky test by awaiting the promise."
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
+
+        assert_eq!(
+            event.response.as_deref(),
+            Some("Fixed the flaky test by awaiting the promise.")
+        );
+    }
+
+    #[test]
+    fn build_event_carries_no_response_when_the_stop_payload_has_none() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "Stop"
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
+
+        assert_eq!(event.response, None);
+    }
+
+    #[test]
+    fn build_event_carries_no_response_for_other_hook_events_even_with_last_assistant_message_present() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "last_assistant_message": "Fixed the flaky test by awaiting the promise."
+        }"#;
+        let payload = parse_hook_payload(raw).unwrap();
+
+        let event = build_event(&payload, HostContext::Terminal, 4242, 1_700_000_000_000).unwrap();
+
+        assert_eq!(
+            event.response, None,
+            "a non-Stop event must never carry a response, even if its payload happens to include last_assistant_message"
+        );
+    }
+
+    #[test]
     fn build_event_returns_none_for_a_non_status_notification() {
         let raw = r#"{
             "session_id": "abc-123",
@@ -323,6 +383,7 @@ mod tests {
             status: AgentStatus::Done,
             prompt: None,
             fired_at_ms: 1_700_000_000_000,
+            response: None,
         };
 
         let started = std::time::Instant::now();

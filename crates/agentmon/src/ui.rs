@@ -2956,6 +2956,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }
     }
 
@@ -4166,6 +4167,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -4176,6 +4178,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -4207,6 +4210,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: Some("Fix the flaky test".to_string()),
+            response: None,
         }]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
 
@@ -4303,6 +4307,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             },
             LogEntry {
                 working_dir: PathBuf::from("/Users/beet/project"),
@@ -4313,6 +4318,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             },
         ]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -4352,6 +4358,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         };
         let long_entry = LogEntry {
             working_dir: PathBuf::from("/Users/beet/project"),
@@ -4362,6 +4369,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         };
         app.apply_log_snapshot(vec![short_entry.clone(), long_entry.clone()]);
         app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
@@ -4875,6 +4883,7 @@ mod tests {
                 reminder_name: Some("Check the build".to_string()),
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             }]);
             app
         };
@@ -5031,6 +5040,7 @@ mod tests {
             reminder_name: Some("Check the build".to_string()),
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         };
 
         let (text, _style) = log_entry_status_line(&[], &entry, 0);
@@ -5049,6 +5059,7 @@ mod tests {
             reminder_name: Some(name.to_string()),
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }
     }
 
@@ -5094,6 +5105,7 @@ mod tests {
             reminder_name: Some("Check the build".to_string()),
             reminder_due_at_ms: Some(600_000),
             prompt: None,
+            response: None,
         };
 
         let (text, _style) = log_entry_status_line(&[], &entry, 0);

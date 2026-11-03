@@ -1818,6 +1818,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }
     }
 
@@ -2352,6 +2353,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: Some("Fix the flaky test".to_string()),
+            response: None,
         };
         // Recorded in daemon order (started before prompt), matching how
         // `Ingestor::ingest_event` appends them - the stable recency sort

@@ -103,6 +103,7 @@ classDiagram
         +u32 pid
         +AgentStatus status
         +Option~String~ prompt
+        +Option~String~ response
         +u64 fired_at_ms
     }
     class AgentInfo {
@@ -142,6 +143,7 @@ classDiagram
         +Option~String~ reminder_name
         +Option~u64~ reminder_due_at_ms
         +Option~String~ prompt
+        +Option~String~ response
     }
     class ProjectName {
         +PathBuf cwd

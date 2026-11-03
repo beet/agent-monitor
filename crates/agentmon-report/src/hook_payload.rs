@@ -17,6 +17,12 @@ pub struct HookPayload {
     /// payload.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// The final assistant message's text before the turn ended. Only
+    /// present on a `Stop` payload - Claude Code resolves this itself
+    /// (including excluding sub-agent/sidechain turns) specifically so
+    /// consumers never need to read and parse the transcript file.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 pub fn parse_hook_payload(raw: &str) -> serde_json::Result<HookPayload> {
@@ -149,6 +155,31 @@ pub(crate) fn sanitized_prompt(raw: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Caps how long a captured response can grow, mirroring the daemon
+/// registry's `MAX_LAST_PROMPT_CHARS` cap on last-prompt text - the same
+/// free-text, same in-memory, bounded-capacity activity log, so the same
+/// bound applies.
+const MAX_RESPONSE_CHARS: usize = 4_000;
+
+/// Trims a `Stop` payload's `last_assistant_message` field and treats the
+/// result as "no response" when nothing survives trimming (empty, or
+/// whitespace-only) - the same convention `sanitized_prompt` uses for a
+/// submitted prompt. A response longer than `MAX_RESPONSE_CHARS` (counted in
+/// chars, not bytes, so a multi-byte UTF-8 character is never split) is
+/// truncated to that length with a trailing truncation marker.
+pub(crate) fn sanitized_response(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= MAX_RESPONSE_CHARS {
+        return Some(trimmed.to_string());
+    }
+    let mut truncated: String = trimmed.chars().take(MAX_RESPONSE_CHARS).collect();
+    truncated.push_str("...");
+    Some(truncated)
 }
 
 /// Notification_type values (per Claude Code's hooks reference) that mean
@@ -286,6 +317,60 @@ mod tests {
         let payload = parse_hook_payload(raw).unwrap();
 
         assert_eq!(status_for_payload(&payload), Some(AgentStatus::Done));
+    }
+
+    #[test]
+    fn parses_a_stop_payloads_last_assistant_message() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Fixed the flaky test by awaiting the promise."
+        }"#;
+
+        let payload = parse_hook_payload(raw).unwrap();
+
+        assert_eq!(
+            payload.last_assistant_message.as_deref(),
+            Some("Fixed the flaky test by awaiting the promise.")
+        );
+    }
+
+    #[test]
+    fn a_payload_with_no_last_assistant_message_field_parses_with_none() {
+        let raw = r#"{
+            "session_id": "abc-123",
+            "cwd": "/tmp/project",
+            "hook_event_name": "Stop"
+        }"#;
+
+        let payload = parse_hook_payload(raw).unwrap();
+
+        assert_eq!(payload.last_assistant_message, None);
+    }
+
+    #[test]
+    fn sanitized_response_trims_whitespace() {
+        assert_eq!(
+            sanitized_response("  Fixed the flaky test.  "),
+            Some("Fixed the flaky test.".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitized_response_collapses_blank_text_to_none() {
+        assert_eq!(sanitized_response(""), None);
+        assert_eq!(sanitized_response("   "), None);
+    }
+
+    #[test]
+    fn sanitized_response_truncates_overlong_text_with_a_marker() {
+        let overlong = "a".repeat(MAX_RESPONSE_CHARS + 500);
+
+        let response = sanitized_response(&overlong).unwrap();
+
+        assert_eq!(response.chars().count(), MAX_RESPONSE_CHARS + 3);
+        assert!(response.ends_with("..."));
     }
 
     #[test]

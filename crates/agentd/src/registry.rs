@@ -415,6 +415,7 @@ mod tests {
             status,
             prompt: None,
             fired_at_ms,
+            response: None,
         }
     }
 

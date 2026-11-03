@@ -362,21 +362,25 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
                 KeyCode::Char('g') => app.jump_modal_logs_to_start(page_sizes.modal_logs),
                 KeyCode::Char('G') => app.jump_modal_logs_to_end(page_sizes.modal_logs),
                 // Unlike the top-level Logs tab, `Enter` here otherwise does
-                // nothing - this only opens the full-prompt modal for a
-                // prompt-category entry, per the "Prompt entry full-text
-                // modal" requirement. Consistent regardless of whether the
-                // entry's displayed snippet happens to be truncated - the
-                // user shouldn't have to judge a row's length to know what
-                // `Enter` will do.
+                // nothing - this only opens the full-text modal for a
+                // prompt-category entry, or an agent-category "done" entry
+                // carrying a response snapshot, per the "Prompt entry
+                // full-text modal" requirement. Consistent regardless of
+                // whether the entry's displayed snippet happens to be
+                // truncated - the user shouldn't have to judge a row's
+                // length to know what `Enter` will do.
                 KeyCode::Enter => {
                     if let Some(Modal::Details(cwd)) = &app.modal {
                         let cwd = cwd.clone();
-                        let prompt = app
+                        let text = app
                             .project_logs(&cwd)
                             .get(app.modal_logs_pagination.selected)
-                            .filter(|entry| entry.category == LogCategory::Prompt)
-                            .and_then(|entry| entry.prompt.clone());
-                        if let Some(text) = prompt {
+                            .and_then(|entry| match entry.category {
+                                LogCategory::Prompt => entry.prompt.clone(),
+                                LogCategory::Agent if entry.status == "done" => entry.response.clone(),
+                                _ => None,
+                            });
+                        if let Some(text) = text {
                             app.open_prompt_detail(text);
                         }
                     }
@@ -1025,6 +1029,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }]);
 
         press(&mut app, KeyCode::Enter);
@@ -1046,23 +1051,51 @@ mod tests {
         let overlong = "a".repeat(200); // deliberately far longer than any realistic column width
         let mut app = App::new();
         app.set_tab(Tab::Logs);
-        app.apply_log_snapshot(vec![LogEntry {
-            working_dir: "/tmp/a".into(),
-            category: LogCategory::Prompt,
-            status: "submitted".to_string(),
-            occurred_at_ms: 1,
-            pid: Some(1),
-            reminder_name: None,
-            reminder_due_at_ms: None,
-            prompt: Some(overlong),
-        }]);
+        app.apply_log_snapshot(vec![
+            LogEntry {
+                working_dir: "/tmp/a".into(),
+                category: LogCategory::Prompt,
+                status: "submitted".to_string(),
+                occurred_at_ms: 1,
+                pid: Some(1),
+                reminder_name: None,
+                reminder_due_at_ms: None,
+                prompt: Some(overlong),
+                response: None,
+            },
+            // A done entry carrying a response is the other case that
+            // matters here - the top-level Logs tab's `Enter` must be just
+            // as unaffected by it as it is by a prompt entry.
+            LogEntry {
+                working_dir: "/tmp/a".into(),
+                category: LogCategory::Agent,
+                status: "done".to_string(),
+                occurred_at_ms: 2,
+                pid: Some(1),
+                reminder_name: None,
+                reminder_due_at_ms: None,
+                prompt: None,
+                response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            },
+        ]);
 
         press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
         assert_eq!(
             app.prompt_detail, None,
-            "the full-prompt modal is never opened from the top-level Logs tab"
+            "the full-text modal is never opened from the top-level Logs tab"
+        );
+
+        app.close_modal();
+        app.move_logs_selection(1, 10);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+        assert_eq!(
+            app.prompt_detail, None,
+            "the full-text modal is never opened from the top-level Logs tab, even for a done entry carrying a response"
         );
     }
 
@@ -1096,6 +1129,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: Some(overlong.clone()),
+            response: None,
         }]);
         app.set_tab(Tab::Agents);
         press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused
@@ -1144,6 +1178,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: Some("short prompt".to_string()),
+            response: None,
         }]);
         app.set_tab(Tab::Agents);
         press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
@@ -1191,6 +1226,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }]);
         app.set_tab(Tab::Agents);
         press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
@@ -1202,6 +1238,96 @@ mod tests {
             app.modal,
             Some(Modal::Details(PathBuf::from("/tmp/a"))),
             "and must not do anything else either - the details modal underneath is simply unaffected"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_full_response_modal_for_a_done_entry_with_a_response() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Done,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "done".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: None,
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.prompt_detail.as_ref().map(|d| d.text.as_str()),
+            Some("Fixed the flaky test by awaiting the promise."),
+            "Enter on a done entry carrying a response must open the full-text modal with that response"
+        );
+        assert_eq!(
+            app.modal,
+            Some(Modal::Details(PathBuf::from("/tmp/a"))),
+            "the details modal underneath must stay open"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_done_entry_with_no_response_has_no_effect() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Done,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "done".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: None,
+            response: None,
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.prompt_detail, None,
+            "a done entry recorded with no response snapshot must not open the full-text modal"
         );
     }
 
@@ -1242,6 +1368,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: Some("short prompt".to_string()),
+                response: None,
             },
             LogEntry {
                 working_dir: "/tmp/a".into(),
@@ -1252,6 +1379,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: Some(overlong.clone()),
+                response: None,
             },
         ]);
         app.set_tab(Tab::Agents);
@@ -1326,6 +1454,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             },
             LogEntry {
                 working_dir: "/tmp/b".into(),
@@ -1336,6 +1465,7 @@ mod tests {
                 reminder_name: None,
                 reminder_due_at_ms: None,
                 prompt: None,
+                response: None,
             },
         ]);
 
@@ -1366,6 +1496,7 @@ mod tests {
                     reminder_name: None,
                     reminder_due_at_ms: None,
                     prompt: None,
+                    response: None,
                 })
                 .collect(),
         );
@@ -1394,6 +1525,7 @@ mod tests {
                     reminder_name: None,
                     reminder_due_at_ms: None,
                     prompt: None,
+                    response: None,
                 })
                 .collect(),
         );
@@ -1419,6 +1551,7 @@ mod tests {
             reminder_name: None,
             reminder_due_at_ms: None,
             prompt: None,
+            response: None,
         }]);
 
         press(&mut app, KeyCode::Char('o'));
@@ -1481,6 +1614,7 @@ mod tests {
                     reminder_name: None,
                     reminder_due_at_ms: None,
                     prompt: None,
+                    response: None,
                 })
                 .collect(),
         );
@@ -1514,6 +1648,7 @@ mod tests {
                     reminder_name: None,
                     reminder_due_at_ms: None,
                     prompt: None,
+                    response: None,
                 })
                 .collect(),
         );
