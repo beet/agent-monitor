@@ -617,19 +617,30 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_wi
             text.push_str(&format!(" {}", prompt_snippet(prompt, budget)));
         }
     }
-    // A reminder of what this agent was asked to do, for an agent-category
-    // entry recorded with a prompt snapshot - see the activity-log
-    // capability's "Activity log captures notification-worthy events"
-    // requirement. No snippet for entries recorded with none (e.g. an agent
-    // first tracked via `PreToolUse`, before any `UserPromptSubmit`). Same
-    // reasoning as the prompt-category branch above: the budget passed to
-    // `prompt_snippet` accounts for everything already in `text` plus this
-    // decoration's own width (` — "` before the snippet, `"` after it).
+    // A "done" entry's snippet reports what the agent said it did, not what
+    // it was asked - it prefers the response snapshot over the last-prompt
+    // one, falling back to the prompt only when no response was captured
+    // (e.g. the turn ended with only tool calls, or an older daemon never
+    // captured one), so a "done" entry never regresses to showing nothing.
+    // A "started" or "needs input" entry has no response field at all, so it
+    // always reports what this agent was asked to do, from its prompt
+    // snapshot - see the activity-log capability's "Activity log captures
+    // notification-worthy events" requirement. No snippet for entries
+    // recorded with neither (e.g. an agent first tracked via `PreToolUse`,
+    // before any `UserPromptSubmit`). Same reasoning as the prompt-category
+    // branch above: the budget passed to `prompt_snippet` accounts for
+    // everything already in `text` plus this decoration's own width (` — "`
+    // before the snippet, `"` after it).
     if entry.category == agentmon_proto::LogCategory::Agent {
-        if let Some(prompt) = &entry.prompt {
+        let snippet_source = if entry.status == "done" {
+            entry.response.as_deref().or(entry.prompt.as_deref())
+        } else {
+            entry.prompt.as_deref()
+        };
+        if let Some(snippet_text) = snippet_source {
             use unicode_width::UnicodeWidthStr;
             let budget = snippet_max_width.saturating_sub(text.width() + 5);
-            text.push_str(&format!(" — \"{}\"", prompt_snippet(prompt, budget)));
+            text.push_str(&format!(" — \"{}\"", prompt_snippet(snippet_text, budget)));
         }
     }
     (text, style)
@@ -5216,6 +5227,77 @@ mod tests {
         let (text, _style) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
 
         assert!(text.contains("...\""), "expected the snippet to end with an ellipsis, got: {text}");
+    }
+
+    #[test]
+    fn a_done_entry_with_a_response_shows_the_response_not_the_prompt() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+
+        assert!(
+            text.contains("\"Fixed the flaky test by awaiting the promise.\""),
+            "expected the done entry's snippet to show its response, got: {text}"
+        );
+        assert!(
+            !text.contains("Fix the flaky test\""),
+            "expected the done entry's snippet to omit the prompt once a response is captured, got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_done_entry_with_no_response_falls_back_to_its_prompt() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            response: None,
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+
+        assert!(
+            text.contains("\"Fix the flaky test\""),
+            "expected the done entry's snippet to fall back to its last-prompt snapshot, got: {text}"
+        );
+    }
+
+    #[test]
+    fn a_done_entry_with_neither_a_response_nor_a_prompt_shows_no_snippet() {
+        let entry = LogEntry {
+            prompt: None,
+            response: None,
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+
+        assert!(!text.contains('"'), "expected no snippet at all, got: {text}");
+    }
+
+    #[test]
+    fn a_started_or_needs_input_entry_ignores_any_response_and_shows_its_prompt() {
+        for status in ["started", "needs input"] {
+            let entry = LogEntry {
+                prompt: Some("Fix the flaky test".to_string()),
+                response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+                ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, status, 0)
+            };
+
+            let (text, _style) = log_entry_status_line(&[], &entry, 0);
+
+            assert!(
+                text.contains("\"Fix the flaky test\""),
+                "expected a {status:?} entry's snippet to show its prompt regardless of any response, got: {text}"
+            );
+            assert!(
+                !text.contains("Fixed the flaky test by awaiting the promise."),
+                "a {status:?} entry has no response field in practice, but the renderer must not use one even if present, got: {text}"
+            );
+        }
     }
 
     #[test]
