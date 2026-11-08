@@ -363,12 +363,15 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
                 KeyCode::Char('G') => app.jump_modal_logs_to_end(page_sizes.modal_logs),
                 // Unlike the top-level Logs tab, `Enter` here otherwise does
                 // nothing - this only opens the full-text modal for a
-                // prompt-category entry, or an agent-category "done" entry
-                // carrying a response snapshot, per the "Prompt entry
-                // full-text modal" requirement. Consistent regardless of
-                // whether the entry's displayed snippet happens to be
-                // truncated - the user shouldn't have to judge a row's
-                // length to know what `Enter` will do.
+                // prompt-category entry, an agent-category "done" entry
+                // carrying a response snapshot, or an agent-category
+                // "started" entry carrying a last-prompt snapshot, per the
+                // "Prompt entry full-text modal" requirement. Consistent
+                // regardless of whether the entry's displayed snippet
+                // happens to be truncated - or, for a "started" entry,
+                // regardless of the fact that its row shows no inline
+                // snippet at all - the user shouldn't have to judge a row's
+                // length or content to know what `Enter` will do.
                 KeyCode::Enter => {
                     if let Some(Modal::Details(cwd)) = &app.modal {
                         let cwd = cwd.clone();
@@ -378,6 +381,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
                             .and_then(|entry| match entry.category {
                                 LogCategory::Prompt => entry.prompt.clone(),
                                 LogCategory::Agent if entry.status == "done" => entry.response.clone(),
+                                LogCategory::Agent if entry.status == "started" => entry.prompt.clone(),
                                 _ => None,
                             });
                         if let Some(text) = text {
@@ -1328,6 +1332,142 @@ mod tests {
         assert_eq!(
             app.prompt_detail, None,
             "a done entry recorded with no response snapshot must not open the full-text modal"
+        );
+    }
+
+    #[test]
+    fn enter_opens_the_full_prompt_modal_for_a_started_entry_with_a_last_prompt_snapshot() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "started".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: Some("Fix the flaky test".to_string()),
+            response: None,
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.prompt_detail.as_ref().map(|d| d.text.as_str()),
+            Some("Fix the flaky test"),
+            "Enter on a started entry carrying a last-prompt snapshot must open the full-text modal with that prompt, even though the row itself shows no inline snippet"
+        );
+        assert_eq!(
+            app.modal,
+            Some(Modal::Details(PathBuf::from("/tmp/a"))),
+            "the details modal underneath must stay open"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_started_entry_with_no_last_prompt_snapshot_has_no_effect() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "started".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: None,
+            response: None,
+        }]);
+        app.set_tab(Tab::Agents);
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused, one (non-paginated) entry selected
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.prompt_detail, None,
+            "a started entry recorded with no last-prompt snapshot must not open the full-text modal"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_started_entry_in_the_top_level_logs_tab_opens_the_details_modal_not_the_full_text_modal() {
+        use agentmon_proto::{AgentInfo, AgentStatus, HostContext, LogCategory, LogEntry, SessionId};
+        use std::path::PathBuf;
+
+        let mut app = App::new();
+        app.apply_snapshot(
+            vec![AgentInfo {
+                session_id: SessionId("s1".to_string()),
+                cwd: PathBuf::from("/tmp/a"),
+                host_context: HostContext::Terminal,
+                pid: 1,
+                status: AgentStatus::Running,
+                last_updated_ms: 0,
+                status_since_ms: 0,
+                run_started_ms: 0,
+                last_prompt: None,
+            }],
+            Vec::new(),
+        );
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "started".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: Some("Fix the flaky test".to_string()),
+            response: None,
+        }]);
+        app.set_tab(Tab::Logs);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.modal,
+            Some(Modal::Details(PathBuf::from("/tmp/a"))),
+            "Enter on a started entry in the top-level Logs tab must open the project details modal, per the \"Project details modal\" requirement"
+        );
+        assert_eq!(
+            app.prompt_detail, None,
+            "the full-text modal must not open directly from the top-level Logs tab's Enter"
         );
     }
 

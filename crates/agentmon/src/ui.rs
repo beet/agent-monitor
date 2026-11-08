@@ -371,9 +371,13 @@ fn render_logs_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option<&str
     let status_width = columns[0].width as usize;
 
     let rows = entries.iter().zip(project_texts.iter()).map(|(entry, project_text)| {
-        let (status_text, status_style) = log_entry_status_line(&app.logs, entry, status_width);
+        let (status_text, status_style, snippet) = log_entry_status_line(&app.logs, entry, status_width);
+        let mut status_spans = vec![Span::styled(status_text, status_style)];
+        if let Some((snippet_text, snippet_style)) = snippet {
+            status_spans.push(Span::styled(snippet_text, snippet_style));
+        }
         Row::new([
-            Cell::from(Span::styled(status_text, status_style)),
+            Cell::from(Line::from(status_spans)),
             Cell::from(log_category_label(entry.category)),
             Cell::from(project_text.clone()),
             Cell::from(format_last_updated(entry.occurred_at_ms)),
@@ -572,9 +576,20 @@ fn log_completion_duration_ms(all_logs: &[LogEntry], entry: &LogEntry) -> Option
 /// (e.g. "reminder finished: Check the build 10m", "reminder started: Check
 /// the build, ETA: 10:45 AM"), reading as a single "what, when/how long"
 /// phrase. `snippet_max_width` bounds a prompt-category entry's own snippet
-/// and an agent-category entry's trailing last-prompt snippet - see
-/// `prompt_snippet`.
-fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_width: usize) -> (String, Style) {
+/// and an agent-category entry's trailing last-prompt/response snippet - see
+/// `prompt_snippet`. Returns the label (status word plus name/ETA/duration)
+/// and its style as the first two elements; when this entry also carries a
+/// quoted snippet, that snippet's own text and style come back as a third,
+/// separate element rather than being concatenated onto the label - the
+/// caller renders it as its own `Span`, since a "done" entry's snippet
+/// renders in a different color than its label (see the "Logs tab shows an
+/// aggregated, paginated activity list" requirement's "done" entry color
+/// scenarios).
+fn log_entry_status_line(
+    all_logs: &[LogEntry],
+    entry: &LogEntry,
+    snippet_max_width: usize,
+) -> (String, Style, Option<(String, Style)>) {
     let (mut text, style) = log_status_cell_text_and_style(entry.category, &entry.status);
     // Carries the reminder's name as of this event, so a later-deleted
     // reminder's past entries keep showing it - per the "A deleted
@@ -599,6 +614,8 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_wi
         };
         text.push_str(&formatted);
     }
+    let mut snippet: Option<(String, Style)> = None;
+
     // A prompt-category entry's snippet *is* its label - appended after the
     // 🗣️ marker with a single separating space (no quotes), since there is
     // no other status/category text for it to follow - per the "Logs tab
@@ -609,12 +626,14 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_wi
     // double-width emoji) is subtracted first - otherwise the snippet could
     // still end up wider than the column has room for, pushing its own
     // trailing `...` past the edge where ratatui would silently clip it
-    // rather than the ellipsis ever being visible.
+    // rather than the ellipsis ever being visible. Styled the same as the
+    // marker (unstyled, no color override) - there is no label/snippet color
+    // distinction to make here, unlike a "done" entry's snippet below.
     if entry.category == agentmon_proto::LogCategory::Prompt {
         if let Some(prompt) = &entry.prompt {
             use unicode_width::UnicodeWidthStr;
             let budget = snippet_max_width.saturating_sub(text.width() + 1);
-            text.push_str(&format!(" {}", prompt_snippet(prompt, budget)));
+            snippet = Some((format!(" {}", prompt_snippet(prompt, budget)), style));
         }
     }
     // A "done" entry's snippet reports what the agent said it did, not what
@@ -622,28 +641,37 @@ fn log_entry_status_line(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_wi
     // one, falling back to the prompt only when no response was captured
     // (e.g. the turn ended with only tool calls, or an older daemon never
     // captured one), so a "done" entry never regresses to showing nothing.
-    // A "started" or "needs input" entry has no response field at all, so it
-    // always reports what this agent was asked to do, from its prompt
-    // snapshot - see the activity-log capability's "Activity log captures
-    // notification-worthy events" requirement. No snippet for entries
-    // recorded with neither (e.g. an agent first tracked via `PreToolUse`,
-    // before any `UserPromptSubmit`). Same reasoning as the prompt-category
-    // branch above: the budget passed to `prompt_snippet` accounts for
-    // everything already in `text` plus this decoration's own width (` — "`
-    // before the snippet, `"` after it).
+    // A "needs input" entry has no response field at all, so it always
+    // reports what this agent was asked to do, from its prompt snapshot -
+    // see the activity-log capability's "Activity log captures
+    // notification-worthy events" requirement. A "started" entry shows no
+    // inline snippet at all, regardless of whether a last-prompt snapshot
+    // was recorded for it - that text is instead reachable in full via
+    // `Enter` on the entry within the details modal's Logs pane, per the
+    // "Prompt entry full-text modal" requirement. No snippet for a "done" or
+    // "needs input" entry recorded with neither a response nor a prompt
+    // (e.g. an agent first tracked via `PreToolUse`, before any
+    // `UserPromptSubmit`). Same reasoning as the prompt-category branch
+    // above: the budget passed to `prompt_snippet` accounts for everything
+    // already in `text` plus this decoration's own width (` — "` before the
+    // snippet, `"` after it). Styled with a bare, unstyled `Style::new()` -
+    // the same "default foreground" color already used for a prompt-category
+    // entry's own snippet and the Last Prompt pane - rather than the status
+    // style, so the agent's own words are visually distinguishable from the
+    // status styling (e.g. "done"'s green) around them.
     if entry.category == agentmon_proto::LogCategory::Agent {
-        let snippet_source = if entry.status == "done" {
-            entry.response.as_deref().or(entry.prompt.as_deref())
-        } else {
-            entry.prompt.as_deref()
+        let snippet_source = match entry.status.as_str() {
+            "done" => entry.response.as_deref().or(entry.prompt.as_deref()),
+            "needs_input" => entry.prompt.as_deref(),
+            _ => None,
         };
         if let Some(snippet_text) = snippet_source {
             use unicode_width::UnicodeWidthStr;
             let budget = snippet_max_width.saturating_sub(text.width() + 5);
-            text.push_str(&format!(" — \"{}\"", prompt_snippet(snippet_text, budget)));
+            snippet = Some((format!(" — \"{}\"", prompt_snippet(snippet_text, budget)), Style::new()));
         }
     }
-    (text, style)
+    (text, style, snippet)
 }
 
 /// Caps how much of a log entry's recorded prompt the Logs tab/pane shows
@@ -680,15 +708,22 @@ pub(crate) fn prompt_snippet(prompt: &str, max_width: usize) -> String {
 
 /// Appends `entry`'s reporting process id to an already-built status line,
 /// for agent-category entries only - used by the details modal's Logs pane,
-/// which shows pid where the top-level Logs tab does not.
-fn log_entry_line_with_pid(all_logs: &[LogEntry], entry: &LogEntry, snippet_max_width: usize) -> (String, Style) {
-    let (mut text, style) = log_entry_status_line(all_logs, entry, snippet_max_width);
+/// which shows pid where the top-level Logs tab does not. The pid is
+/// appended to the label text (ahead of any quoted snippet), not the
+/// snippet, since it's reporting metadata rather than the agent's own words
+/// and should share the label's style, not the snippet's.
+fn log_entry_line_with_pid(
+    all_logs: &[LogEntry],
+    entry: &LogEntry,
+    snippet_max_width: usize,
+) -> (String, Style, Option<(String, Style)>) {
+    let (mut text, style, snippet) = log_entry_status_line(all_logs, entry, snippet_max_width);
     if entry.category == agentmon_proto::LogCategory::Agent {
         if let Some(pid) = entry.pid {
             text.push_str(&format!("  pid {pid}"));
         }
     }
-    (text, style)
+    (text, style, snippet)
 }
 
 /// Builds the Agents tab's title, reflecting its `/`-search state - see
@@ -914,13 +949,14 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
         project_logs
             .iter()
             .map(|entry| {
-                let (status_text, style) = log_entry_line_with_pid(&app.logs, entry, logs_status_width);
+                let (status_text, style, snippet) = log_entry_line_with_pid(&app.logs, entry, logs_status_width);
                 let prefix = log_entry_tree_prefix(entry.category);
+                let mut spans = vec![Span::raw(prefix), Span::styled(status_text, style)];
+                if let Some((snippet_text, snippet_style)) = snippet {
+                    spans.push(Span::styled(snippet_text, snippet_style));
+                }
                 Row::new([
-                    Cell::from(Line::from(vec![
-                        Span::raw(prefix),
-                        Span::styled(status_text, style),
-                    ])),
+                    Cell::from(Line::from(spans)),
                     Cell::from(format_last_updated(entry.occurred_at_ms)),
                 ])
             })
@@ -3115,6 +3151,27 @@ mod tests {
     }
 
     #[test]
+    fn logs_tab_shows_no_inline_snippet_for_a_started_entry_with_a_recorded_prompt() {
+        let mut term = terminal();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.set_tab(crate::app::Tab::Logs);
+        app.apply_log_snapshot(vec![LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..log_entry("/tmp/project-a", agentmon_proto::LogCategory::Agent, "started", 0)
+        }]);
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("agent started"), "got:\n{text}");
+        assert!(
+            !text.contains("Fix the flaky test"),
+            "a started entry's row must show no inline prompt snippet, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn a_wider_terminal_shows_more_of_a_prompt_entrys_snippet_in_the_logs_tab() {
         // Flattened with single spaces - long enough to overflow a narrow
         // terminal's STATUS column but comfortably fit a wide one.
@@ -3319,6 +3376,27 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains('🤖'), "got:\n{text}");
         assert!(text.contains("agent started"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_logs_pane_shows_no_inline_snippet_for_a_started_entry_but_still_shows_its_pid() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(Vec::new(), Vec::new());
+        app.apply_log_snapshot(vec![LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            ..log_entry("/Users/beet/project", agentmon_proto::LogCategory::Agent, "started", 0)
+        }]);
+        app.modal = Some(crate::app::Modal::Details(PathBuf::from("/Users/beet/project")));
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(text.contains("pid 1"), "expected the started entry's pid, got:\n{text}");
+        assert!(
+            !text.contains("Fix the flaky test"),
+            "a started entry's row in the modal's Logs pane must show no inline prompt snippet, got:\n{text}"
+        );
     }
 
     #[test]
@@ -5054,7 +5132,7 @@ mod tests {
             response: None,
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (text, _style, _snippet) = log_entry_status_line(&[], &entry, 0);
 
         assert!(text.contains('⏰'), "got: {text}");
         assert!(text.contains("Check the build"), "got: {text}");
@@ -5078,7 +5156,7 @@ mod tests {
     fn a_finished_reminder_shows_its_elapsed_duration() {
         let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("finished", "Check the build", 600_000)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1], 0);
+        let (text, _style, _snippet) = log_entry_status_line(&all_logs, &all_logs[1], 0);
 
         assert!(text.contains("10m"), "expected the elapsed duration, got: {text}");
         assert!(!text.contains("10m00s"), "reminder durations should drop trailing 00s, got: {text}");
@@ -5088,7 +5166,7 @@ mod tests {
     fn a_stopped_reminder_shows_its_elapsed_duration() {
         let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("stopped", "Check the build", 83_000)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1], 0);
+        let (text, _style, _snippet) = log_entry_status_line(&all_logs, &all_logs[1], 0);
 
         assert!(text.contains("1m23s"), "expected the elapsed duration, got: {text}");
     }
@@ -5097,7 +5175,7 @@ mod tests {
     fn a_started_reminder_shows_no_duration() {
         let all_logs = vec![reminder_log("started", "Check the build", 0)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[0], 0);
+        let (text, _style, _snippet) = log_entry_status_line(&all_logs, &all_logs[0], 0);
 
         assert_eq!(
             text, "⏰ reminder started: Check the build",
@@ -5119,7 +5197,7 @@ mod tests {
             response: None,
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (text, _style, _snippet) = log_entry_status_line(&[], &entry, 0);
 
         assert_eq!(
             text,
@@ -5135,11 +5213,11 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
 
         assert!(
-            text.contains("\"Fix the flaky test\""),
-            "expected the recorded prompt snippet, got: {text}"
+            snippet.is_some_and(|(text, _)| text.contains("\"Fix the flaky test\"")),
+            "expected the recorded prompt snippet"
         );
     }
 
@@ -5147,9 +5225,9 @@ mod tests {
     fn an_agent_entry_with_no_recorded_prompt_shows_no_snippet() {
         let entry = log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0);
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
 
-        assert!(!text.contains('"'), "expected no prompt snippet, got: {text}");
+        assert!(snippet.is_none(), "expected no prompt snippet, got: {snippet:?}");
     }
 
     #[test]
@@ -5162,9 +5240,9 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::TestRun, "failed", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
 
-        assert!(!text.contains('"'), "expected no prompt snippet on a non-agent entry, got: {text}");
+        assert!(snippet.is_none(), "expected no prompt snippet on a non-agent entry, got: {snippet:?}");
     }
 
     #[test]
@@ -5190,11 +5268,13 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
 
+        assert_eq!(text, "🗣️", "expected the label to be the bare marker, with no prompt text concatenated onto it");
         assert_eq!(
-            text, "🗣️ Fix the flaky test",
-            "expected the marker, a single space, then the unquoted prompt text, with no \"prompt submitted\" wording"
+            snippet.map(|(text, _)| text),
+            Some(" Fix the flaky test".to_string()),
+            "expected the snippet to be a single space, then the unquoted prompt text, with no \"prompt submitted\" wording"
         );
     }
 
@@ -5207,11 +5287,12 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Prompt, "submitted", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
+        let snippet_text = snippet.expect("a prompt entry always carries a snippet").0;
 
         assert!(
-            text.ends_with("...") && !text.contains('"'),
-            "expected a truncated, unquoted snippet, got: {text}"
+            snippet_text.ends_with("...") && !snippet_text.contains('"'),
+            "expected a truncated, unquoted snippet, got: {snippet_text}"
         );
     }
 
@@ -5224,9 +5305,10 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, SNIPPET_MAX_WIDTH);
+        let snippet_text = snippet.expect("a done entry with a prompt always carries a snippet").0;
 
-        assert!(text.contains("...\""), "expected the snippet to end with an ellipsis, got: {text}");
+        assert!(snippet_text.contains("...\""), "expected the snippet to end with an ellipsis, got: {snippet_text}");
     }
 
     #[test]
@@ -5237,15 +5319,52 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
+        let snippet_text = snippet.expect("a done entry with a response always carries a snippet").0;
 
         assert!(
-            text.contains("\"Fixed the flaky test by awaiting the promise.\""),
-            "expected the done entry's snippet to show its response, got: {text}"
+            snippet_text.contains("\"Fixed the flaky test by awaiting the promise.\""),
+            "expected the done entry's snippet to show its response, got: {snippet_text}"
         );
         assert!(
-            !text.contains("Fix the flaky test\""),
-            "expected the done entry's snippet to omit the prompt once a response is captured, got: {text}"
+            !snippet_text.contains("Fix the flaky test\""),
+            "expected the done entry's snippet to omit the prompt once a response is captured, got: {snippet_text}"
+        );
+    }
+
+    #[test]
+    fn a_done_entrys_snippet_renders_in_the_user_prompt_color_not_the_status_color() {
+        let entry = LogEntry {
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (_text, label_style, snippet) = log_entry_status_line(&[], &entry, 0);
+        let snippet_style = snippet.expect("a done entry with a response always carries a snippet").1;
+
+        assert_eq!(label_style.fg, Some(Color::Green), "the \"done\" label itself should keep the status color");
+        assert_eq!(
+            snippet_style,
+            Style::new(),
+            "the quoted response should render unstyled, the same color already used for a prompt-category entry's snippet, not the status color"
+        );
+    }
+
+    #[test]
+    fn a_done_entrys_fallback_prompt_snippet_also_renders_in_the_user_prompt_color() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            response: None,
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
+        };
+
+        let (_text, _label_style, snippet) = log_entry_status_line(&[], &entry, 0);
+        let snippet_style = snippet.expect("a done entry falling back to its prompt still carries a snippet").1;
+
+        assert_eq!(
+            snippet_style,
+            Style::new(),
+            "the fallback prompt snippet should render unstyled too, not the status color"
         );
     }
 
@@ -5257,11 +5376,12 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
+        let snippet_text = snippet.expect("a done entry falling back to its prompt still carries a snippet").0;
 
         assert!(
-            text.contains("\"Fix the flaky test\""),
-            "expected the done entry's snippet to fall back to its last-prompt snapshot, got: {text}"
+            snippet_text.contains("\"Fix the flaky test\""),
+            "expected the done entry's snippet to fall back to its last-prompt snapshot, got: {snippet_text}"
         );
     }
 
@@ -5273,31 +5393,46 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
 
-        assert!(!text.contains('"'), "expected no snippet at all, got: {text}");
+        assert!(snippet.is_none(), "expected no snippet at all, got: {snippet:?}");
     }
 
     #[test]
-    fn a_started_or_needs_input_entry_ignores_any_response_and_shows_its_prompt() {
-        for status in ["started", "needs input"] {
-            let entry = LogEntry {
-                prompt: Some("Fix the flaky test".to_string()),
-                response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
-                ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, status, 0)
-            };
+    fn a_needs_input_entry_ignores_any_response_and_shows_its_prompt() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "needs_input", 0)
+        };
 
-            let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
+        let snippet_text = snippet.expect("a needs-input entry with a prompt always carries a snippet").0;
 
-            assert!(
-                text.contains("\"Fix the flaky test\""),
-                "expected a {status:?} entry's snippet to show its prompt regardless of any response, got: {text}"
-            );
-            assert!(
-                !text.contains("Fixed the flaky test by awaiting the promise."),
-                "a {status:?} entry has no response field in practice, but the renderer must not use one even if present, got: {text}"
-            );
-        }
+        assert!(
+            snippet_text.contains("\"Fix the flaky test\""),
+            "expected a needs-input entry's snippet to show its prompt regardless of any response, got: {snippet_text}"
+        );
+        assert!(
+            !snippet_text.contains("Fixed the flaky test by awaiting the promise."),
+            "a needs-input entry has no response field in practice, but the renderer must not use one even if present, got: {snippet_text}"
+        );
+    }
+
+    #[test]
+    fn a_started_entry_shows_no_inline_snippet_regardless_of_a_recorded_prompt() {
+        let entry = LogEntry {
+            prompt: Some("Fix the flaky test".to_string()),
+            response: Some("Fixed the flaky test by awaiting the promise.".to_string()),
+            ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "started", 0)
+        };
+
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
+
+        assert!(
+            snippet.is_none(),
+            "a started entry must show no inline snippet, even when it carries a last-prompt snapshot, got: {snippet:?}"
+        );
     }
 
     #[test]
@@ -5307,11 +5442,12 @@ mod tests {
             ..log_entry("/tmp/project", agentmon_proto::LogCategory::Agent, "done", 0)
         };
 
-        let (text, _style) = log_entry_status_line(&[], &entry, 0);
+        let (_text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
+        let snippet_text = snippet.expect("a done entry with a prompt always carries a snippet").0;
 
         assert!(
-            text.contains("\"Fix the flaky test in CI\""),
-            "expected the prompt's newline collapsed to a space, got: {text}"
+            snippet_text.contains("\"Fix the flaky test in CI\""),
+            "expected the prompt's newline collapsed to a space, got: {snippet_text}"
         );
     }
 
@@ -5319,7 +5455,7 @@ mod tests {
     fn a_stopped_or_finished_reminder_still_shows_duration_not_an_eta() {
         let all_logs = vec![reminder_log("started", "Check the build", 0), reminder_log("stopped", "Check the build", 83_000)];
 
-        let (text, _style) = log_entry_status_line(&all_logs, &all_logs[1], 0);
+        let (text, _style, _snippet) = log_entry_status_line(&all_logs, &all_logs[1], 0);
 
         assert!(text.contains("1m23s"), "expected the elapsed duration, got: {text}");
         assert!(!text.contains("ETA"), "a stopped entry should not show an ETA, got: {text}");
@@ -5337,8 +5473,8 @@ mod tests {
             reminder_log("finished", "First", 600_000),
         ];
 
-        let (first_text, _) = log_entry_status_line(&all_logs, &all_logs[3], 0);
-        let (second_text, _) = log_entry_status_line(&all_logs, &all_logs[2], 0);
+        let (first_text, ..) = log_entry_status_line(&all_logs, &all_logs[3], 0);
+        let (second_text, ..) = log_entry_status_line(&all_logs, &all_logs[2], 0);
 
         assert!(first_text.contains("10m"), "First ran for 10m (600_000ms from t=0), got: {first_text}");
         assert!(second_text.contains("1m"), "Second ran for 1m (60_000ms from t=10_000), got: {second_text}");
