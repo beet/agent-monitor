@@ -274,11 +274,26 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
     }
 
     if code == KeyCode::Esc {
+        // While the details modal is maximised, `Esc` restores it to
+        // windowed size instead of closing it - closing only happens on a
+        // second `Esc` once it's windowed. See the "Project details modal"
+        // requirement's contextual `Esc` behavior.
+        if matches!(app.modal, Some(Modal::Details(_))) && app.modal_maximised {
+            app.modal_maximised = false;
+            return InputAction::Continue;
+        }
         app.close_modal();
         return InputAction::Continue;
     }
 
     if matches!(app.modal, Some(Modal::Details(_))) {
+        // Toggles the modal between windowed and maximised, regardless of
+        // which pane currently holds focus - matching its `Maximise [m]`
+        // hint, which is shown at all times.
+        if code == KeyCode::Char('m') {
+            app.toggle_modal_maximised();
+            return InputAction::Continue;
+        }
         if code == KeyCode::Tab {
             app.toggle_modal_focus();
             return InputAction::Continue;
@@ -631,6 +646,183 @@ mod tests {
 
         assert_eq!(app.active_tab, Tab::Agents, "tab switching must not leak through a modal");
         assert!(is_help_modal_open(&app), "the modal must stay open");
+    }
+
+    #[test]
+    fn m_toggles_the_details_modal_between_windowed_and_maximised() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal
+        assert!(!app.modal_maximised);
+
+        let action = press(&mut app, KeyCode::Char('m'));
+        assert_eq!(action, InputAction::Continue);
+        assert!(app.modal_maximised);
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(!app.modal_maximised);
+    }
+
+    #[test]
+    fn m_toggles_the_details_modal_regardless_of_which_pane_holds_focus() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal, Logs pane focused
+        press(&mut app, KeyCode::Char('a')); // move focus to the Agents pane
+
+        press(&mut app, KeyCode::Char('m'));
+
+        assert!(app.modal_maximised);
+    }
+
+    #[test]
+    fn esc_restores_a_maximised_details_modal_instead_of_closing_it() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal
+        press(&mut app, KeyCode::Char('m')); // maximise it
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert!(!app.modal_maximised, "Esc should restore windowed size");
+        assert!(app.modal.is_some(), "Esc must not close a maximised modal");
+    }
+
+    #[test]
+    fn esc_closes_the_details_modal_once_it_is_windowed() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal
+        press(&mut app, KeyCode::Char('m')); // maximise it
+        press(&mut app, KeyCode::Esc); // first Esc: restore to windowed
+
+        let action = press(&mut app, KeyCode::Esc); // second Esc: close
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn esc_closes_the_details_modal_directly_when_it_was_never_maximised() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal, windowed by default
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn m_has_no_effect_on_the_help_modal() {
+        let mut app = App::new();
+        app.open_help_modal();
+
+        press(&mut app, KeyCode::Char('m'));
+
+        assert!(!app.modal_maximised);
+        assert!(is_help_modal_open(&app));
+    }
+
+    #[test]
+    fn esc_on_the_help_modal_closes_it_regardless_of_modal_maximised() {
+        let mut app = App::new();
+        app.open_help_modal();
+        app.modal_maximised = true;
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.modal, None, "Help modal must still close on Esc even if modal_maximised is true");
+    }
+
+    #[test]
+    fn m_has_no_effect_on_the_quit_confirm_dialog() {
+        let mut app = App::new();
+        app.open_quit_confirm();
+
+        press(&mut app, KeyCode::Char('m'));
+
+        assert!(!app.modal_maximised);
+        assert_eq!(app.modal, Some(Modal::QuitConfirm));
+    }
+
+    #[test]
+    fn esc_on_the_quit_confirm_dialog_closes_it_regardless_of_modal_maximised() {
+        let mut app = App::new();
+        app.open_quit_confirm();
+        app.modal_maximised = true;
+
+        let action = press(&mut app, KeyCode::Esc);
+
+        assert_eq!(action, InputAction::Continue);
+        assert_eq!(app.modal, None);
+    }
+
+    // NOTE: there is no key sequence that closes the details modal while
+    // `modal_maximised` is still `true` - `Esc` always restores a maximised
+    // modal to windowed before a further `Esc` closes it (see
+    // `esc_restores_a_maximised_details_modal_instead_of_closing_it` and
+    // `esc_closes_the_details_modal_once_it_is_windowed` above), so a
+    // "maximise, close, navigate tabs, reopen, still maximised" flow isn't
+    // reachable through real input. What IS reachable, and what this test
+    // and `maximised_state_applies_regardless_of_which_tab_opens_the_modal`
+    // below cover, is that nothing in the tab-switching keys themselves (or
+    // in reopening the modal) resets the flag - confirmed with the user; see
+    // design.md's Risks/Trade-offs.
+    #[test]
+    fn switching_tabs_while_the_modal_is_closed_does_not_reset_modal_maximised() {
+        let mut app = app_with_one_agent();
+        app.modal_maximised = true;
+
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.active_tab, Tab::Logs);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.active_tab, Tab::Reminders);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.active_tab, Tab::Agents);
+
+        assert!(app.modal_maximised, "switching tabs must not reset the sticky maximised/windowed choice");
+    }
+
+    #[test]
+    fn windowed_state_persists_after_navigating_tabs_and_reopening_the_details_modal() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal, windowed by default
+        press(&mut app, KeyCode::Esc); // close it, still windowed
+        assert_eq!(app.modal, None);
+
+        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::Char('a'));
+
+        press(&mut app, KeyCode::Enter); // reopen the details modal
+
+        assert!(app.modal.is_some(), "the modal should reopen");
+        assert!(!app.modal_maximised, "windowed state should survive closing, tab navigation, and reopening");
+    }
+
+    #[test]
+    fn maximised_state_applies_regardless_of_which_tab_opens_the_modal() {
+        use agentmon_proto::{LogCategory, LogEntry};
+        use std::path::PathBuf;
+
+        let mut app = app_with_one_agent();
+        app.apply_log_snapshot(vec![LogEntry {
+            working_dir: "/tmp/a".into(),
+            category: LogCategory::Agent,
+            status: "done".to_string(),
+            occurred_at_ms: 1,
+            pid: Some(1),
+            reminder_name: None,
+            reminder_due_at_ms: None,
+            prompt: None,
+            response: None,
+        }]);
+        app.modal_maximised = true;
+        press(&mut app, KeyCode::Char('l')); // switch to the Logs tab
+
+        press(&mut app, KeyCode::Enter); // open the details modal from the Logs tab
+
+        assert_eq!(app.modal, Some(Modal::Details(PathBuf::from("/tmp/a"))));
+        assert!(app.modal_maximised, "the sticky maximised state applies no matter which tab opened the modal");
     }
 
     #[test]

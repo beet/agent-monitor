@@ -293,7 +293,13 @@ The TUI SHALL open a details modal overlay for a project when the user presses `
 
 The Agents, Tests, and Reminders panes SHALL be arranged side by side (by width) in a row above the Last Prompt pane. By default, each of the three collapses to a single line of content with one blank line beneath it - the same collapsed look the Last Prompt pane has always had. Whichever of the three currently needs the most vertical room to show its content, up to a cap of one third of the modal's height, SHALL set the height applied to all three: they always share the same height as each other on a given frame, growing or shrinking together as their content changes, rather than each sizing independently. A pane whose content exceeds that shared height, once it is capped at one third of the modal, SHALL paginate per the "Paginated lists support keyboard navigation" requirement instead of growing further. The Last Prompt pane SHALL continue to occupy a thin, fixed-height strip spanning the modal's full width immediately below that row, unchanged in height, wrapping, and truncation behavior. The Logs pane SHALL occupy the remaining space beneath that, shrinking or growing by exactly however much the Agents/Tests/Reminders row's height changes from its one-line default, so the modal's total height stays fixed regardless of how tall that row currently is.
 
-Agent and test-run statuses in the Agents and Tests panes, reminder statuses in the Reminders pane, and log entry statuses in the Logs pane, SHALL use the same emoji markers, color styling, and duration as their counterparts in the Agents tab, Reminders tab, and Logs tab respectively, so status is visually consistent wherever it appears; the Agents, Tests, and Reminders panes SHALL omit the category-word prefix used in the Agents, Reminders, and Logs tabs, since each pane itself already establishes the category (e.g. "🤖 done", "❌ failed", "✅ done, 10m"); the modal's Logs pane SHALL include the category-word prefix, consistent with the top-level Logs tab it mirrors. The user SHALL be able to close the modal with `Esc`, returning to whichever tab was active without altering the underlying agent, test-run, or reminder state.
+Agent and test-run statuses in the Agents and Tests panes, reminder statuses in the Reminders pane, and log entry statuses in the Logs pane, SHALL use the same emoji markers, color styling, and duration as their counterparts in the Agents tab, Reminders tab, and Logs tab respectively, so status is visually consistent wherever it appears; the Agents, Tests, and Reminders panes SHALL omit the category-word prefix used in the Agents, Reminders, and Logs tabs, since each pane itself already establishes the category (e.g. "🤖 done", "❌ failed", "✅ done, 10m"); the modal's Logs pane SHALL include the category-word prefix, consistent with the top-level Logs tab it mirrors. The user SHALL be able to close the modal with `Esc` while it is in its windowed size, returning to whichever tab was active without altering the underlying agent, test-run, or reminder state; see below for `Esc`'s contextual behavior while the modal is maximised.
+
+While the details modal is open, the user SHALL be able to press `m` to toggle it between its default windowed size (described above and in the following paragraphs) and a maximised size that takes over the entire screen, including the rows the tab bar normally occupies: since the modal's own keyboard shortcuts take priority over all input while it is open and the outer tab bar cannot actually be switched while it is showing, maximising reserves no space for it. This toggle SHALL work identically regardless of which tab the modal was opened from. Maximising or restoring the modal SHALL NOT change its five-pane layout proportions, its focus cycling, its pagination behavior, or any pane's content or interaction rules - it only changes how much height and width that existing layout has to work with. Whether the modal is currently maximised or windowed is a single, sticky choice that persists for as long as the TUI keeps running: closing the modal and later reopening it - from the same tab or a different one, including after navigating away via the outer tab bar to another tab and back - SHALL reopen it in whichever of the two sizes it was last left in, rather than always resetting to windowed, and switching tabs SHALL NOT by itself change this choice. Since `Esc` always restores a maximised modal to windowed before a further `Esc` closes it (per the contextual behavior described below), closing the modal in practice always leaves it windowed for the next open; the sticky choice is what prevents that next open from being forced to windowed for any other reason (e.g. by the act of closing and reopening, or by tab navigation, each independent of the size actually chosen).
+
+The modal's frame SHALL show a `Maximise [m]` keyboard shortcut hint anchored at its top-right corner for as long as the modal is open, alongside its existing top-left title and its bottom-left `<tab> focus pane` hint. This hint SHALL render in bold while the modal is maximised, and in normal (non-bold) weight while it is windowed, so the modal's current size is visible from the hint's weight alone.
+
+`Esc`'s effect on the details modal is contextual on its current size: while the modal is maximised, `Esc` SHALL restore it to its windowed size without closing it; while the modal is windowed, `Esc` SHALL close it, per the closing behavior described above. Pressing `m` while the modal is already maximised SHALL likewise restore it to windowed size, giving the maximised modal two equivalent ways back to windowed size.
 
 The Agents, Tests, and Reminders panes SHALL each be paginated per the "Paginated lists support keyboard navigation" requirement once they hold more content than fits within their current (possibly capped) height. Unlike the Logs pane, none of these three SHALL ever show a pagination keyboard-shortcut hint in its title, whether or not they are currently paginated; a scrollbar is their only pagination indicator. The Reminders pane's title SHALL always show a hint for creating a new reminder (`New [R]`) instead; the Agents and Tests panes' titles show only their pane name and focus-shortcut hint.
 
@@ -428,7 +434,7 @@ The Last Prompt pane SHALL show the last-prompt text of whichever agent register
 - **THEN** the Logs pane indicates there is no activity rather than showing an error
 
 #### Scenario: Closing the modal
-- **WHEN** the user presses `Esc` while the details modal is open
+- **WHEN** the user presses `Esc` while the details modal is open and in its windowed size
 - **THEN** the TUI closes the modal and returns to whichever tab was active when it opened, and the daemon's tracked agents, test runs, and reminders are unaffected
 
 #### Scenario: The Logs pane's timestamp trails each entry's text
@@ -518,6 +524,59 @@ The Last Prompt pane SHALL show the last-prompt text of whichever agent register
 #### Scenario: The Last Prompt pane is not part of the modal's keyboard focus cycle
 - **WHEN** the user presses `Tab` or the `p` focus-shortcut while the details modal is open
 - **THEN** keyboard focus can land on the Last Prompt pane, unlike before this requirement extended focus to all five panes - `Tab` reaches it in its place in the Agents/Tests/Reminders/Last Prompt/Logs order, and `p` jumps to it directly
+
+#### Scenario: Maximising the modal takes over the entire screen
+- **WHEN** the details modal is open in its windowed size and the user presses `m`
+- **THEN** the modal grows to fill the entire screen, including the rows the tab bar normally occupies
+
+#### Scenario: Maximising works the same regardless of which tab the modal was opened from
+- **WHEN** the details modal is open, having been reached from the Agents tab, the Logs tab, or the Reminders tab, and the user presses `m`
+- **THEN** the modal maximises to fill the entire screen in exactly the same way, regardless of which tab it was opened from
+
+#### Scenario: The tab bar is covered while the modal is maximised
+- **WHEN** the details modal is maximised
+- **THEN** the tab bar is no longer visible - the modal's own border and panes occupy the rows it would otherwise occupy
+
+#### Scenario: Maximising does not change the modal's internal layout or interactions
+- **WHEN** the details modal is maximised
+- **THEN** its five panes keep the same relative layout, focus cycling, pagination behavior, and content as when windowed - only the amount of space available to that existing layout changes
+
+#### Scenario: Pressing m again while maximised restores the windowed size
+- **WHEN** the details modal is maximised and the user presses `m`
+- **THEN** the modal returns to its windowed size
+
+#### Scenario: Esc restores a maximised modal instead of closing it
+- **WHEN** the details modal is maximised and the user presses `Esc`
+- **THEN** the modal returns to its windowed size and remains open, and the daemon's tracked agents, test runs, and reminders are unaffected
+
+#### Scenario: Esc closes the modal only once it is windowed
+- **WHEN** the details modal was maximised, the user presses `Esc` to restore it to windowed size, and then presses `Esc` again
+- **THEN** the first `Esc` restores the windowed size and the second `Esc` closes the modal, returning to whichever tab was active when it opened
+
+#### Scenario: The maximise hint is shown at the modal's top-right corner
+- **WHEN** the details modal is open, whether windowed or maximised
+- **THEN** its frame shows a `Maximise [m]` keyboard shortcut hint anchored at its top-right corner, alongside its existing top-left title and bottom-left `<tab> focus pane` hint
+
+#### Scenario: The maximise hint is bold while maximised
+- **WHEN** the details modal is maximised
+- **THEN** its `Maximise [m]` hint renders in bold
+
+#### Scenario: The maximise hint is normal weight while windowed
+- **WHEN** the details modal is in its windowed size
+- **THEN** its `Maximise [m]` hint renders in normal, non-bold weight
+
+#### Scenario: The windowed state persists across closing and reopening the modal
+- **WHEN** the details modal is in its windowed size, the user closes it, and later reopens the details modal (for the same or a different project)
+- **THEN** the modal reopens in its windowed size
+
+#### Scenario: Switching tabs does not reset the maximised/windowed choice
+- **WHEN** the details modal is closed, whatever its maximised/windowed choice currently is, and the user switches between the Agents, Logs, and Reminders tabs via the outer tab bar any number of times
+- **THEN** that choice is unchanged by the tab switching itself, and the next time the details modal is opened it reflects that same, untouched choice
+
+#### Scenario: Reopening the modal honors whatever the sticky choice currently is, regardless of which tab opens it
+- **WHEN** the details modal's sticky maximised/windowed choice is currently maximised, and the user opens the details modal from the Agents tab, the Logs tab, or the Reminders tab
+- **THEN** the modal opens already maximised, regardless of which of the three tabs it was opened from
+
 ### Requirement: Prompt entry full-text modal
 When the details modal's Logs pane holds focus and the user presses `Enter` on its selected log entry, and that entry is a prompt-category entry, an agent-category entry with status "done" that carries a response snapshot, or an agent-category entry with status "started" that carries a last-prompt snapshot, the TUI SHALL open a read-only modal overlay showing that entry's full text - the prompt text for a prompt-category entry, the response text for a "done" entry, the last-prompt text for a "started" entry - consistently, regardless of whether its displayed snippet happened to be truncated (or, for a "started" entry, regardless of the fact that it shows no inline snippet at all - per the "Project details modal" requirement), so the user never has to judge a row's length or content to know what `Enter` will do. This modal SHALL wrap its text to its own width and, if the full text exceeds the modal's height, SHALL make it scrollable with `j`/`k` (and `g`/`G` to jump to its start/end) rather than truncating it - unlike the non-interactive Last Prompt pane, the entire purpose of this modal is to show text the Logs pane's row might not have fit (or, for a "started" entry, does not show at all). The user SHALL be able to close it with `Esc`, returning to the details modal with its Logs pane still focused and its selection unchanged, without altering any tracked agent, test-run, or reminder state. `Enter` on any other selected entry in the Logs pane - any entry that is neither a prompt-category entry, a "done" agent-category entry carrying a response snapshot, nor a "started" agent-category entry carrying a last-prompt snapshot - SHALL have no effect, unchanged from the Logs pane's behavior before this modal existed; this includes a "done" entry recorded with no response snapshot (e.g. because its transcript could not be read) and a "started" entry recorded with no last-prompt snapshot. The top-level Logs tab's own `Enter` is unaffected by this requirement: per the "Project details modal" requirement, it always opens the project details modal, regardless of the selected entry's category, status, or truncation.
 

@@ -390,6 +390,13 @@ pub struct App {
     pub rename_form: Option<RenameForm>,
     /// The full-prompt modal, when open - see `PromptDetail`.
     pub prompt_detail: Option<PromptDetail>,
+    /// Whether the details modal renders maximised (filling the content
+    /// area beneath the tab bar) rather than windowed (its default centered
+    /// size) - see the "Project details modal" requirement's maximise
+    /// toggle. Deliberately NOT reset by `close_modal`: this is a sticky
+    /// choice that survives closing and reopening the modal, from any tab,
+    /// for as long as the TUI keeps running.
+    pub modal_maximised: bool,
 }
 
 impl App {
@@ -425,6 +432,7 @@ impl App {
             project_names: HashMap::new(),
             rename_form: None,
             prompt_detail: None,
+            modal_maximised: false,
         }
     }
 
@@ -714,6 +722,15 @@ impl App {
         self.modal = None;
         self.reminder_form = None;
         self.confirm_delete_reminder = None;
+    }
+
+    /// Flips the details modal between maximised and windowed - the `m`
+    /// shortcut. Deliberately not scoped to `Modal::Details` here: callers
+    /// in `input.rs` only invoke this while that modal is open, and the flag
+    /// itself is meant to persist across closing/reopening, so there's
+    /// nothing to guard against.
+    pub fn toggle_modal_maximised(&mut self) {
+        self.modal_maximised = !self.modal_maximised;
     }
 
     /// Opens the full-prompt modal showing `text` in full, scrolled to its
@@ -2226,6 +2243,34 @@ mod tests {
 
         app.close_modal();
         assert_eq!(app.modal, None);
+    }
+
+    #[test]
+    fn toggle_modal_maximised_flips_back_and_forth() {
+        let mut app = App::new();
+        assert!(!app.modal_maximised);
+
+        app.toggle_modal_maximised();
+        assert!(app.modal_maximised);
+
+        app.toggle_modal_maximised();
+        assert!(!app.modal_maximised);
+    }
+
+    #[test]
+    fn closing_and_reopening_the_details_modal_does_not_reset_maximised_state() {
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent_in("/tmp/a", "a", AgentStatus::Running)], Vec::new());
+        app.open_details_modal();
+
+        app.toggle_modal_maximised();
+        assert!(app.modal_maximised);
+
+        app.close_modal();
+        assert!(app.modal_maximised);
+
+        app.open_details_modal();
+        assert!(app.modal_maximised);
     }
 
     #[test]

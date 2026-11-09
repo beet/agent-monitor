@@ -872,11 +872,20 @@ fn pane_border_style(focused: bool) -> Style {
 /// `(logs_page_size, reminders_page_size, agents_page_size, tests_page_size)`
 /// (see `render` / `PageSizes`).
 fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usize, usize, usize) {
-    let area = centered_rect(80, 80, frame.area());
+    // Maximised takes over the entire screen, including the rows the tab
+    // bar normally occupies - the modal intercepts all keyboard input while
+    // open, so the tab bar can't actually be interacted with regardless of
+    // whether it's visible. `Clear`, rendered across this area just below,
+    // blanks whatever `render_tab_bar` already painted there. See the
+    // "Project details modal" requirement's maximise toggle.
+    let area = if app.modal_maximised { frame.area() } else { centered_rect(80, 80, frame.area()) };
     frame.render_widget(Clear, area);
 
+    let maximise_hint_style =
+        if app.modal_maximised { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
     let block = Block::default()
         .title(format!("Details - {}  Rename [n]", app.project_name(cwd)))
+        .title_top(Line::from(Span::styled("Maximise [m]", maximise_hint_style)).right_aligned())
         .title_bottom("<tab> focus pane")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
@@ -3940,6 +3949,144 @@ mod tests {
 
         let text = buffer_text(&term);
         assert!(text.contains("Details - project  Rename [n]"), "got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_shows_the_maximise_hint_at_top_right_in_normal_weight_when_windowed() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let text = buffer_text(&term);
+        assert!(text.contains("Maximise [m]"), "got:\n{text}");
+        let (hint_x, hint_y) = find_text(buffer, "Maximise [m]").expect("hint should be rendered");
+        let (title_x, title_y) = find_text(buffer, "Details -").expect("left title should be rendered");
+        assert_eq!(hint_y, title_y, "the maximise hint should be on the same row as the modal's title");
+        assert!(hint_x > title_x, "the maximise hint should sit to the right of the left-aligned title");
+        let hint_cell = &buffer[(hint_x, hint_y)];
+        assert!(!hint_cell.modifier.contains(Modifier::BOLD), "the hint should be normal weight while windowed");
+    }
+
+    #[test]
+    fn details_modal_maximise_hint_is_bold_while_maximised() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+        app.modal_maximised = true;
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (hint_x, hint_y) = find_text(buffer, "Maximise [m]").expect("hint should be rendered");
+        let hint_cell = &buffer[(hint_x, hint_y)];
+        assert!(hint_cell.modifier.contains(Modifier::BOLD), "the hint should be bold while maximised");
+    }
+
+    #[test]
+    fn details_modal_fills_the_entire_screen_when_maximised() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+        app.modal_maximised = true;
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        // The modal's title starts immediately after its left border, which
+        // itself starts at the terminal's actual top-left corner (row 0,
+        // column 0), covering the rows the tab bar normally occupies -
+        // unlike the windowed modal's centered, inset border.
+        let (title_x, title_y) = find_text(buffer, "Details -").expect("title should be rendered");
+        assert_eq!((title_x, title_y), (1, 0), "maximised modal's border should start at the terminal's corner");
+    }
+
+    #[test]
+    fn details_modal_covers_the_tab_bar_when_maximised() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+        app.modal_maximised = true;
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        // The modal's own keyboard shortcuts take priority over everything
+        // else while it's open, and the tab bar can't actually be switched
+        // while it's showing - so maximising reserves no space for it,
+        // unlike the earlier design that kept it visible above the modal.
+        // Checked via "(tab)" - the tab bar's own cycling hint - rather than
+        // "Agents [a]", since the modal's own Agents pane title also
+        // contains that exact substring.
+        let text = buffer_text(&term);
+        assert!(!text.contains("(tab)"), "the tab bar must be covered while maximised, got:\n{text}");
+    }
+
+    #[test]
+    fn details_modal_does_not_fill_the_entire_screen_when_windowed() {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 4242, 0)], Vec::new());
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let buffer = term.backend().buffer();
+        let (title_x, title_y) = find_text(buffer, "Details -").expect("title should be rendered");
+        assert_ne!(
+            (title_x, title_y),
+            (1, 0),
+            "windowed modal's border should stay centered, not reach the terminal's corner"
+        );
+    }
+
+    #[test]
+    fn help_modal_rendering_is_unaffected_by_modal_maximised() {
+        let mut windowed_term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut windowed_app = App::new();
+        windowed_app.open_help_modal();
+        windowed_term.draw(|frame| { render(frame, &windowed_app); }).unwrap();
+        let windowed_text = buffer_text(&windowed_term);
+
+        let mut maximised_term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut maximised_app = App::new();
+        maximised_app.open_help_modal();
+        maximised_app.modal_maximised = true;
+        maximised_term.draw(|frame| { render(frame, &maximised_app); }).unwrap();
+        let maximised_text = buffer_text(&maximised_term);
+
+        assert_eq!(
+            windowed_text, maximised_text,
+            "the help modal must render identically regardless of modal_maximised - only the details modal supports maximising"
+        );
+        assert!(!windowed_text.contains("Maximise [m]"), "the help modal must not show the maximise hint");
+    }
+
+    #[test]
+    fn quit_confirm_modal_rendering_is_unaffected_by_modal_maximised() {
+        let mut windowed_term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut windowed_app = App::new();
+        windowed_app.open_quit_confirm();
+        windowed_term.draw(|frame| { render(frame, &windowed_app); }).unwrap();
+        let windowed_text = buffer_text(&windowed_term);
+
+        let mut maximised_term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut maximised_app = App::new();
+        maximised_app.open_quit_confirm();
+        maximised_app.modal_maximised = true;
+        maximised_term.draw(|frame| { render(frame, &maximised_app); }).unwrap();
+        let maximised_text = buffer_text(&maximised_term);
+
+        assert_eq!(
+            windowed_text, maximised_text,
+            "the quit-confirm dialog must render identically regardless of modal_maximised - only the details modal supports maximising"
+        );
+        assert!(!windowed_text.contains("Maximise [m]"), "the quit-confirm dialog must not show the maximise hint");
     }
 
     #[test]
