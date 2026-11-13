@@ -883,9 +883,10 @@ fn render_details_modal(frame: &mut Frame, app: &App, cwd: &Path) -> (usize, usi
 
     let maximise_hint_style =
         if app.modal_maximised { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
+    let maximise_hint_text = if app.modal_maximised { "Un-maximise [m]" } else { "Maximise [m]" };
     let block = Block::default()
         .title(format!("Details - {}  Rename [n]", app.project_name(cwd)))
-        .title_top(Line::from(Span::styled("Maximise [m]", maximise_hint_style)).right_aligned())
+        .title_top(Line::from(Span::styled(maximise_hint_text, maximise_hint_style)).right_aligned())
         .title_bottom("<tab> focus pane")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
@@ -3982,7 +3983,11 @@ mod tests {
         term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let buffer = term.backend().buffer();
-        let (hint_x, hint_y) = find_text(buffer, "Maximise [m]").expect("hint should be rendered");
+        assert!(
+            find_text(buffer, "Maximise [m]").is_none(),
+            "while maximised the hint should read \"Un-maximise [m]\", not \"Maximise [m]\""
+        );
+        let (hint_x, hint_y) = find_text(buffer, "Un-maximise [m]").expect("hint should be rendered");
         let hint_cell = &buffer[(hint_x, hint_y)];
         assert!(hint_cell.modifier.contains(Modifier::BOLD), "the hint should be bold while maximised");
     }

@@ -98,6 +98,25 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     // "`page_size` is a parameter" decision.
     let mut page_sizes = PageSizes::default();
     loop {
+        // Toggling the details modal's maximised state reflows every row on
+        // screen; ratatui's incremental diffing can misalign by a column on
+        // a row led by a VS16 emoji (e.g. the Logs pane's `🗣️` marker),
+        // leaving stale characters from the previous frame behind. Forcing
+        // a full redraw for the frame right after a toggle sidesteps that -
+        // see `App::take_needs_full_redraw` and the "Project details modal"
+        // requirement.
+        //
+        // Deliberately `resize(size)` rather than `Terminal::clear()`:
+        // `clear()` calls `get_cursor_position()`, which queries the
+        // terminal and reads its reply from stdin - crossterm's own docs
+        // warn this can block or time out while another thread is in
+        // `event::read`/`event::poll`, which the key-reading thread spawned
+        // above always is. `resize` to the terminal's own current size
+        // clears the screen and resets the diff buffer the same way, for a
+        // fullscreen viewport, without touching cursor position at all.
+        if app.take_needs_full_redraw() {
+            terminal.resize(terminal.size()?.into())?;
+        }
         terminal.draw(|frame| page_sizes = render(frame, &app))?;
 
         match rx.recv() {

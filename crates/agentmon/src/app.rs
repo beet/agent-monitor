@@ -397,6 +397,16 @@ pub struct App {
     /// choice that survives closing and reopening the modal, from any tab,
     /// for as long as the TUI keeps running.
     pub modal_maximised: bool,
+    /// Set whenever `toggle_modal_maximised` flips `modal_maximised`, and
+    /// cleared by `take_needs_full_redraw` - a one-shot signal telling the
+    /// main loop to force a full terminal redraw before its next draw,
+    /// instead of relying on ratatui's incremental diffing between frames.
+    /// Needed because the maximise toggle reflows
+    /// every row on screen, and ratatui's diff can misalign by a column on
+    /// rows led by a VS16 emoji (e.g. the Logs pane's `🗣️` marker), leaving
+    /// stale characters from the previous frame on screen - see the
+    /// "Project details modal" requirement.
+    needs_full_redraw: bool,
 }
 
 impl App {
@@ -433,6 +443,7 @@ impl App {
             rename_form: None,
             prompt_detail: None,
             modal_maximised: false,
+            needs_full_redraw: false,
         }
     }
 
@@ -725,12 +736,22 @@ impl App {
     }
 
     /// Flips the details modal between maximised and windowed - the `m`
-    /// shortcut. Deliberately not scoped to `Modal::Details` here: callers
-    /// in `input.rs` only invoke this while that modal is open, and the flag
-    /// itself is meant to persist across closing/reopening, so there's
-    /// nothing to guard against.
+    /// shortcut, and the `Esc`-while-maximised restore path. Deliberately
+    /// not scoped to `Modal::Details` here: callers in `input.rs` only
+    /// invoke this while that modal is open, and the flag itself is meant to
+    /// persist across closing/reopening, so there's nothing to guard
+    /// against. Also marks that the next frame needs a full redraw - see
+    /// `needs_full_redraw`.
     pub fn toggle_modal_maximised(&mut self) {
         self.modal_maximised = !self.modal_maximised;
+        self.needs_full_redraw = true;
+    }
+
+    /// Consumes the one-shot full-redraw signal set by
+    /// `toggle_modal_maximised`, so the main loop forces a full terminal
+    /// redraw exactly once per toggle rather than on every subsequent frame.
+    pub fn take_needs_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.needs_full_redraw)
     }
 
     /// Opens the full-prompt modal showing `text` in full, scrolled to its
@@ -2255,6 +2276,19 @@ mod tests {
 
         app.toggle_modal_maximised();
         assert!(!app.modal_maximised);
+    }
+
+    #[test]
+    fn toggle_modal_maximised_sets_a_one_shot_full_redraw_signal() {
+        let mut app = App::new();
+        assert!(!app.take_needs_full_redraw(), "nothing to redraw before any toggle");
+
+        app.toggle_modal_maximised();
+        assert!(app.take_needs_full_redraw(), "toggling should request a full redraw");
+        assert!(!app.take_needs_full_redraw(), "the signal is one-shot and should not repeat");
+
+        app.toggle_modal_maximised();
+        assert!(app.take_needs_full_redraw(), "toggling back should request a full redraw again");
     }
 
     #[test]

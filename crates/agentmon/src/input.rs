@@ -279,7 +279,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent, page_sizes: PageSizes) -> Inpu
         // second `Esc` once it's windowed. See the "Project details modal"
         // requirement's contextual `Esc` behavior.
         if matches!(app.modal, Some(Modal::Details(_))) && app.modal_maximised {
-            app.modal_maximised = false;
+            app.toggle_modal_maximised();
             return InputAction::Continue;
         }
         app.close_modal();
@@ -684,6 +684,18 @@ mod tests {
         assert_eq!(action, InputAction::Continue);
         assert!(!app.modal_maximised, "Esc should restore windowed size");
         assert!(app.modal.is_some(), "Esc must not close a maximised modal");
+    }
+
+    #[test]
+    fn esc_restoring_a_maximised_details_modal_requests_a_full_redraw() {
+        let mut app = app_with_one_agent();
+        press(&mut app, KeyCode::Enter); // opens the details modal
+        press(&mut app, KeyCode::Char('m')); // maximise it
+        app.take_needs_full_redraw(); // consume the signal from maximising, in isolation from Esc's
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.take_needs_full_redraw(), "restoring from maximised should request a full redraw, not just `m` maximising");
     }
 
     #[test]
