@@ -1203,6 +1203,46 @@ fn truncate_text_with_ellipsis(text: &str, max_width: usize) -> String {
     format!("{result}...")
 }
 
+/// Builds one reminder's row for the details modal's Reminders pane as a
+/// single flowing `Line`, rather than padded columns: the reminder's name, a
+/// single space, its configured duration, and then - when it has a status -
+/// enough space to push that status flush with the pane's right edge
+/// (`inner_width`), falling back to a single space when there's no slack
+/// width to spare. "Running" is dropped from a running reminder's status
+/// text (see `reminder_status_cell_text_and_style`'s `drop_running`). When
+/// the row doesn't fit even with that gap collapsed to one space, the
+/// reminder's *name* is truncated (via `truncate_line`, with a trailing
+/// `...`) instead of the duration or status, so the duration and status -
+/// including a running reminder's ETA - are always fully visible. See the
+/// "Project details modal" requirement's Reminders-pane row formatting.
+fn reminder_pane_row(reminder: &ReminderInfo, now_ms: u64, inner_width: usize) -> Line<'static> {
+    let (status_text, status_style) = reminder_status_cell_text_and_style(reminder, now_ms, false, true);
+    let has_status = !status_text.is_empty();
+    let status_width = str_width(&status_text);
+
+    let duration_text = format!(" {}m", reminder.duration_minutes);
+    let duration_width = str_width(&duration_text);
+
+    let reserved = duration_width + if has_status { 1 + status_width } else { 0 };
+    let name_budget = inner_width.saturating_sub(reserved);
+
+    let name_line = truncate_line(Line::from(Span::raw(reminder.name.clone())), name_budget);
+    let name_width = line_width(&name_line);
+
+    let mut spans: Vec<Span<'static>> = name_line.spans;
+    spans.push(Span::raw(duration_text));
+
+    if has_status {
+        let padding = inner_width
+            .saturating_sub(name_width + duration_width + status_width)
+            .max(1);
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::styled(status_text, status_style));
+    }
+
+    Line::from(spans)
+}
+
 /// Renders the details modal's Reminders pane: that project's reminders,
 /// most recently updated first, paginated once they overflow the pane - see
 /// the "Project details modal" requirement. Unlike the Logs pane, its title
@@ -1215,7 +1255,7 @@ fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -
     let reminders = app.project_reminders(cwd);
     let focused = matches!(app.modal_focus, ModalFocus::Reminders);
 
-    let widths = [Constraint::Fill(2), Constraint::Length(9), Constraint::Fill(2)];
+    let widths = [Constraint::Fill(1)];
 
     let bare_block = Block::default()
         .borders(Borders::ALL)
@@ -1223,33 +1263,14 @@ fn render_reminders_pane(frame: &mut Frame, app: &App, cwd: &Path, area: Rect) -
         .border_style(pane_border_style(focused));
     let inner = bare_block.inner(area);
     let page_size = inner.height as usize;
-
-    // This pane is only a third of the modal's top third, so its Status
-    // column has little room - a running reminder's "⏳ Running Xm, ETA:
-    // h:MM AM/PM" easily overflows it. Resolves the exact column widths the
-    // `Table` below will use (including its default 1-column spacing
-    // between columns, which a bare `Layout::split` doesn't apply on its
-    // own) and truncates to fit - the same technique used for the Agents
-    // tab's narrow columns (see `truncate_line`). No `Cell::highlight_symbol`
-    // is set on this table, so unlike ratatui's own column-width resolution
-    // there's no selection-width reservation to account for here.
-    let columns = Layout::horizontal(widths).spacing(1).split(inner);
-    let status_width = columns[2].width as usize;
+    let inner_width = inner.width as usize;
 
     let rows: Vec<Row> = if reminders.is_empty() {
-        vec![Row::new([Cell::from("No reminders"), Cell::from(""), Cell::from("")])]
+        vec![Row::new([Cell::from("No reminders")])]
     } else {
         reminders
             .iter()
-            .map(|reminder| {
-                let (status_text, style) = reminder_status_cell_text_and_style(reminder, now, false);
-                let status_line = truncate_line(Line::from(Span::styled(status_text, style)), status_width);
-                Row::new([
-                    Cell::from(reminder.name.clone()),
-                    Cell::from(format!("{}m", reminder.duration_minutes)),
-                    Cell::from(status_line),
-                ])
-            })
+            .map(|reminder| Row::new([Cell::from(reminder_pane_row(reminder, now, inner_width))]))
             .collect()
     };
 
@@ -1532,7 +1553,7 @@ fn render_reminders_tab(frame: &mut Frame, app: &App, area: Rect, banner: Option
     let now = now_ms();
     let entries = app.visible_reminders();
     let rows = entries.iter().map(|reminder| {
-        let (status_text, status_style) = reminder_status_cell_text_and_style(reminder, now, false);
+        let (status_text, status_style) = reminder_status_cell_text_and_style(reminder, now, false, false);
         Row::new([
             Cell::from(app.project_name(&reminder.cwd)),
             Cell::from(reminder.name.clone()),
@@ -1674,13 +1695,22 @@ fn format_reminder_eta(run_started_ms: u64, duration_minutes: u32) -> String {
 }
 
 /// The Reminders tab/pane's STATUS cell: blank while not-yet-started,
-/// `⏳ Running <dur>, ETA: h:MM AM/PM` while running, `✅ Done <dur>` once done -
-/// see the "Reminders tab shows an aggregated, paginated reminder list"
-/// requirement. `with_category_prefix` adds "reminder" after the emoji, for
-/// cross-category views (the Agents tab's Reminders column); the top-level
-/// Reminders tab and the modal's Reminders pane both pass `false`, since each
-/// already dedicates its view to reminders.
-fn reminder_status_cell_text_and_style(reminder: &ReminderInfo, now_ms: u64, with_category_prefix: bool) -> (String, Style) {
+/// `⏳ Running <dur>, ETA: h:MM AM/PM` while running (or `⏳ <dur>, ETA: h:MM
+/// AM/PM` when `drop_running` is set), `✅ Done <dur>` once done - see the
+/// "Reminders tab shows an aggregated, paginated reminder list" requirement.
+/// `with_category_prefix` adds "reminder" after the emoji, for cross-category
+/// views (the Agents tab's Reminders column); the top-level Reminders tab and
+/// the modal's Reminders pane both pass `false`, since each already
+/// dedicates its view to reminders. `drop_running` omits the word "Running"
+/// from a running reminder's text; only the details modal's Reminders pane
+/// sets it, since that pane is narrow enough to need the extra room - the
+/// top-level Reminders tab keeps the word.
+fn reminder_status_cell_text_and_style(
+    reminder: &ReminderInfo,
+    now_ms: u64,
+    with_category_prefix: bool,
+    drop_running: bool,
+) -> (String, Style) {
     let prefix = |emoji: &str| {
         if with_category_prefix {
             format!("{emoji} reminder")
@@ -1694,10 +1724,12 @@ fn reminder_status_cell_text_and_style(reminder: &ReminderInfo, now_ms: u64, wit
             let started = reminder.run_started_ms.unwrap_or(now_ms);
             let elapsed = format_reminder_duration_ms(now_ms.saturating_sub(started));
             let eta = format_reminder_eta(started, reminder.duration_minutes);
-            (
-                format!("{} Running {elapsed}, ETA: {eta}", prefix("⏳")),
-                Style::new().fg(Color::Blue),
-            )
+            let text = if drop_running {
+                format!("{} {elapsed}, ETA: {eta}", prefix("⏳"))
+            } else {
+                format!("{} Running {elapsed}, ETA: {eta}", prefix("⏳"))
+            };
+            (text, Style::new().fg(Color::Blue))
         }
         ReminderStatus::Done => {
             let started = reminder.run_started_ms.unwrap_or(reminder.last_updated_ms);
@@ -4877,7 +4909,7 @@ mod tests {
             None,
             0,
         )];
-        let (text, _style) = reminder_status_cell_text_and_style(&entries[0], now_ms(), false);
+        let (text, _style) = reminder_status_cell_text_and_style(&entries[0], now_ms(), false, false);
         assert_eq!(text, "");
     }
 
@@ -4894,9 +4926,29 @@ mod tests {
             now - 83_000,
         );
 
-        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now, false);
+        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now, false, false);
 
         assert!(text.contains("Running"), "got: {text}");
+        assert!(text.contains("1m23s"), "got: {text}");
+        assert!(text.contains("ETA:"), "got: {text}");
+    }
+
+    #[test]
+    fn reminder_status_cell_can_drop_running_for_the_modal_pane() {
+        let now = 1_700_000_000_000u64;
+        let reminder = reminder_in(
+            "/tmp/project",
+            "r1",
+            "Check the build",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now - 83_000),
+            now - 83_000,
+        );
+
+        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now, false, true);
+
+        assert!(!text.contains("Running"), "got: {text}");
         assert!(text.contains("1m23s"), "got: {text}");
         assert!(text.contains("ETA:"), "got: {text}");
     }
@@ -4913,7 +4965,7 @@ mod tests {
             600_000, // exactly 10 minutes elapsed
         );
 
-        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now_ms(), false);
+        let (text, _style) = reminder_status_cell_text_and_style(&reminder, now_ms(), false, false);
 
         assert_eq!(text, "✅ Done 10m");
     }
@@ -5225,11 +5277,64 @@ mod tests {
     }
 
     #[test]
-    fn details_modal_reminders_pane_truncates_a_running_reminders_status_instead_of_overflowing() {
+    fn details_modal_reminders_pane_truncates_a_running_reminders_name_to_keep_its_eta_visible() {
         // Regression test: the Reminders pane is only a third of the
-        // modal's top third, so a running reminder's "Running Xm, ETA:
-        // h:MM AM/PM" status must be truncated to fit rather than spilling past
-        // the pane's right border.
+        // modal's top third, so a long reminder name plus a running
+        // reminder's "<elapsed>, ETA: h:MM AM/PM" status can overflow it.
+        // The reminder's *name* must be truncated instead of the status -
+        // never the ETA at the end of it - so the row never overflows the
+        // pane's right border.
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        let now = now_ms();
+        let long_name = "Check the build and deploy to every environment before the next meeting";
+        app.apply_reminder_update(reminder_in(
+            "/Users/beet/project",
+            "r1",
+            long_name,
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now - 83_000),
+            now - 83_000,
+        ));
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
+        let text = buffer_text(&term);
+        assert!(!text.contains("Running"), "the word \"Running\" should not appear, got:\n{text}");
+        assert!(
+            text.contains("1m23s, ETA:"),
+            "expected the full, untruncated elapsed/ETA text, got:\n{text}"
+        );
+        assert!(
+            !text.contains(long_name),
+            "expected the reminder's full name not to be shown, got:\n{text}"
+        );
+        assert!(
+            text.contains("..."),
+            "expected the reminder's name to be truncated with a trailing ellipsis, got:\n{text}"
+        );
+
+        // No row extends past the modal's own right border: every "│"
+        // border character in the modal's row band should still be the
+        // rightmost non-blank glyph on its row.
+        let buffer = term.backend().buffer();
+        let (modal_right_border_x, top_y) =
+            find_text(buffer, "╮").expect("expected the modal's top-right corner");
+        for y in top_y..(top_y + 10) {
+            let cell = &buffer[(modal_right_border_x, y)];
+            assert!(
+                cell.symbol() == "│" || cell.symbol() == "╮" || cell.symbol() == "╯",
+                "expected the modal's right border at ({modal_right_border_x}, {y}), got {:?}",
+                cell.symbol()
+            );
+        }
+    }
+
+    #[test]
+    fn details_modal_reminders_pane_omits_the_word_running() {
         let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
         let mut app = App::new();
         app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
@@ -5248,26 +5353,53 @@ mod tests {
         term.draw(|frame| { render(frame, &app); }).unwrap();
 
         let text = buffer_text(&term);
-        assert!(
-            !text.contains("Running 1m23s, ETA:"),
-            "the full status text should be truncated rather than rendered in full, got:\n{text}"
-        );
-        assert!(text.contains("..."), "expected a trailing ellipsis on the truncated status, got:\n{text}");
+        assert!(!text.contains("Running"), "got:\n{text}");
+        assert!(text.contains("1m23s"), "got:\n{text}");
+        assert!(text.contains("ETA:"), "got:\n{text}");
+    }
 
-        // No row extends past the modal's own right border: every "│"
-        // border character in the modal's row band should still be the
-        // rightmost non-blank glyph on its row.
+    #[test]
+    fn details_modal_reminders_pane_right_aligns_eta_when_there_is_slack_width() {
+        // Regression test: with a short name, there's slack width left over
+        // once the name, duration, and status are accounted for - that
+        // slack should appear as extra space inserted after the duration,
+        // flush-aligning the status/ETA against the pane's right border,
+        // rather than the status merely trailing the duration by a single
+        // fixed space with blank space left over before the border.
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut app = App::new();
+        app.apply_snapshot(vec![agent("a", AgentStatus::Running, HostContext::Terminal, 1, 0)], Vec::new());
+        let now = now_ms();
+        app.apply_reminder_update(reminder_in(
+            "/Users/beet/project",
+            "r1",
+            "Build",
+            agentmon_proto::ReminderStatus::Running,
+            10,
+            Some(now - 83_000),
+            now - 83_000,
+        ));
+        app.open_details_modal();
+
+        term.draw(|frame| { render(frame, &app); }).unwrap();
+
         let buffer = term.backend().buffer();
-        let (modal_right_border_x, top_y) =
-            find_text(buffer, "╮").expect("expected the modal's top-right corner");
-        for y in top_y..(top_y + 10) {
-            let cell = &buffer[(modal_right_border_x, y)];
-            assert!(
-                cell.symbol() == "│" || cell.symbol() == "╮" || cell.symbol() == "╯",
-                "expected the modal's right border at ({modal_right_border_x}, {y}), got {:?}",
-                cell.symbol()
-            );
-        }
+        let (name_x, name_y) = find_text(buffer, "Build").expect("expected the reminder's name");
+
+        let border_x = (name_x..buffer.area.width)
+            .find(|&x| buffer[(x, name_y)].symbol() == "│")
+            .expect("expected the Reminders pane's right border on this row");
+
+        let last_content_x = (name_x..border_x)
+            .rev()
+            .find(|&x| buffer[(x, name_y)].symbol() != " ")
+            .expect("expected status content on this row");
+
+        assert_eq!(
+            last_content_x,
+            border_x - 1,
+            "expected the status/ETA text to end flush against the pane's right border, got border at {border_x} and last content at {last_content_x}"
+        );
     }
 
     #[test]
