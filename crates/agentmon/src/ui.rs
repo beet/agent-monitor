@@ -531,7 +531,7 @@ fn log_status_cell_text_and_style(category: agentmon_proto::LogCategory, status:
         // marker alone (plus the Logs tab's own CATEGORY column) already
         // identifies it - per the "Status labels are prefixed by category
         // outside dedicated panes" requirement's prompt-category exception.
-        agentmon_proto::LogCategory::Prompt => ("🗣️".to_string(), Style::new()),
+        agentmon_proto::LogCategory::Prompt => ("💬".to_string(), Style::new()),
     }
 }
 
@@ -617,7 +617,7 @@ fn log_entry_status_line(
     let mut snippet: Option<(String, Style)> = None;
 
     // A prompt-category entry's snippet *is* its label - appended after the
-    // 🗣️ marker with a single separating space (no quotes), since there is
+    // 💬 marker with a single separating space (no quotes), since there is
     // no other status/category text for it to follow - per the "Logs tab
     // shows an aggregated, paginated activity list" requirement. A prompt
     // entry always carries one, since that's the event that produced it.
@@ -1022,7 +1022,7 @@ const NO_PROMPT_CAPTURED_PLACEHOLDER: &str = "No prompt captured yet";
 fn render_last_prompt_pane(frame: &mut Frame, app: &App, area: Rect) {
     let focused = matches!(app.modal_focus, ModalFocus::LastPrompt);
     let block = Block::default()
-        .title("🗣️ Last Prompt [p]")
+        .title("💬 Last Prompt [p]")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(pane_border_style(focused));
@@ -3962,7 +3962,7 @@ mod tests {
         assert!(text.contains('🤖'), "got:\n{text}");
         assert!(text.contains('🧪'), "got:\n{text}");
         assert!(text.contains('⏰'), "got:\n{text}");
-        assert!(text.contains('🗣'), "got:\n{text}");
+        assert!(text.contains('💬'), "got:\n{text}");
         assert!(text.contains('🪵'), "got:\n{text}");
         assert!(text.contains("Agents"), "got:\n{text}");
         assert!(text.contains("Tests"), "got:\n{text}");
@@ -5535,7 +5535,7 @@ mod tests {
             log_status_cell_text_and_style(agentmon_proto::LogCategory::Prompt, "submitted");
 
         assert_eq!(
-            text, "🗣️",
+            text, "💬",
             "a prompt entry's marker carries no category or status word, unlike every other category"
         );
         assert_eq!(
@@ -5554,7 +5554,7 @@ mod tests {
 
         let (text, _style, snippet) = log_entry_status_line(&[], &entry, 0);
 
-        assert_eq!(text, "🗣️", "expected the label to be the bare marker, with no prompt text concatenated onto it");
+        assert_eq!(text, "💬", "expected the label to be the bare marker, with no prompt text concatenated onto it");
         assert_eq!(
             snippet.map(|(text, _)| text),
             Some(" Fix the flaky test".to_string()),

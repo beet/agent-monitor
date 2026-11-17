@@ -1,0 +1,17 @@
+## 1. Swap the prompt marker
+
+- [x] 1.1 In `crates/agentmon/src/ui.rs`, replace the `🗣️` literal with `💬` in `log_status_cell_text_and_style` (the Prompt-category marker) and in `render_last_prompt_pane`'s title (`"🗣️ Last Prompt [p]"`), and update the two test assertions (`a_prompt_entry_renders_its_marker_with_no_color`, `a_prompt_entry_shows_its_snippet_separated_by_a_space_and_unquoted`) to expect `💬`; verify with `cargo test -p agentmon` that both pass.
+- [x] 1.2 In `crates/agentmon/src/ui.rs`, update the comment above the snippet-budget subtraction (near the prompt-snippet rendering) that explains the marker is "a double-width emoji" to drop the now-inaccurate reference to it needing a variation selector, while keeping the width-subtraction rationale itself; verify by reading the updated comment against `design.md`'s "comments... kept, only updated" decision.
+
+## 2. Remove the maximise-toggle full-redraw workaround
+
+- [x] 2.1 In `crates/agentmon/src/app.rs`, remove the `needs_full_redraw` field, its doc comment, its `false` initializer in `App::new()`, the flag-set line inside `toggle_modal_maximised()` (keeping the rest of that method, which still flips `modal_maximised`), and the `take_needs_full_redraw()` method; verify `cargo build -p agentmon` succeeds with no remaining references.
+- [x] 2.2 In `crates/agentmon/src/app.rs`, remove the `toggle_modal_maximised_sets_a_one_shot_full_redraw_signal` test, and strip the full-redraw assertions out of `toggle_modal_maximised_flips_back_and_forth` if it checks the flag (keep its assertions on `modal_maximised` itself); verify `cargo test -p agentmon` passes.
+- [x] 2.3 In `crates/agentmon/src/main.rs`, remove the `if app.take_needs_full_redraw() { terminal.resize(terminal.size()?.into())?; }` block and its preceding explanatory comment in the draw loop; verify `cargo build -p agentmon` succeeds.
+- [x] 2.4 In `crates/agentmon/src/input.rs`, remove the line that calls `app.take_needs_full_redraw()` to consume the signal in the maximise/`Esc` test setup, and remove the assertion `assert!(app.take_needs_full_redraw(), "restoring from maximised should request a full redraw...")`; keep the rest of that test's assertions on `modal_maximised`/`app.modal`; verify `cargo test -p agentmon` passes. (The test's only content was that redraw assertion, so the whole test is removed - nothing else remained to keep.)
+
+## 3. Verify no stale references remain
+
+- [x] 3.1 Run `grep -rn "🗣️\|needs_full_redraw\|take_needs_full_redraw" crates/agentmon/src` and confirm it returns no matches. (Also caught and fixed a third occurrence this grep missed: `details_modal_pane_titles_are_each_prefixed_with_a_category_emoji` in `ui.rs` asserted on the bare `🗣` codepoint without the VS16 suffix - updated to `💬`.)
+- [x] 3.2 Run `cargo test -p agentmon` and confirm the full suite passes. (413 passed, 0 failed.)
+- [x] 3.3 Launch the TUI, trigger a prompt-category log entry, and confirm the Logs tab, details-modal Logs pane, and Last Prompt pane title all show `💬`; toggle the details modal's maximised state (`m`, then `Esc`) and confirm no stale characters are left on screen. (Verified via tmux: real agentd + agentmon-report + agentmon TUI, isolated HOME under `/tmp` - a unix-socket-path-length constraint forced a shorter path than the scratchpad dir. Logs tab showed `💬 Fix the flaky test`; details modal's Last Prompt pane title showed `💬 Last Prompt [p]`; `m` maximised cleanly, `Esc` restored to windowed with no leftover characters from the maximised frame.)

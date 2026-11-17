@@ -687,18 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn esc_restoring_a_maximised_details_modal_requests_a_full_redraw() {
-        let mut app = app_with_one_agent();
-        press(&mut app, KeyCode::Enter); // opens the details modal
-        press(&mut app, KeyCode::Char('m')); // maximise it
-        app.take_needs_full_redraw(); // consume the signal from maximising, in isolation from Esc's
-
-        press(&mut app, KeyCode::Esc);
-
-        assert!(app.take_needs_full_redraw(), "restoring from maximised should request a full redraw, not just `m` maximising");
-    }
-
-    #[test]
     fn esc_closes_the_details_modal_once_it_is_windowed() {
         let mut app = app_with_one_agent();
         press(&mut app, KeyCode::Enter); // opens the details modal
